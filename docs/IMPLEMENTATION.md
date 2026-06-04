@@ -588,3 +588,64 @@ forgetting_score_threshold = 0.1
 ---
 
 *End of document. Last updated 2026-06-04.*
+
+
+---
+
+## 19. Design Decisions Log
+
+### 2026-06-04 — Single-tenant + single-model defaults
+
+**Context.** The initial design exposed `tenant: u32` and per-(tenant, model)
+HNSW indices as first-class concepts in the public API. For the actual
+target deployment — a single user, single agent, single embedding model —
+this added cognitive overhead without benefit.
+
+**Decision.**
+
+1. **Hide `tenant` from the user-facing API**, but keep it in the on-disk key
+   encoding (`tenant_be(4)` prefix is unchanged). The facade pins
+   `tenant = DEFAULT_TENANT (0)` and forcibly stamps it on every insert.
+   Storage format remains forward-compatible with future MVCC branching and
+   multi-agent isolation at zero migration cost.
+2. **Single default embedding model**, configured at `Database::open_with`.
+   The simple path is `db.vector_search(query, k)`. Power users that genuinely
+   need multiple embedding spaces (CLIP + text, code-specific embeddings)
+   can call `db.vector_search_with_model(model, query, k)`.
+3. **`NodeBuilder::new(kind)`** — tenant parameter removed. `Embedding.model`
+   field on `MemoryNode` is retained but typically only carries the default
+   model name.
+
+**Rationale for the multi-model architecture remaining in the storage layer.**
+
+Even in single-model deployments, the per-(tenant, model) index keying is
+preserved because:
+
+- adding a second model later (e.g. CLIP for image artifacts) requires zero
+  schema migration;
+- different embedding models have incompatible dimensions and distance
+  semantics, so they physically cannot share an HNSW graph;
+- the cost in the single-model case is one extra `DashMap` entry — negligible.
+
+**Non-goals confirmed for P1.**
+
+- No multi-tenancy isolation primitives in the API (no per-tenant quotas,
+  no per-tenant key derivation).
+- No reranker pipeline (cross-encoder re-scoring is a P3 concern).
+- No automatic embedding-model selection by node kind.
+
+**API surface after this change.**
+
+```rust
+let db = Database::open(path)?;                       // defaults
+let db = Database::open_with(path, DatabaseConfig {   // custom model
+    tenant: 0,
+    default_model: "bge-m3".into(),
+})?;
+
+let id = db.insert(NodeBuilder::new(NodeKind::Fact).text("...").build())?;
+let n  = db.get(id)?;
+let xs = db.scan_by_time(0, now_ms(), 50)?;
+let hs = db.vector_search(&query, 10)?;
+let hs = db.vector_search_with_model("clip-vit-b32", &query, 10)?;
+```
