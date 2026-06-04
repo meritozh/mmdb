@@ -9,6 +9,7 @@
 //!   multiple models can call `vector_search_with_model`.
 use mmdb_core::{Content, Embedding, MemoryNode, NodeKind, Result};
 use mmdb_storage::Storage;
+use mmdb_vector::VectorStore;
 use smallvec::SmallVec;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -17,6 +18,7 @@ use ulid::Ulid;
 
 pub use mmdb_core as core;
 pub use mmdb_storage as storage;
+pub use mmdb_vector as vector;
 
 /// Default tenant id for single-tenant deployments.
 pub const DEFAULT_TENANT: u32 = 0;
@@ -43,6 +45,7 @@ impl Default for DatabaseConfig {
 
 pub struct Database {
     storage: Storage,
+    vector_store: VectorStore,
     config: DatabaseConfig,
 }
 
@@ -54,7 +57,9 @@ impl Database {
 
     /// Open with an explicit config.
     pub fn open_with(path: impl AsRef<Path>, config: DatabaseConfig) -> Result<Self> {
-        Ok(Self { storage: Storage::open(path)?, config })
+        let storage = Storage::open(path)?;
+        let vector_store = VectorStore::open(storage.keyspace.clone())?;
+        Ok(Self { storage, vector_store, config })
     }
 
     pub fn config(&self) -> &DatabaseConfig {
@@ -68,7 +73,10 @@ impl Database {
         node.tenant = self.config.tenant;
         let id = node.id;
         self.storage.put_node(&node)?;
-        // TODO(P1): for each embedding in node.embeddings, also insert into VectorStore.
+        for emb in &node.embeddings {
+            self.vector_store
+                .insert(self.config.tenant, &emb.model, id, &emb.vector)?;
+        }
         Ok(id)
     }
 
@@ -86,28 +94,39 @@ impl Database {
     }
 
     pub fn delete(&self, id: Ulid) -> Result<()> {
+        if let Some(node) = self.storage.get_node(self.config.tenant, id)? {
+            for emb in &node.embeddings {
+                self.vector_store
+                    .delete(self.config.tenant, &emb.model, id)?;
+            }
+        }
         self.storage.delete_node(self.config.tenant, id)
     }
 
     /// Vector search using the database default model.
-    ///
-    /// **P1 stub** — wiring to `mmdb-vector` lands in the next milestone.
-    pub fn vector_search(&self, _query: &[f32], _k: usize) -> Result<Vec<Hit>> {
-        // Will dispatch to VectorStore(tenant, default_model).search(...)
-        Ok(Vec::new())
+    pub fn vector_search(&self, query: &[f32], k: usize) -> Result<Vec<Hit>> {
+        let model = self.config.default_model.clone();
+        self.vector_search_with_model(&model, query, k)
     }
 
     /// Vector search against an explicit model name. Use this only when you
     /// genuinely need multiple embedding spaces (e.g. CLIP + text).
-    ///
-    /// **P1 stub** — wiring to `mmdb-vector` lands in the next milestone.
     pub fn vector_search_with_model(
         &self,
-        _model: &str,
-        _query: &[f32],
-        _k: usize,
+        model: &str,
+        query: &[f32],
+        k: usize,
     ) -> Result<Vec<Hit>> {
-        Ok(Vec::new())
+        let scored = self
+            .vector_store
+            .search(self.config.tenant, model, query, k)?;
+        let mut hits = Vec::with_capacity(scored.len());
+        for s in scored {
+            if let Some(node) = self.storage.get_node(self.config.tenant, s.node_id)? {
+                hits.push(Hit { node, score: s.score });
+            }
+        }
+        Ok(hits)
     }
 }
 
@@ -229,9 +248,54 @@ mod tests {
         let db = Database::open_with(dir.path(), cfg).unwrap();
         assert_eq!(db.config().default_model, "bge-m3");
 
-        // vector_search returns empty until P1 vector wiring lands
+        // No nodes inserted -> empty result
         let hits = db.vector_search(&[0.1, 0.2, 0.3], 5).unwrap();
         assert!(hits.is_empty());
+    }
+
+    fn norm(v: Vec<f32>) -> Vec<f32> {
+        let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.into_iter().map(|x| x / n).collect()
+    }
+
+    #[test]
+    fn vector_search_returns_inserted_nodes_ranked() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let mk = |v: Vec<f32>, label: &str| {
+            NodeBuilder::new(NodeKind::Fact)
+                .text(label)
+                .embedding(DEFAULT_MODEL, norm(v))
+                .build()
+        };
+        let n1 = mk(vec![1.0, 0.0, 0.0, 0.0], "axis-x");
+        let n2 = mk(vec![0.0, 1.0, 0.0, 0.0], "axis-y");
+        let n3 = mk(vec![0.95, 0.05, 0.0, 0.0], "near-x");
+        let id1 = db.insert(n1).unwrap();
+        let _id2 = db.insert(n2).unwrap();
+        let id3 = db.insert(n3).unwrap();
+
+        let q = norm(vec![1.0, 0.0, 0.0, 0.0]);
+        let hits = db.vector_search(&q, 2).unwrap();
+        assert_eq!(hits.len(), 2, "got {:?}", hits.iter().map(|h| &h.node.id).collect::<Vec<_>>());
+        assert_eq!(hits[0].node.id, id1);
+        assert_eq!(hits[1].node.id, id3);
+        assert!(hits[0].score >= hits[1].score);
+    }
+
+    #[test]
+    fn delete_removes_from_vector_search() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let node = NodeBuilder::new(NodeKind::Fact)
+            .text("x")
+            .embedding(DEFAULT_MODEL, norm(vec![1.0, 0.0, 0.0]))
+            .build();
+        let id = db.insert(node).unwrap();
+        let q = norm(vec![1.0, 0.0, 0.0]);
+        assert_eq!(db.vector_search(&q, 5).unwrap().len(), 1);
+        db.delete(id).unwrap();
+        assert_eq!(db.vector_search(&q, 5).unwrap().len(), 0);
     }
 
     #[test]
