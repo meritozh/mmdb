@@ -55,6 +55,38 @@ impl VectorIndex {
         id
     }
 
+    /// Insert with an externally-supplied internal id. Used by
+    /// `VectorStore::open` to rebuild the in-memory graph from persisted
+    /// metadata after a restart. The caller must guarantee uniqueness.
+    pub fn insert_with_id(&self, vector: &[f32], internal_id: u64) {
+        self.inner.insert((vector, internal_id as usize));
+        // do not mark dirty: rebuilding from disk is not a new mutation
+    }
+
+    /// After bulk rebuild, advance the id counter past every id we just
+    /// reinserted, so future `insert()` calls don't collide.
+    pub fn set_next_id_at_least(&self, candidate: u64) {
+        let mut cur = self.next_internal_id.load(Ordering::SeqCst);
+        while candidate >= cur {
+            match self.next_internal_id.compare_exchange(
+                cur, candidate + 1, Ordering::SeqCst, Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
+    /// Replace tombstone bitmap wholesale (used during open-time rebuild).
+    pub fn load_tombstones(&self, bm: RoaringBitmap) {
+        *self.tombstones.write() = bm;
+    }
+
+    /// Read a snapshot of the current tombstone bitmap.
+    pub fn tombstone_snapshot(&self) -> RoaringBitmap {
+        self.tombstones.read().clone()
+    }
+
     pub fn mark_deleted(&self, internal_id: u64) {
         let mut g = self.tombstones.write();
         g.insert(internal_id as u32);
@@ -63,6 +95,16 @@ impl VectorIndex {
 
     pub fn is_tombstoned(&self, internal_id: u64) -> bool {
         self.tombstones.read().contains(internal_id as u32)
+    }
+
+    /// Batch insert. Each entry is `(vector_slice, assigned_internal_id)`.
+    /// IDs are caller-allocated so the storage layer can persist mapping
+    /// in the same fjall batch.
+    pub fn insert_batch(&self, items: &[(Vec<f32>, u64)]) {
+        let refs: Vec<(&Vec<f32>, usize)> =
+            items.iter().map(|(v, id)| (v, *id as usize)).collect();
+        self.inner.parallel_insert(&refs);
+        *self.dirty.lock() = true;
     }
 
     /// Returns (internal_id, distance) pairs, with tombstoned entries filtered.
@@ -80,6 +122,13 @@ impl VectorIndex {
             }
         }
         out
+    }
+
+    /// Reserve and return a fresh internal id without inserting into the
+    /// HNSW graph. Used by `VectorStore::insert_batch` when it wants to
+    /// persist mapping and bulk-insert in one shot.
+    pub fn next_internal_id_load_and_inc(&self, ord: Ordering) -> u64 {
+        self.next_internal_id.fetch_add(1, ord)
     }
 
     pub fn is_dirty(&self) -> bool {

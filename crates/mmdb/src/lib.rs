@@ -109,6 +109,37 @@ impl Database {
         self.vector_search_with_model(&model, query, k)
     }
 
+    /// Vector search with structured post-filter (kind / time window).
+    /// Returns at most `k` hits, applying the filter to over-fetched
+    /// candidates internally so the result count remains useful.
+    pub fn vector_search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: VectorFilter,
+    ) -> Result<Vec<Hit>> {
+        let model = self.config.default_model.clone();
+        let tenant = self.config.tenant;
+        let storage = &self.storage;
+        let f = &filter;
+        let pred = move |id: Ulid| -> bool {
+            match storage.get_node(tenant, id) {
+                Ok(Some(n)) => f.matches(&n),
+                _ => false,
+            }
+        };
+        let scored = self
+            .vector_store
+            .search_with_filter(tenant, &model, query, k, Some(&pred))?;
+        let mut hits = Vec::with_capacity(scored.len());
+        for sh in scored {
+            if let Some(node) = self.storage.get_node(tenant, sh.node_id)? {
+                hits.push(Hit { node, score: sh.score });
+            }
+        }
+        Ok(hits)
+    }
+
     /// Vector search against an explicit model name. Use this only when you
     /// genuinely need multiple embedding spaces (e.g. CLIP + text).
     pub fn vector_search_with_model(
@@ -134,6 +165,27 @@ impl Database {
 pub struct Hit {
     pub node: MemoryNode,
     pub score: f32,
+}
+
+/// Post-filter for `vector_search_filtered`. All set fields are AND-ed.
+#[derive(Debug, Clone, Default)]
+pub struct VectorFilter {
+    pub kind: Option<NodeKind>,
+    pub after_ms: Option<i64>,
+    pub before_ms: Option<i64>,
+}
+
+impl VectorFilter {
+    pub fn new() -> Self { Self::default() }
+    pub fn kind(mut self, k: NodeKind) -> Self { self.kind = Some(k); self }
+    pub fn after_ms(mut self, t: i64) -> Self { self.after_ms = Some(t); self }
+    pub fn before_ms(mut self, t: i64) -> Self { self.before_ms = Some(t); self }
+    pub fn matches(&self, n: &MemoryNode) -> bool {
+        if let Some(k) = self.kind { if n.kind != k { return false; } }
+        if let Some(a) = self.after_ms  { if n.created_at_ms < a { return false; } }
+        if let Some(b) = self.before_ms { if n.created_at_ms > b { return false; } }
+        true
+    }
 }
 
 /// NodeBuilder — tenant is no longer a parameter (set by Database on insert).
@@ -281,6 +333,35 @@ mod tests {
         assert_eq!(hits[0].node.id, id1);
         assert_eq!(hits[1].node.id, id3);
         assert!(hits[0].score >= hits[1].score);
+    }
+
+    #[test]
+    fn vector_search_filtered_by_kind_and_time() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let v = norm(vec![1.0, 0.0, 0.0, 0.0]);
+        let fact_id = db.insert(
+            NodeBuilder::new(NodeKind::Fact)
+                .text("fact").created_at(1_000).embedding(DEFAULT_MODEL, v.clone()).build()
+        ).unwrap();
+        let ep_id = db.insert(
+            NodeBuilder::new(NodeKind::Episode)
+                .text("episode").created_at(2_000).embedding(DEFAULT_MODEL, v.clone()).build()
+        ).unwrap();
+        // kind filter — only Fact survives
+        let hits = db.vector_search_filtered(&v, 5, VectorFilter::new().kind(NodeKind::Fact)).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].node.id, fact_id);
+        // time-window — only Episode survives
+        let hits = db.vector_search_filtered(&v, 5, VectorFilter::new().after_ms(1_500)).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].node.id, ep_id);
+        // both — empty
+        let hits = db.vector_search_filtered(
+            &v, 5,
+            VectorFilter::new().kind(NodeKind::Fact).after_ms(1_500),
+        ).unwrap();
+        assert!(hits.is_empty());
     }
 
     #[test]

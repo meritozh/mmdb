@@ -649,3 +649,148 @@ let xs = db.scan_by_time(0, now_ms(), 50)?;
 let hs = db.vector_search(&query, 10)?;
 let hs = db.vector_search_with_model("clip-vit-b32", &query, 10)?;
 ```
+
+---
+
+## 20. P1 Vector Implementation Log (Jun 2026)
+
+This section freezes the design decisions taken when implementing
+`mmdb-vector` and integrating it into the `mmdb` facade. Anyone resuming
+work after a context wipe can rebuild from this spec alone.
+
+### 20.1 Crate boundary
+
+```
+crates/mmdb-vector/
+├── src/
+│   ├── hit.rs        # ScoredHit { node_id, score, distance }
+│   ├── index.rs      # VectorIndex (HNSW wrapper + tombstones)
+│   ├── store.rs      # VectorStore (multi-index facade + fjall persistence)
+│   └── lib.rs
+└── examples/
+    └── recall_bench.rs   # 1k×384 random vectors, recall@10 + p50/p99 latency
+```
+
+### 20.2 HNSW configuration
+
+| Param | Value | Rationale |
+|---|---|---|
+| `M` | 16 | hnsw_rs default — good recall/memory trade-off for ≤1M vectors |
+| `max_elements` | 1_000_000 | per-(tenant, model) cap; revisit at P2 |
+| `max_layer` | 16 | matches M; hnsw_rs convention |
+| `ef_construction` | 200 | inserts are bulk anyway; favour graph quality |
+| Distance | `DistCosine` | normalise inputs; map distance → similarity below |
+
+`score = (1.0 - distance / 2.0).clamp(0.0, 1.0)` — cosine distance is in [0, 2],
+similarity is [0, 1].
+
+### 20.3 fjall persistence schema
+
+Three partitions, all keyed by `[tenant_be(4) | model_hash_be(4) | …]`:
+
+| Partition | Key suffix | Value | Purpose |
+|---|---|---|---|
+| `vector_meta` | `ulid_be(16)` | `[internal_id_be(8) | dim_be(4) | f32×dim (LE)]` | Source of truth; lets us rebuild HNSW from disk |
+| `vector_rev`  | `internal_id_be(8)` | `ulid_bytes(16)` | Reverse lookup after HNSW returns internal_id |
+| `vector_tomb` | `internal_id_be(8)` | `[]` (presence marker) | Persist soft-delete bitmap across restarts |
+
+`model_hash` is **FNV-1a 32-bit** of the model name. The model name itself is
+not stored on disk; on `open()` we rebuild placeholder indices keyed by
+`__h::<mh>`, then promote them lazily the first time a caller uses the real
+model name (see §20.4).
+
+### 20.4 Open-time rebuild
+
+`VectorStore::open` after partition init:
+
+1. Scan `vector_meta`, group rows by `(tenant, model_hash)`, decode `(vec, internal_id, dim)`.
+2. For each group: `VectorIndex::new(dim)` → `insert_batch(items)` (uses `hnsw_rs::parallel_insert`) → `set_next_id_at_least(max_id)`.
+3. Scan `vector_tomb`, group by `(tenant, model_hash)`, load into each index via `load_tombstones`.
+4. Store under placeholder key `IndexKey { tenant, model: "__h::<hex>" }`.
+5. First subsequent `insert`/`search` for that tenant+model name calls
+   `resolve_index` → finds placeholder by hash → re-keys to the real name +
+   registers `(tenant, mh) -> name` in `model_names`.
+
+This trades a tiny "first-call rename" cost for avoiding any need to store
+model names on disk (which would have required a 4th partition).
+
+### 20.5 Batch insert + id allocation
+
+`VectorStore::insert_batch(tenant, model, items: &[(Ulid, Vec<f32>)])`:
+
+1. Validate uniform `dim` across batch.
+2. Allocate `len(items)` internal ids via `VectorIndex::next_internal_id_load_and_inc` (atomic `fetch_add`).
+3. Call `VectorIndex::insert_batch` → wraps `hnsw_rs::parallel_insert(&[(&Vec<f32>, usize)])`.
+4. Single fjall `batch` writes both `vector_meta` and `vector_rev` for every item, then `persist(SyncAll)`.
+
+Single-item `insert` is now a 1-element batch.
+
+### 20.6 Filtered search
+
+`VectorStore::search_with_filter(..., filter: Option<&HitFilter>)` widens the
+HNSW retrieval set when a filter is present:
+
+```
+over_fetch = if filter.is_some() { 4 } else { 1 };
+widened    = max(k * over_fetch, k);
+ef         = max(widened * 4, 32);
+```
+
+After HNSW returns `widened` candidates, we apply the predicate per-`Ulid`
+and stop once `k` survivors collected. The 4× over-fetch is a heuristic;
+revisit if recall regresses on highly-selective filters (P2 may need an
+"adaptive widening" pass).
+
+The facade exposes this as `Database::vector_search_filtered(query, k, VectorFilter)`,
+where `VectorFilter` AND-combines `kind`, `after_ms`, `before_ms`. Each
+candidate triggers one `Storage::get_node(tenant, id)` round-trip — acceptable
+at small `k`, but P2 should add a "metadata-only" partition (`nodes_meta` with
+just `kind` + `created_at_ms`) so filters can run without deserialising full
+node payloads.
+
+### 20.7 Facade integration
+
+`Database` (in `crates/mmdb`) holds both `Storage` and `VectorStore`,
+sharing one `Keyspace` (`storage.keyspace.clone()`):
+
+```rust
+pub struct Database {
+    storage: Storage,
+    vector_store: VectorStore,
+    config: DatabaseConfig,
+}
+```
+
+- `insert`: writes node to `Storage`, then for each `Embedding` in
+  `node.embeddings` calls `vector_store.insert(tenant, &emb.model, id, &emb.vector)`.
+- `delete`: reads node, calls `vector_store.delete(...)` for each embedding's
+  model, then `Storage::delete_node`.
+- `vector_search(q, k)` → `vector_search_with_model(config.default_model, …)`.
+- `vector_search_filtered(q, k, filter)` → see §20.6.
+
+### 20.8 Benchmark baseline
+
+`cargo run --release -p mmdb-vector --example recall_bench` on the dev machine
+(macOS, M-series, single workspace target dir):
+
+| Metric | Value |
+|---|---|
+| Dataset | 1 000 vectors × 384 dim, random Gaussian, L2-normalised |
+| Bulk insert (`insert_batch` + 1× fjall commit) | 86 ms (~11.6k vec/s) |
+| Recall@10 (vs brute-force ground truth) | **0.902** |
+| Query latency p50 / p99 | **220 µs / 374 µs** |
+
+Numbers are reference-grade for the default `(M=16, ef_construction=200)` knobs.
+Tuning `ef` upward at query time should push recall toward 0.95+ at the cost
+of latency; left as a P2 tuning task.
+
+### 20.9 Known limits and P2 backlog
+
+| Limit | Plan |
+|---|---|
+| First-call model-name resolution requires that the caller eventually use the same model name as on insert | acceptable for now; alternative is a 4th `vector_models` partition |
+| Full node fetch per filter candidate | add `nodes_meta` partition (kind + ts) in P2 |
+| No `update_vector(node_id, new_vec)` API | implement as `delete + insert`; consider in-place when HNSW supports it |
+| HNSW graph not snapshotted to disk; cold-start cost ~ O(N) inserts | acceptable up to ~100k; P3: `Hnsw::file_dump` snapshot + delta log |
+| No per-(tenant, model) capacity guard | `INDEX_DEFAULT_MAX_ELEMENTS = 1_000_000`; bigger tenants need their own knob |
+| Filter is a Rust closure, not pushable through HNSW | true post-filter; selective filters lose recall — see §20.6 over-fetch |
