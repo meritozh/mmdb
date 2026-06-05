@@ -9,6 +9,7 @@ pub struct Storage {
     pub nodes: PartitionHandle,
     pub nodes_by_time: PartitionHandle,
     pub nodes_by_kind: PartitionHandle,
+    pub nodes_meta: PartitionHandle,
 }
 
 impl Storage {
@@ -25,7 +26,10 @@ impl Storage {
         let nodes_by_kind = ks
             .open_partition(partitions::NODES_BY_KIND, PartitionCreateOptions::default())
             .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(Self { keyspace: ks, nodes, nodes_by_time, nodes_by_kind })
+        let nodes_meta = ks
+            .open_partition(partitions::NODES_META, PartitionCreateOptions::default())
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(Self { keyspace: ks, nodes, nodes_by_time, nodes_by_kind, nodes_meta })
     }
 
     pub fn put_node(&self, n: &MemoryNode) -> Result<()> {
@@ -35,9 +39,10 @@ impl Storage {
         let kk = keys::kind_key(n.tenant, n.kind.as_u8(), n.created_at_ms, n.id);
 
         let mut batch = self.keyspace.batch();
-        batch.insert(&self.nodes, nk, bytes);
+        batch.insert(&self.nodes, nk.clone(), bytes);
         batch.insert(&self.nodes_by_time, tk, []);
         batch.insert(&self.nodes_by_kind, kk, []);
+        batch.insert(&self.nodes_meta, nk, encode_meta(n));
         batch.commit().map_err(|e| Error::Storage(e.to_string()))?;
         self.keyspace
             .persist(PersistMode::SyncAll)
@@ -82,14 +87,53 @@ impl Storage {
             let tk = keys::time_key(tenant, n.created_at_ms, id);
             let kk = keys::kind_key(tenant, n.kind.as_u8(), n.created_at_ms, id);
             let mut batch = self.keyspace.batch();
-            batch.remove(&self.nodes, nk);
+            batch.remove(&self.nodes, nk.clone());
             batch.remove(&self.nodes_by_time, tk);
             batch.remove(&self.nodes_by_kind, kk);
+            batch.remove(&self.nodes_meta, nk);
             batch.commit().map_err(|e| Error::Storage(e.to_string()))?;
             self.keyspace
                 .persist(PersistMode::SyncAll)
                 .map_err(|e| Error::Storage(e.to_string()))?;
         }
         Ok(())
+    }
+}
+
+/// Lightweight per-node metadata: just enough to do kind/time post-filtering
+/// without deserialising the full node payload.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NodeMeta {
+    pub kind: u8,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+fn encode_meta(n: &MemoryNode) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + 8 + 8);
+    v.push(n.kind.as_u8());
+    v.extend_from_slice(&n.created_at_ms.to_be_bytes());
+    v.extend_from_slice(&n.updated_at_ms.to_be_bytes());
+    v
+}
+
+pub fn decode_meta(b: &[u8]) -> Option<NodeMeta> {
+    if b.len() != 1 + 8 + 8 { return None; }
+    let kind = b[0];
+    let mut c = [0u8; 8]; c.copy_from_slice(&b[1..9]);
+    let created = i64::from_be_bytes(c);
+    let mut u = [0u8; 8]; u.copy_from_slice(&b[9..17]);
+    let updated = i64::from_be_bytes(u);
+    Some(NodeMeta { kind, created_at_ms: created, updated_at_ms: updated })
+}
+
+impl Storage {
+    /// Look up the cheap meta record for a node. Returns None if absent.
+    pub fn get_node_meta(&self, tenant: u32, id: Ulid) -> Result<Option<NodeMeta>> {
+        let nk = keys::node_key(tenant, id);
+        match self.nodes_meta.get(&nk).map_err(|e| Error::Storage(e.to_string()))? {
+            Some(v) => Ok(decode_meta(&v)),
+            None => Ok(None),
+        }
     }
 }

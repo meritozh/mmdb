@@ -794,3 +794,174 @@ of latency; left as a P2 tuning task.
 | HNSW graph not snapshotted to disk; cold-start cost ~ O(N) inserts | acceptable up to ~100k; P3: `Hnsw::file_dump` snapshot + delta log |
 | No per-(tenant, model) capacity guard | `INDEX_DEFAULT_MAX_ELEMENTS = 1_000_000`; bigger tenants need their own knob |
 | Filter is a Rust closure, not pushable through HNSW | true post-filter; selective filters lose recall — see §20.6 over-fetch |
+
+
+---
+
+## §21 P2 设计纪要(2026-06-04)
+
+本节记录 P2 阶段三件落地工作的设计权衡,与 §20 共同构成"向量检索 + 图遍历 + 自动嵌入"的最小可用形态。
+
+### §21.1 `nodes_meta` 副表 — 过滤路径的快进通道
+
+**动机**:`vector_search_filtered` 在 HNSW 召回后需要对每个候选 id 做 kind / 时间窗口的二次裁剪。最早的实现走 `Storage::get_node` → 解 JSON → 取字段,单次解码代价 O(node 大小),对长文本节点尤为浪费。
+
+**Schema**(写在 `mmdb-storage` 的 `nodes_meta` partition):
+
+```
+key = [tenant_be(4) | ulid_be(16)]                 // 与 nodes 主表完全同 key
+val = [kind_u8 | created_at_ms_be(8) | updated_at_ms_be(8)]  // 17 bytes 固定
+```
+
+**一致性**:`put_node` 和 `delete_node` 在同一个 fjall `Batch` 里同时更新 `nodes` 与 `nodes_meta`,保证两者要么都生效要么都回滚,无需读修复。
+
+**facade 使用**:`vector_search_filtered` 把谓词从"取完整节点"换成 `Storage::get_node_meta`,只读 17 字节并直接套用 `VectorFilter::matches_meta(kind_u8, created_at_ms)`。冷数据场景下省去一次大值反序列化。
+
+**未来扩展**:如果以后需要 `metadata` 字段上的过滤,会再加一张 `nodes_tags` 倒排表,而不是把 metadata 塞进 meta 副表 — 后者会把固定长度的优势抹掉。
+
+### §21.2 `mmdb-graph` — 双向边 + 标签桶 + BFS
+
+**Crate 边界**:`mmdb-graph` 只持有 `fjall::Keyspace` 句柄,自己再 `open_partition` 两张表;不依赖 `mmdb-storage` 的 `Storage`。这样 graph 既可独立测试,也可被 facade 嵌入而不会发生循环依赖。
+
+**Schema**(两张 partition,边对称写入):
+
+```
+edges_out  key = [tenant(4) | src(16) | label_hash(4) | dst(16)]   val = payload(JSON)
+edges_in   key = [tenant(4) | dst(16) | label_hash(4) | src(16)]   val = []    // 只做反向索引
+```
+
+* `label_hash` 用 FNV-1a 32-bit。哈希冲突在标签过滤时通过加载 payload 校验 `label` 字段做最终裁定(目前未实现,标签命名空间小时不会撞;若以后开放任意标签,会补一张 `label_dict` 字典表反查原值)。
+* `Out` 拿到 payload、`In` 只是一个 marker;`neighbours_in` 需要 payload 时,会拼出对应的 out_key 再读一次。空间换 BFS 时间。
+
+**Direction 枚举**:`Out` / `In` / `Both`。BFS 内部按 direction 分别 range-scan,visited 集合用 `HashSet<Ulid>` 去重,产出顺序按发现顺序(典型 BFS 层序)。
+
+**写一致性**:`add_edge` / `remove_edge` 都通过一个 `Batch` 同时改两侧,确保不会出现"出边有、入边无"的悬挂态。
+
+**测试矩阵**(6 个):add → list / 标签过滤 / 反向边 / remove 双删 / 两跳 BFS / 多租户隔离。
+
+### §21.3 `Embedder` trait — 文本插入零样板
+
+**契约**:
+
+```rust
+pub trait Embedder: Send + Sync {
+    fn embed(&self, text: &str) -> Result<Vec<f32>>;
+    fn model_name(&self) -> &str;
+    fn dim(&self) -> u32;
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> { /* loop default */ }
+}
+```
+
+**facade 接线**:
+
+* `Database::open_with_embedder(path, config, Box<dyn Embedder>)` 在打开数据库的同时挂载嵌入器。`debug_assert_eq!(embedder.model_name(), config.default_model)` 提醒模型名一致(release 不强制 — 留出多模型混用的口子)。
+* `Database::insert` 内联自动嵌入:**只有**在嵌入器存在 ∧ 节点 content 是非空 `Text` ∧ 节点尚未含该 model 的 Embedding 时,才会调用 `embed` 并把结果 push 进 `node.embeddings`。
+* `Database::insert_text(kind, text)` 是"只给文本"的快捷入口;未挂载嵌入器时返回 `InvalidArgument` 显式失败,而不是静默写入一个无向量的节点。
+* `Database::search_text(query, k)` 用嵌入器把 query 编码后走 `vector_search_with_model(embedder.model_name(), …)`。
+
+**显式优先原则**:用户通过 `NodeBuilder::embedding(model, v)` 主动给的向量永远不会被自动嵌入覆盖;同一节点想存多模型向量时,先 `embedding(...)` 再交给 `insert`,自动路径不会再叠一份。
+
+**为什么不放在 trait object 的 `DatabaseConfig` 里**:`DatabaseConfig` 实现了 `Clone`,而 `Box<dyn Embedder>` 不天然 `Clone`。把嵌入器作为构造函数的单独参数,既避免给 trait 加 `Clone` 约束,也让"无嵌入器纯向量模式"和"挂嵌入器自动模式"在类型层面就是两条不同的入口。
+
+**测试**(3 个):`auto_embeds_text_on_insert`(round-trip)、`explicit_embedding_overrides_auto`(显式优先)、`insert_text_without_embedder_errors`(失败语义)。
+
+### §21.4 当前测试矩阵
+
+| crate | tests | 说明 |
+|---|---|---|
+| mmdb | 9 | facade(增删查 / 过滤 / 自动嵌入 3 件) |
+| mmdb-vector | 9 | HNSW + 持久化 + rebuild + 过滤回调 |
+| mmdb-graph | 6 | 双向边 + BFS + 多租户隔离 |
+| mmdb-storage | 3 | key 编解码 |
+
+工作区 `cargo test --workspace` 全绿,无 ignored / 无 failed。
+
+### §21.5 P3 候选(尚未启动)
+
+1. **标签字典表 `label_dict`**:把 `label_hash → label_string` 物化,解决 FNV-1a 冲突 + 支持反向枚举。
+2. **图 + 向量混合 ranker**:在 `vector_search` 之上叠加"邻居加权"或"K 跳图扩张",形成 GraphRAG 风格的召回。
+3. **`metadata` 倒排表**:为 `VectorFilter` 新增任意 key/value 谓词的 sublinear 过滤通路。
+4. **Embedder 异步路径**:目前 `embed` 是同步的;接入远程模型时需要一个 `async fn embed_async` 或在 facade 外做缓冲。
+5. **`Hnsw::file_dump` 加速冷启动**:rebuild 在 ≥10⁵ 节点后会成为打开瓶颈,届时落地一份原生 dump,把 rebuild 降级成 fallback。
+
+---
+
+## §22 P3-1 图+向量混合 ranker(2026-06-04)
+
+P3 第一刀:把 §20 的纯向量检索和 §21 的图存储拼起来,形成 mmdb 区别于"再造一个 Qdrant"的差异化能力 —— **召回阶段走向量,精排阶段叠图信号**。
+
+### §22.1 算法
+
+```
+seeds = vector_search(query, max(seed_k, k))         // 召回阶段
+for s in seeds:
+    score[s] = alpha * cos_sim(s)                    // 向量贡献
+    BFS expand_hops from s along (direction, label):
+        score[n] += (1 - alpha) * s.score * decay^hop // 邻居贡献(可累加)
+rank by score desc → top k → hydrate as MemoryNode
+```
+
+* `alpha` 是向量/图权重的拨杆;`1.0` 退化为纯向量,`0.0` 全靠邻居信号。
+* `decay` 控制跳数衰减,典型取 `0.5` 让 2-hop 贡献仅为 1-hop 的一半。
+* 同一个邻居被多个 seed 命中时分数 **累加**,反映"被多个高相关节点包围"的强信号。
+* BFS 用 `local_visited` 仅在单个 seed 的扩散中去重,避免环;不同 seed 之间允许重复打分,这是有意为之。
+
+### §22.2 facade API
+
+```rust
+pub struct HybridOpts {
+    pub k: usize,             // 最终返回条数
+    pub seed_k: usize,        // 召回阶段拿多少 seed (>= k)
+    pub expand_hops: usize,   // BFS 深度,0 退化为纯向量
+    pub direction: Direction, // Out / In / Both
+    pub label: Option<String>,// 边标签过滤
+    pub alpha: f32,           // 向量权重 [0,1]
+    pub decay: f32,           // 每跳衰减系数
+}
+impl Default                 // k=10, seed_k=20, hops=1, Both, alpha=0.7, decay=0.5
+
+impl Database {
+    pub fn hybrid_search(&self, query: &[f32], opts: HybridOpts) -> Result<Vec<Hit>>;
+}
+```
+
+### §22.3 facade 同时新增的图便捷接口
+
+把 `mmdb-graph` 的 `GraphStore` 包进 `Database`,这样调用方不需要自己拿 `Keyspace` 再 `open`:
+
+```rust
+impl Database {
+    pub fn add_edge(&self, edge: Edge) -> Result<()>;
+    pub fn remove_edge(&self, src: Ulid, dst: Ulid, label: &str) -> Result<()>;
+    pub fn neighbours_out(&self, node: Ulid, label: Option<&str>) -> Result<Vec<Edge>>;
+    pub fn neighbours_in(&self, node: Ulid, label: Option<&str>) -> Result<Vec<Edge>>;
+}
+```
+
+`GraphStore::open(storage.keyspace.clone())` 让边和节点共用同一个 fjall 实例,日后真要做跨 partition 事务时省心。
+
+### §22.4 测试
+
+* `hybrid_search_promotes_neighbour_via_graph`:三个 fact(A 与 query 同向、B 中等、C 正交)。先验证 **纯向量** 下 C 排在 B 之后;再用 `alpha=0.3, decay=1.0` 跑 hybrid,A→C 这条 `related` 边让 C 拿到 `0.7 * a.score` 的邻居信号,直接超过 B。
+* `hybrid_search_alpha_one_equals_vector_only`:边界条件 `alpha=1.0, expand_hops=0` 必须等价于 `vector_search`。
+
+### §22.5 工作区状态(2026-06-04 收尾)
+
+| crate | tests | 备注 |
+|---|---|---|
+| mmdb | 11 | facade(+2 hybrid_search) |
+| mmdb-vector | 9 | |
+| mmdb-graph | 6 | |
+| mmdb-storage | 3 | |
+| **合计** | **29** | `cargo test --workspace` 全绿,`cargo doc --workspace` 0 warning |
+
+`crates/mmdb/examples/` 现在有两份示范:`auto_embed_demo.rs`(自动嵌入端到端)和 `agent_memory.rs`(quickstart),都通过 `cargo run -p mmdb --example` 验证。
+
+### §22.6 P3 余下事项
+
+§21.5 的 5 件事除掉本节已完成的"图+向量混合 ranker",剩下 4 件:
+
+1. `metadata` 倒排表(高优,agent 场景刚需)
+2. Embedder 异步路径(接真实远程模型必备)
+3. `label_dict` 字典表(标签命名空间变大时再做)
+4. `Hnsw::file_dump` 冷启动加速(10⁵ 节点级别再优化)

@@ -9,6 +9,7 @@ authors.workspace = true
 mmdb-core = { path = "../mmdb-core" }
 mmdb-storage = { path = "../mmdb-storage" }
 mmdb-vector = { path = "../mmdb-vector" }
+mmdb-graph = { path = "../mmdb-graph" }
 ulid.workspace = true
 smallvec.workspace = true
 serde_json.workspace = true

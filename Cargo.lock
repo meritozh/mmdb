@@ -641,6 +641,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "mmdb-core",
+ "mmdb-graph",
  "mmdb-storage",
  "mmdb-vector",
  "serde_json",
@@ -679,7 +680,14 @@ dependencies = [
 name = "mmdb-graph"
 version = "0.1.0"
 dependencies = [
+ "fjall",
  "mmdb-core",
+ "mmdb-storage",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "tempfile",
+ "ulid",
 ]
 
 [[package]]
