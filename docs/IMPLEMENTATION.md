@@ -694,20 +694,37 @@ Three partitions, all keyed by `[tenant_be(4) | model_hash_be(4) | …]`:
 | `vector_rev`  | `internal_id_be(8)` | `ulid_bytes(16)` | Reverse lookup after HNSW returns internal_id |
 | `vector_tomb` | `internal_id_be(8)` | `[]` (presence marker) | Persist soft-delete bitmap across restarts |
 
+`VectorStore::flush_snapshots()` 还会把 native HNSW dump 和一个 JSON manifest 写到
+`vector_hnsw_snapshots/`:
+
+| File | Purpose |
+|---|---|
+| `tenant{tenant}-model{mh}.hnsw.graph` / `.hnsw.data` | `hnsw_rs::Hnsw::file_dump` 输出的 native graph/data |
+| `tenant{tenant}-model{mh}.manifest.json` | version、tenant、model_hash、dim、dump basename、max_internal_id、point_count |
+
+manifest 的 `max_internal_id` 会覆盖 live meta row 和 tombstone row。`vector_meta` 仍是
+source of truth; snapshot 只是 cold-start optimization。
+
 `model_hash` is **FNV-1a 32-bit** of the model name. The model name itself is
 not stored on disk; on `open()` we rebuild placeholder indices keyed by
 `__h::<mh>`, then promote them lazily the first time a caller uses the real
 model name (see §20.4).
 
-### 20.4 Open-time rebuild
+### 20.4 Open-time reload / rebuild
 
 `VectorStore::open` after partition init:
 
 1. Scan `vector_meta`, group rows by `(tenant, model_hash)`, decode `(vec, internal_id, dim)`.
-2. For each group: `VectorIndex::new(dim)` → `insert_batch(items)` (uses `hnsw_rs::parallel_insert`) → `set_next_id_at_least(max_id)`.
-3. Scan `vector_tomb`, group by `(tenant, model_hash)`, load into each index via `load_tombstones`.
-4. Store under placeholder key `IndexKey { tenant, model: "__h::<hex>" }`.
-5. First subsequent `insert`/`search` for that tenant+model name calls
+2. Scan `vector_tomb`, group tombstone ids by `(tenant, model_hash)`.
+3. For each group, try manifest-backed `HnswIo` reload first. The manifest must match
+   tenant/model_hash/dim, its dump files must exist, `point_count` must cover live rows, and
+   `max_internal_id` must cover both live meta and tombstone ids.
+4. If the snapshot is missing or stale, fall back to `VectorIndex::new(dim)` →
+   `insert_batch(items)` (uses `hnsw_rs::parallel_insert`) →
+   `set_next_id_at_least(max(live_id, tombstone_id))`.
+5. Replay `vector_tomb` into the chosen index via `load_tombstones`.
+6. Store under placeholder key `IndexKey { tenant, model: "__h::<hex>" }`.
+7. First subsequent `insert`/`search` for that tenant+model name calls
    `resolve_index` → finds placeholder by hash → re-keys to the real name +
    registers `(tenant, mh) -> name` in `model_names`.
 
@@ -791,7 +808,7 @@ of latency; left as a P2 tuning task.
 | First-call model-name resolution requires that the caller eventually use the same model name as on insert | acceptable for now; alternative is a 4th `vector_models` partition |
 | Full node fetch per filter candidate | add `nodes_meta` partition (kind + ts) in P2 |
 | No `update_vector(node_id, new_vec)` API | implement as `delete + insert`; consider in-place when HNSW supports it |
-| HNSW graph not snapshotted to disk; cold-start cost ~ O(N) inserts | acceptable up to ~100k; P3: `Hnsw::file_dump` snapshot + delta log |
+| HNSW graph cold-start rebuild | §24.4 adds manifest-backed `HnswIo` snapshot reload; metadata rebuild remains fallback |
 | No per-(tenant, model) capacity guard | `INDEX_DEFAULT_MAX_ELEMENTS = 1_000_000`; bigger tenants need their own knob |
 | Filter is a Rust closure, not pushable through HNSW | true post-filter; selective filters lose recall — see §20.6 over-fetch |
 
@@ -854,7 +871,7 @@ pub trait Embedder: Send + Sync {
 
 **facade 接线**:
 
-* `Database::open_with_embedder(path, config, Box<dyn Embedder>)` 在打开数据库的同时挂载嵌入器。`debug_assert_eq!(embedder.model_name(), config.default_model)` 提醒模型名一致(release 不强制 — 留出多模型混用的口子)。
+* `Database::open_with_embedder(path, config, Box<dyn Embedder>)` 在打开数据库的同时挂载嵌入器,并在 runtime 拒绝 `embedder.model_name() != config.default_model` 的配置,避免自动嵌入写入的 model 与默认查询 model 分叉。多模型向量仍通过显式 `NodeBuilder::embedding(model, v)` 进入。
 * `Database::insert` 内联自动嵌入:**只有**在嵌入器存在 ∧ 节点 content 是非空 `Text` ∧ 节点尚未含该 model 的 Embedding 时,才会调用 `embed` 并把结果 push 进 `node.embeddings`。
 * `Database::insert_text(kind, text)` 是"只给文本"的快捷入口;未挂载嵌入器时返回 `InvalidArgument` 显式失败,而不是静默写入一个无向量的节点。
 * `Database::search_text(query, k)` 用嵌入器把 query 编码后走 `vector_search_with_model(embedder.model_name(), …)`。
@@ -876,13 +893,15 @@ pub trait Embedder: Send + Sync {
 
 工作区 `cargo test --workspace` 全绿,无 ignored / 无 failed。
 
-### §21.5 P3 候选(尚未启动)
+### §21.5 P3 候选(历史快照;已由 §22-§24 推进)
+
+本小节保留 §21 收尾时的候选列表;当前状态以 §24.8 为准。
 
 1. **标签字典表 `label_dict`**:把 `label_hash → label_string` 物化,解决 FNV-1a 冲突 + 支持反向枚举。
 2. **图 + 向量混合 ranker**:在 `vector_search` 之上叠加"邻居加权"或"K 跳图扩张",形成 GraphRAG 风格的召回。
 3. **`metadata` 倒排表**:为 `VectorFilter` 新增任意 key/value 谓词的 sublinear 过滤通路。
-4. **Embedder 异步路径**:目前 `embed` 是同步的;接入远程模型时需要一个 `async fn embed_async` 或在 facade 外做缓冲。
-5. **`Hnsw::file_dump` 加速冷启动**:rebuild 在 ≥10⁵ 节点后会成为打开瓶颈,届时落地一份原生 dump,把 rebuild 降级成 fallback。
+4. **Embedder 异步路径**:§21 当时只有同步 `embed`;§23.3 后补上 `embed_async` / `embed_batch_async`。
+5. **`Hnsw::file_dump` 加速冷启动**:§21 当时预留 cold-start snapshot;§24.4 后接入 manifest-backed reload。
 
 ---
 
@@ -957,11 +976,361 @@ impl Database {
 
 `crates/mmdb/examples/` 现在有两份示范:`auto_embed_demo.rs`(自动嵌入端到端)和 `agent_memory.rs`(quickstart),都通过 `cargo run -p mmdb --example` 验证。
 
-### §22.6 P3 余下事项
+### §22.6 P3 历史余项(已由 §23-§24 推进)
 
 §21.5 的 5 件事除掉本节已完成的"图+向量混合 ranker",剩下 4 件:
+
+> 历史快照:以下 4 件后来分别在 §23.1(metadata index)、§23.2(label dict)、
+> §23.3(async embedder) 和 §24.4(HNSW snapshot reload) 中推进完成。
 
 1. `metadata` 倒排表(高优,agent 场景刚需)
 2. Embedder 异步路径(接真实远程模型必备)
 3. `label_dict` 字典表(标签命名空间变大时再做)
 4. `Hnsw::file_dump` 冷启动加速(10⁵ 节点级别再优化)
+
+---
+
+## §23 P3-2 索引/DSL/周边 crate 补齐(2026-06-06)
+
+本节记录一次面向"把空壳补成可验证实现"的收尾。目标不是宣称 P4 完成,而是把
+§22.6 的高优 P3 候选和 roadmap 里已经建好的空 crate 变成有行为、有测试的最小实现。
+
+### §23.1 `metadata` 倒排表
+
+`mmdb-storage` 现在打开并维护 `meta_index` partition:
+
+```
+key = [tenant_be(4) | field_hash_be(4) | value_hash_be(8) | node_id_be(16)]
+val = json([field, value])
+```
+
+* `put_node` 在同一个 fjall `Batch` 内同步写 `nodes` / `nodes_meta` / `meta_index`。
+* 同 id 覆盖写会先删除旧 secondary keys,避免 metadata 旧值残留。
+* `delete_node` 同步删除 metadata 索引项。
+* `Database::vector_search_filtered` 新增 `VectorFilter::metadata_eq`,先通过
+  `Storage::node_ids_by_metadata` 做候选集合,再和 kind/time 的 `nodes_meta` 快路径 AND。
+
+补测时顺手暴露并修复了一个 upsert bug:重复 `Database::insert` 同一 `node.id` 时,
+旧 embedding 没有 tombstone,会让 vector search 返回重复节点。现在 `insert` 会在写入
+替换节点后删除旧 embedding 映射,再插入新 embedding。
+
+### §23.2 Embedder 异步路径
+
+`Embedder` trait 新增 object-safe boxed future 默认方法:
+
+```rust
+fn embed_async<'a>(&'a self, text: &'a str)
+    -> Pin<Box<dyn Future<Output = Result<Vec<f32>>> + Send + 'a>>;
+```
+
+默认实现委托同步 `embed`,远程 provider 可以 override。Facade 新增:
+
+* `Database::insert_text_async`
+* `Database::search_text_async`
+
+async insert 会预先把 embedding 挂到节点上,因此不会再次触发同步 auto-embed。
+
+### §23.3 Graph label dictionary
+
+`mmdb-graph` 新增 `edge_label_dict` partition:
+
+```
+key = [tenant_be(4) | label_hash_be(4) | label_utf8]
+val = []
+```
+
+标签字典和 edge insert 同 batch 写入。key 同时包含 hash 和原始 label,所以即使 FNV-1a
+碰撞也不会互相覆盖。`GraphStore::labels` / `Database::edge_labels` 返回 tenant 作用域内
+已见过的 label 列表。当前设计会保留删除过 edge 的 label,把它当作轻量 namespace 字典。
+
+### §23.4 Query IR + MMQL 最小闭环
+
+`mmdb-query` 不再是空壳,现在包含:
+
+* `LogicalPlan` IR: `Scan`, `VectorSearch`, `GraphExpand`, `Filter`, `Score`, `TopK`,
+  `Join`, `Project`, `Udf`
+* `Predicate`, `FieldRef`, `Literal`, `VectorRef`, `ScoreExpr`
+* `Query::recall()` builder,覆盖 tenant/filter/vector/model/topk/limit
+* `Optimizer::optimize`,先落地 filter pushdown 到 `Scan` / `VectorSearch`
+
+`mmdb-mmql` 新增一个窄 parser,支持 implementation doc 里的 recall/vector 子集:
+
+```mmql
+recall n: Node
+  where n.tenant = 7 and n.kind in (Episode, Fact)
+  similar to [1.0, 0.0, 0.0] using model "text" topk 20
+  limit 5
+```
+
+这会 lower 到同一个 `LogicalPlan`。当时还不支持完整表达式语言、graph clause 或 UDF clause;
+这些语法后来由 §24.2 继续扩展。
+
+### §23.5 Blob / Catalog / UDF crate 最小实现
+
+`mmdb-blob`:
+
+* BLAKE3 content address
+* 小 blob 直接文件存储
+* 大 blob 按 4 MiB chunk 写入
+* `metadata.json` 持久化 refcount / size / chunked
+* `gc()` 删除 refcount=0 的物理文件
+* facade 新增 `Database::insert_blob` / `get_blob_stream` / `gc_blobs`;
+  删除 blob-backed node 时会递减 refcount
+
+`mmdb-catalog`:
+
+* embedding model registry,拒绝同名不同维度/距离配置
+* per-tenant node-kind stats
+* named snapshot registry(`name -> seq_no`)
+
+`mmdb-udf`:
+
+* WASM bytes magic/version validation
+* BLAKE3 hash + `UdfSignature`
+* `WasmLimits` 默认 memory/fuel caps
+* typed `UdfRegistry`
+
+注意:这里是 UDF registry / sandbox metadata,还不是 wasmtime 执行器。
+
+### §23.6 当前测试矩阵(2026-06-06)
+
+| crate | tests | 说明 |
+|---|---:|---|
+| mmdb | 19 | facade, auto/async embed, metadata filter, hybrid, label/blob/query facade |
+| mmdb-blob | 2 | content address/refcount/GC/chunk reopen |
+| mmdb-catalog | 3 | model registry/stats/snapshots |
+| mmdb-graph | 7 | 双向边/BFS/tenant/label dict |
+| mmdb-mmql | 1 | recall vector parser |
+| mmdb-query | 2 | recall builder + filter pushdown |
+| mmdb-storage | 3 | key encoding |
+| mmdb-udf | 3 | registry/hash/signature/limits |
+| mmdb-vector | 10 | HNSW/search/rebuild/filter/dump |
+| **合计** | **47 + 1 doctest** | `cargo test --workspace` 全绿 |
+
+### §23.7 历史剩余项(已由 §24 继续推进)
+
+以下是 §23 收尾时的剩余项;当前状态以 §24.8 为准。
+
+* 当时 `Hnsw::file_dump` 已有 wrapper 和测试,cold-start reload 缺口由 §24.4 推进完成。
+* 当时 `mmdb-query` / `mmdb-mmql` 是最小 recall/vector 闭环;§24.1/§24.2/§24.6 已补上
+  graph clause、UDF clause、Volcano executor 和 cost-based optimizer。
+
+---
+
+## §24 P3-3 Query Executor / UDF Runtime / HNSW Reload(2026-06-06)
+
+本节继续缩小 §23.7 的剩余面。
+
+### §24.1 `mmdb-query` 执行语义
+
+`mmdb-query` 新增一个 in-memory Volcano-style executor,用于给 IR 明确可测语义:
+
+* `ExecutionContext`:内存里的 `nodes` / `edges` / UDF closure registry
+* `Executor::execute`:递归执行 `Scan`, `VectorSearch`, `GraphExpand`, `Filter`,
+  `Score`, `TopK`, `Join`, `Project`, `Udf`
+* `Record` / `EdgeRecord`:测试与上层执行器可复用的轻量 row 结构
+* `Optimizer::with_stats`:带 `Stats` 的 rule/cost 混合入口;当前会把高选择性
+  `Filter` push 到 `GraphExpand.from` 之前
+
+§24.6 继续把这层推进到独立 physical operator trait 和 batch executor。
+
+### §24.2 MMQL graph + UDF clause
+
+`mmdb-mmql` 的 parser 从 recall/vector 子集扩展到:
+
+```mmql
+connected via related depth 2
+score by udf "boost"
+```
+
+lowering 顺序为:
+
+```
+VectorSearch -> GraphExpand -> Udf -> TopK
+```
+
+随后又拆出 `RecallQuery` AST、`parse_ast`、`RecallQuery::lower` 和可选 `Resolver`:
+
+* parser 先生成 AST,再 lowering 到 `LogicalPlan`
+* `Resolver` 可限制允许的 embedding model / UDF 名称
+* `parse_with_resolver` 在 lowering 前拒绝未知 model / UDF
+
+parser / resolver / plan-gen 现在已有三段式结构。
+
+`where` clause 现在支持 `n.created_at >/>=/</<= <epoch_ms>`、`now() - <duration>`
+relative time、`n.<metadata> = "value"` string equality,以及 `and` / `or` / `not`
+boolean predicate expression,lowering 到 `Predicate` tree。
+
+`parse_ast_diagnostic` 返回 `MmqlError { message, span }`,用于在缺失 clause 或未知
+`NodeKind` 时指向原始输入里的具体 byte span。
+
+`score by similarity * decay(n.created_at, half_life = 3d)` 现在会 lowering 到
+`ScoreExpr::Mul(ScoreExpr::Similarity, ScoreExpr::Decay { field: CreatedAtMs, ... })`。
+score expression 也支持括号和 numeric literal,例如
+`(similarity + 0.25) * decay(...)`。
+
+`count by kind` / `count by n.kind` 会在 recall `TopK` 后 lowering 到
+`LogicalPlan::Aggregate { group_by: [FieldRef::Kind], aggregate: Count }`。
+
+`join m: Node where m.kind in (...) on node_id` 会在 recall `TopK` 后 lowering 到
+`LogicalPlan::Join { left: recall_topk, right: Scan(Nodes, ...), on: JoinKey::NodeId }`。
+`join ... on n.field = alias.field` 会 lowering 到 `JoinKey::Field`,多个 join 会按书写顺序
+叠成 left-deep join chain。
+
+`connected from (u: Node where ...) via mentions depth 1` 会把 recall vector plan 与
+subquery seed 的 `GraphExpand(Scan(...))` 通过 `JoinKey::NodeId` 做 graph filter。
+`return n.id, n.content, score` 会 lowering 到 `LogicalPlan::Project`。
+
+### §24.3 Wasmtime UDF runtime
+
+`mmdb-udf` 新增 `WasmRuntime`:
+
+* 使用 `wasmtime` 加载 wasm bytes
+* `Config::consume_fuel(true)` + `Store::set_fuel`
+* `StoreLimitsBuilder::memory_size` 限制 linear memory
+* `call_i64(wasm, "run", &[i64]) -> i64` 最小执行入口
+* 测试覆盖正常执行和 fuel exhaustion
+
+registry 仍负责 name/signature/hash/limits metadata;runtime 负责执行与 sandbox caps。
+
+### §24.4 HNSW snapshot reload
+
+`VectorIndex::search_snapshot(dir, basename, query, k, ef)` 仍保留为短生命周期 helper。
+`VectorIndex::load_snapshot_from_dir(dim, dir, basename)` 现在也能给 `VectorStore::open` 加载
+长期持有的 graph:它显式用 `ReloadOptions::new(false)` 关闭 mmap,让 `hnsw_rs` reload owned
+`Vec<f32>` point data;随后在这一局部 invariant 下把 loader-tied lifetime 提升到 `Hnsw<'static>`。
+
+`VectorStore::flush_snapshots()` 会为 dirty index 写 native dump + manifest。`VectorStore::open`
+读取 manifest 后只在 tenant/model_hash/dim 匹配、dump 文件存在、`point_count` 覆盖 live rows、
+`max_internal_id` 覆盖 live meta 与 tombstone ids,且 native dump 能成功加载时使用 `HnswIo`
+reload;否则继续 metadata rebuild。
+reload 之后仍会 replay `vector_tomb`,所以 snapshot graph 可以包含已删除点,而 tombstone bitmap
+负责在 search 时过滤。
+
+### §24.5 当前测试矩阵(2026-06-06)
+
+| crate | tests | 说明 |
+|---|---:|---|
+| mmdb | 34 | facade, auto/async embed, metadata/updated_at filter, hybrid, label/blob/query physical/UDF/project/score projection/text-vector/thread-backed async facade, embedder config validation |
+| mmdb-blob | 2 | content address/refcount/GC/chunk reopen |
+| mmdb-catalog | 3 | model registry/stats/snapshots |
+| mmdb-graph | 7 | 双向边/BFS/tenant/label dict |
+| mmdb-mmql | 19 | recall parser, graph/UDF clause, AST, resolver, diagnostic spans, boolean where predicates, embed text query, relative time, score expr grammar, count aggregation, ordered joins, connected subquery, return projection |
+| mmdb-query | 22 | recall builder, filter pushdown, executor, physical/source batches, UDF binding, histogram selectivity, join costing/order rewrite, aggregate, project/score projection, field/updated_at semantics, instrumented source EXPLAIN |
+| mmdb-storage | 3 | key encoding |
+| mmdb-udf | 5 | registry/hash/signature/limits + wasmtime runtime/fuel |
+| mmdb-vector | 14 | HNSW/search/rebuild/filter/dump/reload helper/open-time snapshot reload/fallback/tombstone high-water |
+| **合计** | **109 + 1 doctest** | `cargo test --workspace` 全绿 |
+
+### §24.6 Query physical operator + histogram selectivity
+
+`mmdb-query` 现在有一层独立的 batch-oriented physical executor:
+
+* `RecordBatch { rows }`
+* `PhysicalOperator::next_batch()`
+* `Executor::compile(plan, batch_size)`
+* streaming `ScanOperator`, `FilterOperator`, `ScoreOperator`, `UdfOperator`
+* blocking `GraphExpandOperator`, `TopKOperator`, `JoinOperator`
+* materialized vector-search leaf,用于当前 in-memory test context
+
+`Stats` 也从单个全局 selectivity knob 扩展为 histogram-backed estimation:
+
+* `FieldHistogram::from_counts`
+* `Stats::with_histogram`
+* `Stats::estimate_selectivity(Predicate)`
+* `Optimizer` 在决定是否把 `Filter` 推到 `GraphExpand.from` 前时,优先使用 predicate-level
+  histogram selectivity。
+
+这让 implementation doc 中的 Volcano operator / histogram optimizer 不再只是设计草图;in-memory
+executor 先给 IR 明确语义,source-backed executor 则把真实 storage/vector/graph scans 接入 facade。
+
+`Executor::explain(plan, stats)` 返回 `ExplainNode` tree:
+
+* physical operator name,例如 `ScanOp`, `HnswSearchOp`, `GraphExpandOp`, `TopKOp`
+* `estimated_rows`,由 `Stats` / `FieldHistogram` 推算
+* `actual_rows`,由当前 executor 对该 subtree 的执行结果计数
+* nested `children`,保留 physical plan 结构
+
+这满足当前 in-memory executor 的 `EXPLAIN` est/actual row-count 闭环。
+
+`mmdb-query` 也新增 source-trait backed physical path:
+
+* `QuerySource`:抽象 `range_scan`, `hnsw_search`, `graph_expand`
+* `SourceExecutor::compile`:把 `Scan` / `VectorSearch` / `GraphExpand` leaf 编译到 source-backed
+  batch operators
+* 其余 `Filter`, `Score`, `TopK`, `Join`, `Project` 和通过 `with_udf` 绑定的 `Udf`
+  复用同一批 physical operators
+
+这样 query crate 不依赖 storage/vector/graph,但已经能表达 source-backed `RangeScanOp` /
+`HnswSearchOp` / `GraphExpandOp` 的执行边界。
+
+`SourceExecutor::explain(plan, stats, batch_size)` 现在会编译一棵带 row counter 的 physical tree,
+drain root 一次,再把 actual row counts 写回 `ExplainNode`。这让 source-backed `RangeScanOp` /
+`HnswSearchOp` / `GraphExpandOp` 的 EXPLAIN 不需要通过重复执行 subtree 来取 actual rows。
+
+Join costing 现在有明确策略:
+
+* `JoinStrategy::{HashBuildLeft, HashBuildRight, Merge}`
+* `Optimizer::choose_join_strategy(left_rows, right_rows, join_key)`
+* `Optimizer::join_order_candidates(plan)`:对同一 join key 的 join chain 枚举 bounded
+  left-deep order candidates,并按 histogram-backed row estimate / cost 排序
+* `Optimizer::optimize`:会对 scan-only `JoinKey::NodeId` chain 应用最便宜的 left-deep
+  join order;对 vector/graph/score-preserving anchor chain 会固定最左侧 retained-row/score
+  source,再重排其右侧 scan filter leaves
+* `EXPLAIN` 对 join 使用 costed physical operator name (`HashJoinOp` / `MergeJoinOp`)
+
+当前策略很小:明显小表 build hash,大且均衡的可排序 key join 走 merge join。join order
+rewrite 尊重当前 `Join` 的 semi-join 语义(left rows retained):scan-only node-id chain 可以
+整体重排;带 vector/graph/`Score`/`Udf` anchor 的 chain 会保持最左侧输出来源不变,只把后续
+scan leaves 按 cost 重排,从而保留 score / projection 语义。
+
+### §24.7 Facade storage/vector/graph query bridge
+
+`mmdb` facade 新增 `Database::execute_query(&LogicalPlan) -> Vec<mmdb_query::Record>`。
+所有 facade query plan 会走 `Database::execute_query_physical`,也就是 source-backed physical
+executor;facade-local UDF 会通过 cloneable closure binding 注入 `SourceExecutor`:
+
+* `Scan(Nodes)`:走真实 `Storage::scan_by_time`,再应用 `Predicate`
+* `VectorSearch`:走真实 `VectorStore::search`,再回表到 `Storage`;`VectorRef::Text`
+  会通过 facade 配置的 embedder 先解析成 query vector
+* `GraphExpand`:先执行 seed plan,再走真实 `GraphStore::bfs`
+* `Filter`, `Score`, `TopK`, `Join`, `Project`:在 materialized query rows 上执行;`Project`
+  可保留 typed `score`, `TopK(SortKey::Field(_))` 会按请求字段排序
+* `Aggregate`:当前支持 `Count` + `group_by` fields,例如 `count by kind`
+* `Udf`:通过 `Database::register_query_udf` 注册 facade-local closure 后在 physical operator
+  中执行;直接执行 wasm 的 sandbox runtime 由 `mmdb-udf::WasmRuntime` 暴露,facade query
+  bridge 保持 closure contract,避免 query crate 反向依赖 wasmtime
+
+同时提供 `Database::execute_query_async(&LogicalPlan)`,作为 async caller 的 top-level query
+entry point。当前底层 storage/vector/graph API 仍是同步的,所以 async facade 会 clone
+storage/vector/graph handles 和 registered UDF bindings,把 source-backed physical execution
+offload 到 worker thread。Future 首次 poll 会启动 worker 并返回 `Pending`;worker 完成真实
+store execution path 后唤醒 caller,避免把同步 storage/vector/graph/UDF work 跑在 polling thread 上。
+
+这把 `LogicalPlan` 从 in-memory test context 推进到真实 persisted stores。`mmdb-query` crate 仍保持
+core-only,避免反向依赖 storage/vector/graph;真实 source binding 放在用户依赖的 `mmdb` crate。
+
+`Database::query_optimizer_stats()` 会从 facade catalog 输出 `mmdb_query::Stats`:
+
+* `Database::open` / `open_with_embedder` 会从 persisted nodes 重建当前 tenant 的 catalog
+* insert / delete / same-id update 会维护 `TenantStats`
+* stats feed 目前提供 `node_rows` 和 `FieldRef::Kind` histogram,可直接交给
+  `Optimizer::with_stats` 或 `Executor::explain`
+
+`Database` 现在也实现 `mmdb_query::QuerySource`,所以 `SourceExecutor::compile` /
+`SourceExecutor::explain` 可以直接绑定真实 facade stores:
+
+* `range_scan`:真实 `Storage::scan_by_time` + `Predicate`
+* `hnsw_search`:真实 `VectorStore::search` + 回表 + `Predicate`
+* `graph_expand`:真实 `GraphStore::bfs`
+
+### §24.8 §24 收尾状态
+
+§24 原本剩余的三项已经闭环:
+
+* `HnswIo` reload 通过 manifest-backed `VectorStore::flush_snapshots()` / `VectorStore::open`
+  接入长期持有的 HNSW graph,同时保留 metadata rebuild fallback。
+* query optimizer 对 scan-only join chain 和固定 score-preserving anchor + scan filter suffix
+  都会做 bounded cost reorder。
+* `Database::execute_query_async` 会把 source-backed physical execution 放到 worker thread,
+  不再只做 cooperative yield。
