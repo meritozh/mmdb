@@ -7,3 +7,4 @@ authors.workspace = true
 
 [dependencies]
 mmdb-core = { path = "../mmdb-core" }
+mmdb-query = { path = "../mmdb-query" }
