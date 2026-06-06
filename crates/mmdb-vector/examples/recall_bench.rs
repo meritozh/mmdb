@@ -56,7 +56,9 @@ fn main() {
     let insert_ms = t.elapsed().as_secs_f64() * 1e3;
     println!(
         "indexed {} vectors of dim {} in {:.1} ms  ({:.1} k vec/s)",
-        N, DIM, insert_ms,
+        N,
+        DIM,
+        insert_ms,
         (N as f64) / insert_ms
     );
 
@@ -67,7 +69,7 @@ fn main() {
     }
 
     // Ground truth via brute force
-    let mut gts: Vec<Vec<Ulid> > = Vec::with_capacity(QUERIES);
+    let mut gts: Vec<Vec<Ulid>> = Vec::with_capacity(QUERIES);
     for q in &queries {
         let mut sims: Vec<(Ulid, f32)> = items
             .iter()
@@ -84,8 +86,7 @@ fn main() {
         let t = Instant::now();
         let hits = store.search(0, "default", q, K).unwrap();
         lats_us.push(t.elapsed().as_secs_f64() * 1e6);
-        let got: std::collections::HashSet<Ulid> =
-            hits.iter().map(|h| h.node_id).collect();
+        let got: std::collections::HashSet<Ulid> = hits.iter().map(|h| h.node_id).collect();
         let intersect = gt.iter().filter(|id| got.contains(id)).count();
         total_recall += intersect as f64 / K as f64;
     }

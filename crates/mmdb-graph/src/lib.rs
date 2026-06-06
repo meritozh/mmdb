@@ -10,17 +10,19 @@
 //! reverse partition stores just keys so updates stay cheap.
 use fjall::{Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
 use mmdb_core::{Edge, Error, Result};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use ulid::Ulid;
 
 const PART_OUT: &str = "edges_out";
 const PART_IN: &str = "edges_in";
+const PART_LABELS: &str = "edge_label_dict";
 
 /// Persistent property-graph store backed by two `fjall` partitions.
 pub struct GraphStore {
     keyspace: Keyspace,
     out: PartitionHandle,
     inn: PartitionHandle,
+    labels: PartitionHandle,
 }
 
 /// Which side of an edge a traversal follows.
@@ -45,7 +47,15 @@ impl GraphStore {
         let inn = keyspace
             .open_partition(PART_IN, PartitionCreateOptions::default())
             .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(Self { keyspace, out, inn })
+        let labels = keyspace
+            .open_partition(PART_LABELS, PartitionCreateOptions::default())
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(Self {
+            keyspace,
+            out,
+            inn,
+            labels,
+        })
     }
 
     /// Insert an edge, writing both forward and reverse index entries
@@ -54,11 +64,13 @@ impl GraphStore {
         let lh = label_hash(&edge.label);
         let kout = out_key(tenant, edge.src, lh, edge.dst);
         let kin = in_key(tenant, edge.dst, lh, edge.src);
+        let label_key = label_dict_key(tenant, lh, &edge.label);
         let val = serde_json::to_vec(&edge).map_err(Error::from)?;
 
         let mut batch = self.keyspace.batch();
         batch.insert(&self.out, kout, val);
         batch.insert(&self.inn, kin, []);
+        batch.insert(&self.labels, label_key, []);
         batch.commit().map_err(|e| Error::Storage(e.to_string()))?;
         self.keyspace
             .persist(PersistMode::SyncAll)
@@ -108,12 +120,7 @@ impl GraphStore {
 
     /// All incoming edges. We materialise the edges by going back to `out`
     /// using the (src, dst, label_hash) tuple recorded in the in-key.
-    pub fn neighbours_in(
-        &self,
-        tenant: u32,
-        node: Ulid,
-        label: Option<&str>,
-    ) -> Result<Vec<Edge>> {
+    pub fn neighbours_in(&self, tenant: u32, node: Ulid, label: Option<&str>) -> Result<Vec<Edge>> {
         let (lo, hi) = match label {
             Some(l) => in_label_range(tenant, node, label_hash(l)),
             None => in_node_range(tenant, node),
@@ -132,8 +139,10 @@ impl GraphStore {
             src_buf.copy_from_slice(&k[24..40]);
             let src = Ulid(u128::from_be_bytes(src_buf));
             let kout = out_key(tenant, src, lh, node);
-            if let Some(v) =
-                self.out.get(&kout).map_err(|e| Error::Storage(e.to_string()))?
+            if let Some(v) = self
+                .out
+                .get(&kout)
+                .map_err(|e| Error::Storage(e.to_string()))?
             {
                 let e: Edge = serde_json::from_slice(&v).map_err(Error::from)?;
                 if let Some(l) = label {
@@ -190,6 +199,24 @@ impl GraphStore {
             }
         }
         Ok(order)
+    }
+
+    /// Enumerate distinct labels observed for `tenant`.
+    ///
+    /// The dictionary key stores both the FNV hash and the original label
+    /// bytes, so hash collisions remain enumerable instead of overwriting each
+    /// other. Labels are intentionally retained after edge deletion as a small
+    /// namespace dictionary.
+    pub fn labels(&self, tenant: u32) -> Result<Vec<String>> {
+        let (lo, hi) = label_dict_tenant_range(tenant);
+        let mut labels = BTreeSet::new();
+        for kv in self.labels.range(lo..hi) {
+            let (k, _) = kv.map_err(|e| Error::Storage(e.to_string()))?;
+            if let Some(label) = label_from_dict_key(&k) {
+                labels.insert(label);
+            }
+        }
+        Ok(labels.into_iter().collect())
     }
 }
 
@@ -260,6 +287,29 @@ fn in_label_range(tenant: u32, dst: Ulid, lh: u32) -> (Vec<u8>, Vec<u8>) {
     (lo, hi)
 }
 
+fn label_dict_key(tenant: u32, lh: u32, label: &str) -> Vec<u8> {
+    let bytes = label.as_bytes();
+    let mut key = Vec::with_capacity(4 + 4 + bytes.len());
+    key.extend_from_slice(&tenant.to_be_bytes());
+    key.extend_from_slice(&lh.to_be_bytes());
+    key.extend_from_slice(bytes);
+    key
+}
+
+fn label_dict_tenant_range(tenant: u32) -> (Vec<u8>, Vec<u8>) {
+    let lo = tenant.to_be_bytes().to_vec();
+    let mut hi = lo.clone();
+    hi.extend_from_slice(&[0xff_u8; 4 + 256]);
+    (lo, hi)
+}
+
+fn label_from_dict_key(k: &[u8]) -> Option<String> {
+    if k.len() < 4 + 4 {
+        return None;
+    }
+    String::from_utf8(k[8..].to_vec()).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,8 +319,12 @@ mod tests {
 
     fn mk_edge(src: Ulid, dst: Ulid, label: &str) -> Edge {
         Edge {
-            src, dst, label: label.into(), weight: 1.0,
-            created_at_ms: 0, metadata: BTreeMap::new(),
+            src,
+            dst,
+            label: label.into(),
+            weight: 1.0,
+            created_at_ms: 0,
+            metadata: BTreeMap::new(),
         }
     }
 
@@ -283,7 +337,9 @@ mod tests {
     #[test]
     fn add_then_list_out() {
         let (_d, g) = open();
-        let a = Ulid::new(); let b = Ulid::new(); let c = Ulid::new();
+        let a = Ulid::new();
+        let b = Ulid::new();
+        let c = Ulid::new();
         g.add_edge(0, mk_edge(a, b, "rel")).unwrap();
         g.add_edge(0, mk_edge(a, c, "rel")).unwrap();
         let outs = g.neighbours_out(0, a, None).unwrap();
@@ -295,7 +351,8 @@ mod tests {
     #[test]
     fn label_filter_works() {
         let (_d, g) = open();
-        let a = Ulid::new(); let b = Ulid::new();
+        let a = Ulid::new();
+        let b = Ulid::new();
         g.add_edge(0, mk_edge(a, b, "knows")).unwrap();
         g.add_edge(0, mk_edge(a, b, "likes")).unwrap();
         let knows = g.neighbours_out(0, a, Some("knows")).unwrap();
@@ -306,7 +363,8 @@ mod tests {
     #[test]
     fn in_edges_round_trip() {
         let (_d, g) = open();
-        let a = Ulid::new(); let b = Ulid::new();
+        let a = Ulid::new();
+        let b = Ulid::new();
         g.add_edge(0, mk_edge(a, b, "rel")).unwrap();
         let ins = g.neighbours_in(0, b, None).unwrap();
         assert_eq!(ins.len(), 1);
@@ -316,7 +374,8 @@ mod tests {
     #[test]
     fn remove_drops_both_sides() {
         let (_d, g) = open();
-        let a = Ulid::new(); let b = Ulid::new();
+        let a = Ulid::new();
+        let b = Ulid::new();
         g.add_edge(0, mk_edge(a, b, "rel")).unwrap();
         g.remove_edge(0, a, b, "rel").unwrap();
         assert!(g.neighbours_out(0, a, None).unwrap().is_empty());
@@ -326,7 +385,10 @@ mod tests {
     #[test]
     fn bfs_two_hop() {
         let (_d, g) = open();
-        let a = Ulid::new(); let b = Ulid::new(); let c = Ulid::new(); let d = Ulid::new();
+        let a = Ulid::new();
+        let b = Ulid::new();
+        let c = Ulid::new();
+        let d = Ulid::new();
         g.add_edge(0, mk_edge(a, b, "r")).unwrap();
         g.add_edge(0, mk_edge(b, c, "r")).unwrap();
         g.add_edge(0, mk_edge(c, d, "r")).unwrap();
@@ -344,9 +406,25 @@ mod tests {
     #[test]
     fn tenant_isolation() {
         let (_d, g) = open();
-        let a = Ulid::new(); let b = Ulid::new();
+        let a = Ulid::new();
+        let b = Ulid::new();
         g.add_edge(0, mk_edge(a, b, "r")).unwrap();
         assert!(g.neighbours_out(1, a, None).unwrap().is_empty());
         assert_eq!(g.neighbours_out(0, a, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn label_dictionary_enumerates_distinct_tenant_labels() {
+        let (_d, g) = open();
+        let a = Ulid::new();
+        let b = Ulid::new();
+        let c = Ulid::new();
+        g.add_edge(0, mk_edge(a, b, "related")).unwrap();
+        g.add_edge(0, mk_edge(b, c, "related")).unwrap();
+        g.add_edge(0, mk_edge(a, c, "mentions")).unwrap();
+        g.add_edge(1, mk_edge(a, c, "other-tenant")).unwrap();
+
+        let labels = g.labels(0).unwrap();
+        assert_eq!(labels, vec!["mentions".to_string(), "related".to_string()]);
     }
 }

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use ulid::Ulid;
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum NodeKind {
     Episode = 1,
     Fact = 2,
@@ -30,7 +30,11 @@ impl NodeKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Content {
     Text(String),
-    Blob { hash: [u8; 32], size: u64, mime: String },
+    Blob {
+        hash: [u8; 32],
+        size: u64,
+        mime: String,
+    },
     Structured(serde_json::Value),
 }
 
