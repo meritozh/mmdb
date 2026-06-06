@@ -10,12 +10,19 @@ use tempfile::tempdir;
 
 /// Tiny deterministic embedder for demos and tests.
 /// Tokenizes on whitespace and FNV-1a-hashes each token into a fixed bucket.
-struct HashEmbedder { dim: u32 }
+struct HashEmbedder {
+    dim: u32,
+}
 impl HashEmbedder {
-    fn new(dim: u32) -> Self { Self { dim } }
+    fn new(dim: u32) -> Self {
+        Self { dim }
+    }
     fn fnv1a(s: &str) -> u32 {
         let mut h: u32 = 0x811c9dc5;
-        for b in s.as_bytes() { h ^= *b as u32; h = h.wrapping_mul(0x01000193); }
+        for b in s.as_bytes() {
+            h ^= *b as u32;
+            h = h.wrapping_mul(0x01000193);
+        }
         h
     }
 }
@@ -26,17 +33,28 @@ impl Embedder for HashEmbedder {
             let h = Self::fnv1a(&tok.to_ascii_lowercase()) as usize;
             v[h % self.dim as usize] += 1.0;
         }
-        let n: f32 = v.iter().map(|x| x*x).sum::<f32>().sqrt();
-        if n > 0.0 { for x in v.iter_mut() { *x /= n; } }
+        let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if n > 0.0 {
+            for x in v.iter_mut() {
+                *x /= n;
+            }
+        }
         Ok(v)
     }
-    fn model_name(&self) -> &str { "demo-hash-64" }
-    fn dim(&self) -> u32 { self.dim }
+    fn model_name(&self) -> &str {
+        "demo-hash-64"
+    }
+    fn dim(&self) -> u32 {
+        self.dim
+    }
 }
 
 fn main() -> anyhow::Result<()> {
     let dir = tempdir()?;
-    let cfg = DatabaseConfig { tenant: 0, default_model: "demo-hash-64".into() };
+    let cfg = DatabaseConfig {
+        tenant: 0,
+        default_model: "demo-hash-64".into(),
+    };
     let db = Database::open_with_embedder(dir.path(), cfg, Box::new(HashEmbedder::new(64)))?;
 
     // Insert raw text — embedding is generated automatically.

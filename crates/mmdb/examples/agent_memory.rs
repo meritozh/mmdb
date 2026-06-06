@@ -8,29 +8,47 @@ use mmdb::{Database, DatabaseConfig, Embedder, VectorFilter};
 use mmdb_core::{NodeKind, Result};
 use tempfile::tempdir;
 
-struct HashEmbedder { dim: u32 }
-impl HashEmbedder { fn new(dim: u32) -> Self { Self { dim } } }
+struct HashEmbedder {
+    dim: u32,
+}
+impl HashEmbedder {
+    fn new(dim: u32) -> Self {
+        Self { dim }
+    }
+}
 impl Embedder for HashEmbedder {
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let mut v = vec![0.0f32; self.dim as usize];
         for tok in text.split_whitespace() {
             let mut h: u32 = 0x811c9dc5;
             for b in tok.to_ascii_lowercase().as_bytes() {
-                h ^= *b as u32; h = h.wrapping_mul(0x01000193);
+                h ^= *b as u32;
+                h = h.wrapping_mul(0x01000193);
             }
             v[(h as usize) % self.dim as usize] += 1.0;
         }
-        let n: f32 = v.iter().map(|x| x*x).sum::<f32>().sqrt();
-        if n > 0.0 { for x in v.iter_mut() { *x /= n; } }
+        let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if n > 0.0 {
+            for x in v.iter_mut() {
+                *x /= n;
+            }
+        }
         Ok(v)
     }
-    fn model_name(&self) -> &str { "demo-hash-64" }
-    fn dim(&self) -> u32 { self.dim }
+    fn model_name(&self) -> &str {
+        "demo-hash-64"
+    }
+    fn dim(&self) -> u32 {
+        self.dim
+    }
 }
 
 fn main() -> anyhow::Result<()> {
     let dir = tempdir()?;
-    let cfg = DatabaseConfig { tenant: 0, default_model: "demo-hash-64".into() };
+    let cfg = DatabaseConfig {
+        tenant: 0,
+        default_model: "demo-hash-64".into(),
+    };
     let db = Database::open_with_embedder(dir.path(), cfg, Box::new(HashEmbedder::new(64)))?;
 
     // 1) Sprinkle in a few memories — Facts get vectors auto-attached.

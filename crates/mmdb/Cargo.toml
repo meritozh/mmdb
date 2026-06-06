@@ -10,6 +10,9 @@ mmdb-core = { path = "../mmdb-core" }
 mmdb-storage = { path = "../mmdb-storage" }
 mmdb-vector = { path = "../mmdb-vector" }
 mmdb-graph = { path = "../mmdb-graph" }
+mmdb-blob = { path = "../mmdb-blob" }
+mmdb-catalog = { path = "../mmdb-catalog" }
+mmdb-query = { path = "../mmdb-query" }
 ulid.workspace = true
 smallvec.workspace = true
 serde_json.workspace = true
