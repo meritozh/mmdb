@@ -39,11 +39,38 @@ impl NodeBuilder {
     }
 
     /// Set the node body to a blob reference already present in the blob store.
+    ///
+    /// For blobs ≤ `mmdb_blob::INLINE_THRESHOLD` (64 KB) you can also pass
+    /// the raw bytes here via `blob_inlined` so the payload is embedded in
+    /// the node record itself — no separate blob-fs lookup needed on read.
     pub fn blob(mut self, hash: [u8; 32], size: u64, mime: impl Into<String>) -> Self {
         self.content = Some(Content::Blob {
             hash,
             size,
             mime: mime.into(),
+            inline: None,
+        });
+        self
+    }
+
+    /// Set the node body to a blob with its bytes inlined directly inside
+    /// the node record. The `hash` is the BLAKE3 hash of `bytes`; the
+    /// refcount in the blob store will still be incremented so that the
+    /// payload is safe against GC even if the `bytes` field is dropped
+    /// from a future revision of the node.
+    pub fn blob_inlined(
+        mut self,
+        hash: [u8; 32],
+        bytes: impl Into<Vec<u8>>,
+        mime: impl Into<String>,
+    ) -> Self {
+        let bytes = bytes.into();
+        let size = bytes.len() as u64;
+        self.content = Some(Content::Blob {
+            hash,
+            size,
+            mime: mime.into(),
+            inline: Some(bytes),
         });
         self
     }

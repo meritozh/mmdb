@@ -34,6 +34,12 @@ pub enum Content {
         hash: [u8; 32],
         size: u64,
         mime: String,
+        /// For small blobs (≤ mmdb_blob::INLINE_THRESHOLD, i.e. ≤64 KB)
+        /// the payload bytes can be inlined directly inside the node
+        /// record so that `get_node()` immediately returns them without
+        /// a separate blob-fs lookup. When `None`, bytes must be read
+        /// from the blob store via `get_blob_stream(&hash)`.
+        inline: Option<Vec<u8>>,
     },
     Structured(serde_json::Value),
 }

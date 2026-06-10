@@ -1139,10 +1139,13 @@ name = "mmdb-blob"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "fjall",
  "mmdb-core",
+ "parking_lot",
  "serde",
  "serde_json",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]

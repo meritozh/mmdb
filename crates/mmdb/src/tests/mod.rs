@@ -1205,15 +1205,25 @@ fn insert_blob_stores_artifact_and_reads_stream() {
         .unwrap();
 
     let node = db.get(id).unwrap().unwrap();
-    let Content::Blob { hash, size, mime } = node.content else {
+    let Content::Blob { hash, size, mime, inline } = node.content else {
         panic!("expected blob content");
     };
     assert_eq!(size, 12);
     assert_eq!(mime, "text/plain");
+    // Small blob ≤64KB: bytes must be inlined in the node record.
+    assert_eq!(inline.as_deref(), Some(b"blob payload".as_slice()));
     assert_eq!(db.blob_refcount(&hash).unwrap(), Some(1));
 
     let mut bytes = Vec::new();
     db.get_blob_stream(&hash)
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert_eq!(bytes, b"blob payload");
+
+    // Short-circuiting get_blob_stream_for returns inlined bytes directly.
+    let mut bytes = Vec::new();
+    db.get_blob_stream_for(&hash, id)
         .unwrap()
         .read_to_end(&mut bytes)
         .unwrap();
@@ -1259,7 +1269,7 @@ fn inserting_node_with_existing_blob_reference_increments_refcount() {
         )
         .unwrap();
     let (hash, size, mime) = match db.get(first).unwrap().unwrap().content {
-        Content::Blob { hash, size, mime } => (hash, size, mime),
+        Content::Blob { hash, size, mime, .. } => (hash, size, mime),
         _ => panic!("expected blob content"),
     };
 
@@ -1278,6 +1288,54 @@ fn inserting_node_with_existing_blob_reference_increments_refcount() {
     assert!(db.get_blob_stream(&hash).is_ok());
     db.delete(second).unwrap();
     assert_eq!(db.blob_refcount(&hash).unwrap(), Some(0));
+}
+
+#[test]
+fn inlined_small_blob_refcount_works_uniformly_and_get_shortcircuits() {
+    use mmdb_blob::INLINE_THRESHOLD;
+    use std::io::Cursor;
+
+    let dir = tempdir().unwrap();
+    let db = Database::open(dir.path()).unwrap();
+
+    // A small (<=INLINE_THRESHOLD) payload — must be inlined into the node.
+    let small = vec![7u8; 1024];
+    let id = db
+        .insert_blob(NodeKind::Artifact, Cursor::new(small.clone()), "application/octet-stream")
+        .unwrap();
+    let node = db.get(id).unwrap().unwrap();
+    match node.content {
+        Content::Blob { hash, size, inline: Some(bytes), .. } => {
+            assert_eq!(size as usize, small.len());
+            assert_eq!(bytes, small);
+            assert!(size as usize <= INLINE_THRESHOLD);
+            // Refcount still tracked (uniform accounting) even though
+            // the bytes are embedded in the node record.
+            assert_eq!(db.blob_refcount(&hash).unwrap(), Some(1));
+            // get_blob_stream_for short-circuits to the inlined bytes.
+            let mut out = Vec::new();
+            db.get_blob_stream_for(&hash, id)
+                .unwrap()
+                .read_to_end(&mut out)
+                .unwrap();
+            assert_eq!(out, small);
+        }
+        other => panic!("expected inlined Content::Blob, got {other:?}"),
+    }
+
+    // A large (>INLINE_THRESHOLD) payload — must NOT be inlined.
+    let big = vec![9u8; INLINE_THRESHOLD + 1];
+    let id2 = db
+        .insert_blob(NodeKind::Artifact, Cursor::new(big.clone()), "application/octet-stream")
+        .unwrap();
+    let node2 = db.get(id2).unwrap().unwrap();
+    match node2.content {
+        Content::Blob { inline, size, .. } => {
+            assert!(inline.is_none());
+            assert_eq!(size as usize, big.len());
+        }
+        other => panic!("expected on-disk Content::Blob, got {other:?}"),
+    }
 }
 
 // Suppress unused warning for now_ms import

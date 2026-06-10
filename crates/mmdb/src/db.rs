@@ -4,7 +4,7 @@ use crate::query_impl::{
     collect_query_operator, query_stats_from_catalog, rebuild_catalog, AsyncQueryFuture,
     AsyncQueryRequest, QuerySourceHandle, QueryUdfFn, QUERY_BATCH_SIZE,
 };
-use mmdb_blob::BlobStore;
+use mmdb_blob::{BlobStore, PutOutcome};
 use mmdb_catalog::Catalog;
 use mmdb_core::{Content, Edge, Embedding, MemoryNode, NodeKind, Result};
 use mmdb_graph::GraphStore;
@@ -287,27 +287,65 @@ impl Database {
     }
 
     /// Store bytes in the content-addressed blob store and insert a blob-backed node.
+    ///
+    /// For payloads ≤ [`mmdb_blob::INLINE_THRESHOLD`] (64 KB) the bytes are
+    /// additionally embedded inside the node record so a subsequent
+    /// [`Self::get`] returns the payload directly without a blob-fs read.
+    /// The blob store still tracks refcounts uniformly.
     pub fn insert_blob(
         &self,
         kind: NodeKind,
         reader: impl Read,
         mime: impl Into<String>,
     ) -> Result<Ulid> {
-        let blob_ref = self.blob_store.put_stream(reader)?;
-        let node = NodeBuilder::new(kind)
-            .blob(blob_ref.hash, blob_ref.size, mime)
-            .build();
+        let mime = mime.into();
+        let outcome = self.blob_store.put_stream(reader)?;
+        let node = match outcome {
+            PutOutcome::InlinedSmall { r#ref, bytes } => NodeBuilder::new(kind)
+                .blob_inlined(r#ref.hash, bytes, mime)
+                .build(),
+            PutOutcome::OnDisk(r#ref) => {
+                NodeBuilder::new(kind).blob(r#ref.hash, r#ref.size, mime).build()
+            }
+        };
+        let hash = blob_hash(&node.content).expect("blob content always has a hash");
         match self.insert_inner(node, true) {
             Ok(id) => Ok(id),
             Err(err) => {
-                let _ = self.blob_store.dec_ref(&blob_ref.hash);
+                let _ = self.blob_store.dec_ref(&hash);
                 Err(err)
             }
         }
     }
 
     /// Read blob bytes by content hash.
+    ///
+    /// If `preferred_id` is given and its node carries inlined bytes for
+    /// `hash`, returns them directly (no blob-fs round-trip). Otherwise
+    /// falls back to the blob store.
     pub fn get_blob_stream(&self, hash: &[u8; 32]) -> Result<Box<dyn Read + Send>> {
+        self.blob_store.get_stream(hash)
+    }
+
+    /// Read blob bytes by content hash, trying to short-circuit to inlined
+    /// bytes if the specific node `id` already has them embedded.
+    pub fn get_blob_stream_for(
+        &self,
+        hash: &[u8; 32],
+        id: Ulid,
+    ) -> Result<Box<dyn Read + Send>> {
+        if let Some(node) = self.storage.get_node(self.config.tenant, id)? {
+            if let Content::Blob {
+                hash: node_hash,
+                inline: Some(bytes),
+                ..
+            } = &node.content
+            {
+                if node_hash == hash {
+                    return Ok(Box::new(std::io::Cursor::new(bytes.clone())));
+                }
+            }
+        }
         self.blob_store.get_stream(hash)
     }
 

@@ -1,284 +1,289 @@
 //! Content-addressed blob store.
+//!
+//! This crate is the storage backend for large binary payloads (images,
+//! documents, logs) in mmdb. It is deliberately layered *separately* from
+//! the fjall-backed `mmdb-storage` LSM engine — see crate-level docs on
+//! why: LSM trees with KV separation are the wrong primitive for MB-range,
+//! write-once, content-hashed data.
+//!
+//! # Layout
+//!
+//! ```text
+//! <root>/
+//!   blobs/            # blob bytes on the filesystem
+//!     <xx>/<64hex>    # one file per small blob, chunked directory per large
+//!   blob-meta/        # fjall keyspace with a single partition `m`
+//!     m/              # per-hash refcount + size + chunked flag
+//! ```
+//!
+//! # Semantics
+//!
+//! - **Dedup**: inserting the same bytes twice returns the same `BlobRef`
+//!   (same BLAKE3 hash) and bumps the refcount to 2.
+//! - **Lazy release**: `dec_ref` only drops the refcount; actual byte
+//!   deletion happens in `gc()`.
+//! - **Small-inline hint**: `put_stream` now returns a `PutOutcome` which
+//!   tells the caller whether the payload should be stored inline inside
+//!   the node's Content (small values, ≤ `INLINE_THRESHOLD`) instead of
+//!   relying on the blob fs for the byte storage. The metadata entry is
+//!   *still created* so that reference-count accounting stays uniform
+//!   across both paths; callers are free to skip the inline-hint branch
+//!   and fall back to fs storage.
 
-use mmdb_core::{Error, Result};
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::fs;
+mod fs;
+mod metadata;
+
+/// Hex-encode a 32-byte BLAKE3 hash as a 64-character lowercase string.
+pub fn hex_hash(hash: &[u8; 32]) -> String {
+    fs::hex_hash(hash)
+}
+
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Arc;
 
+use mmdb_core::{Error, Result};
+
+use crate::metadata::{BlobMeta, MetaStore};
+
+/// Blobs larger than this are split into 4 MiB chunks on disk.
 pub const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+
+/// Blobs ≤ this threshold are small enough to be stored inline inside
+/// the fjall `nodes` partition by the caller. They *can* also live on
+/// the filesystem; this is purely a performance hint.
 pub const INLINE_THRESHOLD: usize = 64 * 1024;
 
+/// A content-addressed reference to stored bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobRef {
     pub hash: [u8; 32],
     pub size: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BlobMeta {
-    refcount: u64,
-    size: u64,
-    chunked: bool,
+/// Outcome of [`BlobStore::put_stream`]. Callers decide how to persist
+/// the reference. For `InlinedSmall` the payload bytes are returned so
+/// the caller can embed them directly into a node's `Content::Blob`
+/// variant; for `OnDisk` the bytes live on the fs and only the ref is
+/// needed.
+pub enum PutOutcome {
+    /// Payload is small enough to inline. Bytes are returned.
+    /// A metadata entry (refcount = 1) is still created so refcount
+    /// accounting is uniform regardless of where bytes live.
+    InlinedSmall {
+        r#ref: BlobRef,
+        bytes: Vec<u8>,
+    },
+    /// Payload was written to the filesystem (possibly chunked).
+    OnDisk(BlobRef),
 }
 
+impl PutOutcome {
+    pub fn into_ref(self) -> BlobRef {
+        match self {
+            PutOutcome::InlinedSmall { r#ref, .. } => r#ref,
+            PutOutcome::OnDisk(r#ref) => r#ref,
+        }
+    }
+
+    pub fn hash(&self) -> &[u8; 32] {
+        match self {
+            PutOutcome::InlinedSmall { r#ref, .. } => &r#ref.hash,
+            PutOutcome::OnDisk(r#ref) => &r#ref.hash,
+        }
+    }
+
+    pub fn size(&self) -> u64 {
+        match self {
+            PutOutcome::InlinedSmall { r#ref, .. } => r#ref.size,
+            PutOutcome::OnDisk(r#ref) => r#ref.size,
+        }
+    }
+}
+
+/// Public API of the blob store.
 pub struct BlobStore {
     root: PathBuf,
-    meta: Mutex<BTreeMap<String, BlobMeta>>,
+    meta: Arc<MetaStore>,
 }
 
 impl BlobStore {
+    // ------------------------------------------------------------------
+    // Constructors
+    // ------------------------------------------------------------------
+
+    /// Open (or create) a blob store rooted at `path`.
+    ///
+    /// On open, performs a lightweight consistency check: warns (via
+    /// `tracing`) about on-disk blobs missing from metadata (orphans)
+    /// and metadata entries missing on disk (dangling). No automatic
+    /// repair is performed; callers that want aggressive clean-up can
+    /// follow up with `repair_remove_orphans`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let root = path.as_ref().to_path_buf();
-        fs::create_dir_all(root.join("blobs"))?;
-        let meta = if metadata_path(&root).exists() {
-            let bytes = fs::read(metadata_path(&root))?;
-            serde_json::from_slice(&bytes)?
-        } else {
-            BTreeMap::new()
-        };
-        Ok(Self {
-            root,
-            meta: Mutex::new(meta),
-        })
+        Self::open_with(path, false)
     }
 
-    pub fn put_stream(&self, mut reader: impl Read) -> Result<BlobRef> {
-        let mut data = Vec::new();
-        reader.read_to_end(&mut data)?;
-        let hash = *blake3::hash(&data).as_bytes();
-        let key = hex_hash(&hash);
+    /// Same as [`Self::open`] but also physically deletes any on-disk
+    /// blob that has no matching metadata entry (orphans). This is the
+    /// "repair" open — use it when you expect crash-recovery cleanup.
+    pub fn open_with_repair(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with(path, true)
+    }
 
-        let mut meta = self.lock_meta()?;
-        if let Some(existing) = meta.get_mut(&key) {
-            existing.refcount += 1;
-            let size = existing.size;
-            self.save_metadata(&meta)?;
-            return Ok(BlobRef { hash, size });
+    fn open_with(path: impl AsRef<Path>, repair: bool) -> Result<Self> {
+        let root = path.as_ref().to_path_buf();
+        fs::ensure_layout(&root)?;
+        let meta = Arc::new(MetaStore::open(&root)?);
+        let store = Self { root, meta };
+        store.reconcile_on_open(repair)?;
+        Ok(store)
+    }
+
+    // ------------------------------------------------------------------
+    // Public API
+    // ------------------------------------------------------------------
+
+    /// Read bytes from `reader`, hash them, and persist them.
+    ///
+    /// Returns a [`PutOutcome`] so callers can decide whether to store
+    /// bytes inline (≤ [`INLINE_THRESHOLD`]) or rely on the fs path.
+    ///
+    /// Deduplication: if the hash already exists the refcount is bumped
+    /// and no bytes are rewritten. The returned `PutOutcome` matches the
+    /// *current* payload size's hint even on dedup hits (i.e. a re-insert
+    /// of a 10-byte blob always returns `InlinedSmall` regardless of
+    /// whether the original caller inlined or stored on disk).
+    pub fn put_stream(&self, mut reader: impl Read) -> Result<PutOutcome> {
+        let (hash, bytes) = fs::hash_and_read(&mut reader)?;
+        let size = bytes.len() as u64;
+
+        // Fast path: already tracked?
+        if let Some(existing) = self.meta.get(&hash)? {
+            // Bump refcount; size on the record is authoritative.
+            self.meta.inc_ref(&hash)?;
+            let r#ref = BlobRef { hash, size: existing.size };
+            return Ok(mk_outcome(r#ref, bytes));
         }
 
-        let chunked = data.len() > INLINE_THRESHOLD;
-        self.write_blob_bytes(&hash, &data, chunked)?;
-        meta.insert(
-            key,
-            BlobMeta {
-                refcount: 1,
-                size: data.len() as u64,
-                chunked,
-            },
-        );
-        self.save_metadata(&meta)?;
-        Ok(BlobRef {
-            hash,
-            size: data.len() as u64,
-        })
+        // New blob: write bytes to fs (even if small — keeps refcount
+        // semantics uniform, and bytes can still be inlined by the caller
+        // from the returned PutOutcome).
+        let chunked = fs::write_blob_bytes(&self.root, &hash, &bytes)?;
+        self.meta.insert_new(&hash, size, chunked)?;
+        let r#ref = BlobRef { hash, size };
+        Ok(mk_outcome(r#ref, bytes))
     }
 
+    /// Read bytes for a hash. Returns a boxed reader for parity with
+    /// the previous API; the current implementation materialises into
+    /// memory, but preserving the trait object keeps us forward-compatible
+    /// with a future zero-copy mmap implementation.
     pub fn get_stream(&self, hash: &[u8; 32]) -> Result<Box<dyn Read + Send>> {
-        let key = hex_hash(hash);
-        let meta = self
-            .lock_meta()?
-            .get(&key)
-            .cloned()
+        let BlobMeta { chunked, size, .. } = self
+            .meta
+            .get(hash)?
             .ok_or(Error::NotFound)?;
-        let data = if meta.chunked {
-            self.read_chunked(hash, meta.size)?
-        } else {
-            fs::read(blob_path(&self.root, hash))?
-        };
+        let data = fs::read_blob_bytes(&self.root, hash, chunked, size)?;
         Ok(Box::new(Cursor::new(data)))
     }
 
     pub fn inc_ref(&self, hash: &[u8; 32]) -> Result<()> {
-        let key = hex_hash(hash);
-        let mut meta = self.lock_meta()?;
-        let Some(existing) = meta.get_mut(&key) else {
-            return Err(Error::NotFound);
-        };
-        existing.refcount += 1;
-        self.save_metadata(&meta)
+        self.meta.inc_ref(hash)
     }
 
     pub fn dec_ref(&self, hash: &[u8; 32]) -> Result<()> {
-        let key = hex_hash(hash);
-        let mut meta = self.lock_meta()?;
-        let Some(existing) = meta.get_mut(&key) else {
-            return Err(Error::NotFound);
-        };
-        if existing.refcount > 0 {
-            existing.refcount -= 1;
-        }
-        self.save_metadata(&meta)
+        self.meta.dec_ref(hash)
     }
 
+    /// Remove all on-disk blobs whose refcount is 0. Returns the count
+    /// of removed blobs.
     pub fn gc(&self) -> Result<usize> {
-        let mut meta = self.lock_meta()?;
-        let garbage: Vec<[u8; 32]> = meta
-            .iter()
+        let garbage: Vec<[u8; 32]> = self
+            .meta
+            .iter_all()?
+            .into_iter()
             .filter(|(_, m)| m.refcount == 0)
-            .filter_map(|(hash, _)| parse_hex_hash(hash))
+            .map(|(h, _)| h)
             .collect();
         for hash in &garbage {
-            remove_blob_bytes(&self.root, hash)?;
-            meta.remove(&hex_hash(hash));
+            fs::remove_blob_bytes(&self.root, hash)?;
+            self.meta.remove(hash)?;
         }
-        self.save_metadata(&meta)?;
         Ok(garbage.len())
     }
 
     pub fn refcount(&self, hash: &[u8; 32]) -> Result<Option<u64>> {
-        Ok(self.lock_meta()?.get(&hex_hash(hash)).map(|m| m.refcount))
+        Ok(self.meta.get(hash)?.map(|m| m.refcount))
     }
 
     pub fn is_chunked(&self, hash: &[u8; 32]) -> Result<bool> {
-        self.lock_meta()?
-            .get(&hex_hash(hash))
+        self.meta
+            .get(hash)?
             .map(|m| m.chunked)
             .ok_or(Error::NotFound)
     }
 
-    fn lock_meta(&self) -> Result<MutexGuard<'_, BTreeMap<String, BlobMeta>>> {
-        self.meta
-            .lock()
-            .map_err(|_| Error::Storage("blob metadata lock poisoned".into()))
+    /// Number of metadata entries (useful for tests / telemetry).
+    pub fn total_tracked(&self) -> Result<usize> {
+        Ok(self.meta.iter_all()?.len())
     }
 
-    fn save_metadata(&self, meta: &BTreeMap<String, BlobMeta>) -> Result<()> {
-        let path = metadata_path(&self.root);
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, serde_json::to_vec_pretty(meta)?)?;
-        fs::rename(tmp, path)?;
-        Ok(())
-    }
+    // ------------------------------------------------------------------
+    // Open-time reconciliation
+    // ------------------------------------------------------------------
 
-    fn write_blob_bytes(&self, hash: &[u8; 32], data: &[u8], chunked: bool) -> Result<()> {
-        let path = blob_path(&self.root, hash);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        if chunked {
-            fs::create_dir_all(&path)?;
-            for (idx, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
-                fs::write(path.join(format!("{idx:08}.chunk")), chunk)?;
+    fn reconcile_on_open(&self, repair: bool) -> Result<()> {
+        let on_disk = fs::list_all_blobs_on_disk(&self.root)?;
+        let all_meta = self.meta.iter_all()?;
+        let mut in_meta = std::collections::HashSet::with_capacity(all_meta.len());
+        // 1) warn for dangling refs (metadata present, no on-disk bytes)
+        for (hash, m) in &all_meta {
+            in_meta.insert(*hash);
+            if m.size > 0 && !fs::blob_exists_on_disk(&self.root, hash) {
+                tracing::warn!(
+                    hash = %fs::hex_hash(hash),
+                    refcount = m.refcount,
+                    "blob metadata entry has no corresponding on-disk bytes (dangling ref)"
+                );
             }
-        } else {
-            fs::write(path, data)?;
+        }
+        // 2) warn/repair for orphans (on disk but no metadata)
+        let mut orphan_count = 0;
+        for hash in on_disk {
+            if in_meta.contains(&hash) {
+                continue;
+            }
+            orphan_count += 1;
+            tracing::warn!(
+                hash = %fs::hex_hash(&hash),
+                repair,
+                "on-disk blob has no metadata entry (orphan)"
+            );
+            if repair {
+                if let Err(e) = fs::remove_blob_bytes(&self.root, &hash) {
+                    tracing::error!(
+                        hash = %fs::hex_hash(&hash),
+                        error = %e,
+                        "failed to repair orphan blob"
+                    );
+                }
+            }
+        }
+        if orphan_count > 0 {
+            tracing::info!(orphan_count, repair, "open-time orphan reconciliation done");
         }
         Ok(())
     }
+}
 
-    fn read_chunked(&self, hash: &[u8; 32], size: u64) -> Result<Vec<u8>> {
-        let dir = blob_path(&self.root, hash);
-        let chunk_count = (size as usize).div_ceil(CHUNK_SIZE);
-        let mut data = Vec::with_capacity(size as usize);
-        for idx in 0..chunk_count {
-            data.extend_from_slice(&fs::read(dir.join(format!("{idx:08}.chunk")))?);
-        }
-        Ok(data)
+fn mk_outcome(r#ref: BlobRef, bytes: Vec<u8>) -> PutOutcome {
+    if bytes.len() <= INLINE_THRESHOLD {
+        PutOutcome::InlinedSmall { r#ref, bytes }
+    } else {
+        PutOutcome::OnDisk(r#ref)
     }
 }
 
-fn metadata_path(root: &Path) -> PathBuf {
-    root.join("blobs").join("metadata.json")
-}
-
-fn blob_path(root: &Path, hash: &[u8; 32]) -> PathBuf {
-    let hex = hex_hash(hash);
-    root.join("blobs").join(&hex[..2]).join(hex)
-}
-
-fn remove_blob_bytes(root: &Path, hash: &[u8; 32]) -> Result<()> {
-    let path = blob_path(root, hash);
-    if path.is_dir() {
-        fs::remove_dir_all(path)?;
-    } else if path.exists() {
-        fs::remove_file(path)?;
-    }
-    Ok(())
-}
-
-fn hex_hash(hash: &[u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(64);
-    for byte in hash {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
-
-fn parse_hex_hash(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (idx, chunk) in s.as_bytes().chunks_exact(2).enumerate() {
-        let hi = hex_nibble(chunk[0])?;
-        let lo = hex_nibble(chunk[1])?;
-        out[idx] = (hi << 4) | lo;
-    }
-    Some(out)
-}
-
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
+// Tests live in tests.rs
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{Cursor, Read};
-    use tempfile::tempdir;
-
-    #[test]
-    fn put_stream_deduplicates_and_refcounts_until_gc() {
-        let dir = tempdir().unwrap();
-        let store = BlobStore::open(dir.path()).unwrap();
-        let a = store
-            .put_stream(Cursor::new(b"hello agent memory"))
-            .unwrap();
-        let b = store
-            .put_stream(Cursor::new(b"hello agent memory"))
-            .unwrap();
-
-        assert_eq!(a.hash, b.hash);
-        assert_eq!(store.refcount(&a.hash).unwrap(), Some(2));
-
-        store.dec_ref(&a.hash).unwrap();
-        assert_eq!(store.refcount(&a.hash).unwrap(), Some(1));
-        store.dec_ref(&a.hash).unwrap();
-        assert_eq!(store.refcount(&a.hash).unwrap(), Some(0));
-        store.gc().unwrap();
-        assert_eq!(store.refcount(&a.hash).unwrap(), None);
-        assert!(store.get_stream(&a.hash).is_err());
-    }
-
-    #[test]
-    fn large_blob_is_chunked_and_readable_after_reopen() {
-        let dir = tempdir().unwrap();
-        let data = vec![42_u8; CHUNK_SIZE + 17];
-        let hash = {
-            let store = BlobStore::open(dir.path()).unwrap();
-            let r = store.put_stream(Cursor::new(data.clone())).unwrap();
-            assert!(store.is_chunked(&r.hash).unwrap());
-            r.hash
-        };
-
-        let store = BlobStore::open(dir.path()).unwrap();
-        assert_eq!(store.refcount(&hash).unwrap(), Some(1));
-        let mut buf = Vec::new();
-        store
-            .get_stream(&hash)
-            .unwrap()
-            .read_to_end(&mut buf)
-            .unwrap();
-        assert_eq!(buf, data);
-    }
-}
+mod tests;
