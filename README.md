@@ -13,7 +13,7 @@ single engine.
 - **Node-centric data model** — `MemoryNode` with Episode / Fact / Entity / Artifact kinds
 - **Builder API** — ergonomic `NodeBuilder` for fluent node construction
 - **Hybrid recall** — vector seeds can be reranked with graph-neighbour signal
-- **MMQL/IR foundation** — minimal recall parser lowers into shared `LogicalPlan`
+- **MMQL/IR/executor** — MMQL and builder plans lower into shared `LogicalPlan`
 
 ## Quick Start
 
@@ -39,30 +39,32 @@ db.delete(id)?;
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│                     mmdb  (facade)                        │
+│                     mmdb (facade)                         │
 ├──────────┬──────────┬──────────┬──────────┬──────────────┤
 │  vector  │  graph   │   blob   │  query   │   mmql/udf   │
-├──────────┴──────────┴──────────┴──────────┴──────────────┤
-│                    mmdb-storage (fjall)                   │
+├──────────┴──────────┴──────────┴──────────┬──────────────┤
+│                 catalog                    │              │
+├────────────────────────────────────────────┴──────────────┤
+│                    mmdb-storage (fjall)                    │
 ├──────────────────────────────────────────────────────────┤
-│                      mmdb-core                           │
+│                      mmdb-core                            │
 └──────────────────────────────────────────────────────────┘
 ```
 
 ## Crate Map
 
-| Crate | Status | Description |
-|-------|--------|-------------|
-| `mmdb-core` | Active | Types, traits, error |
-| `mmdb-storage` | Active | fjall KV engine, key encoding, node/meta indexes |
-| `mmdb` | Active | High-level facade, NodeBuilder, vector/graph/hybrid/query/stats/source/UDF/thread-backed async APIs |
-| `mmdb-blob` | Active | BLAKE3 content-addressed chunked blob store |
-| `mmdb-vector` | Active | HNSW index, persistence metadata, manifest-backed snapshot checkpoint/reload |
-| `mmdb-graph` | Active | Bi-directional edges, BFS, label dictionary |
-| `mmdb-catalog` | Active | Model registry, stats, named snapshots |
-| `mmdb-query` | Active | LogicalPlan IR, recall builder, source-backed batch executor, UDF binding, aggregate, join costing/rewrite, instrumented EXPLAIN |
-| `mmdb-mmql` | Active | MMQL recall parser with AST/resolver, diagnostics, embed text queries, relative time, boolean where predicates, graph/UDF, score expressions, count, ordered joins, connected subqueries, and return projections |
-| `mmdb-udf` | Active | WASM UDF registry, signatures, sandbox limits |
+| Crate | Description | Feature doc |
+|-------|-------------|-------------|
+| `mmdb` | High-level facade, `NodeBuilder`, vector/graph/hybrid/blob/query APIs | [`FEATURES.md`](docs/crates/mmdb/FEATURES.md) |
+| `mmdb-core` | Shared types, traits, and errors | [`FEATURES.md`](docs/crates/mmdb-core/FEATURES.md) |
+| `mmdb-storage` | fjall node store, key encoding, time/kind/meta indexes | [`FEATURES.md`](docs/crates/mmdb-storage/FEATURES.md) |
+| `mmdb-vector` | HNSW indexes, vector metadata, tombstones, snapshot reload | [`FEATURES.md`](docs/crates/mmdb-vector/FEATURES.md) |
+| `mmdb-graph` | Bi-directional edges, BFS, label dictionary | [`FEATURES.md`](docs/crates/mmdb-graph/FEATURES.md) |
+| `mmdb-blob` | BLAKE3 content-addressed blob store, chunks, refcounts, GC | [`FEATURES.md`](docs/crates/mmdb-blob/FEATURES.md) |
+| `mmdb-catalog` | Embedding model registry, tenant stats, named snapshots | [`FEATURES.md`](docs/crates/mmdb-catalog/FEATURES.md) |
+| `mmdb-query` | `LogicalPlan`, optimizer, batch/source executor, EXPLAIN | [`FEATURES.md`](docs/crates/mmdb-query/FEATURES.md) |
+| `mmdb-mmql` | MMQL parser, AST, resolver, lowering to `LogicalPlan` | [`FEATURES.md`](docs/crates/mmdb-mmql/FEATURES.md) |
+| `mmdb-udf` | WASM UDF registry, signatures, sandbox limits, runtime | [`FEATURES.md`](docs/crates/mmdb-udf/FEATURES.md) |
 
 ## Building
 
@@ -72,9 +74,10 @@ cargo test           # run all tests
 cargo run --example agent_memory  # run quickstart
 ```
 
-## Roadmap
+## Documentation
 
-See `docs/IMPLEMENTATION.md` for the full implementation plan (P0–P4).
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — durable system architecture
+- [`docs/crates/`](docs/crates/) — crate-level feature references
 
 ## License
 
