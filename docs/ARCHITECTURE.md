@@ -36,17 +36,17 @@ node-centric memory model.
 
 ```text
 +--------------------------------------------------------------+
-| mmdb facade                                                   |
-| Database, NodeBuilder, search, graph, blob, query bridge      |
+| mmdb facade                                                  |
+| Database, NodeBuilder, search, graph, blob, query bridge     |
 +----------------------+----------------------+----------------+
-| mmdb-mmql            | mmdb-query           | mmdb-udf        |
-| parser + AST         | IR, optimizer, exec  | WASM registry   |
+| mmdb-mmql            | mmdb-query           | mmdb-udf       |
+| parser + AST         | IR, optimizer, exec  | WASM registry  |
 +----------+-----------+----------+-----------+----------------+
-| mmdb-vector          | mmdb-graph           | mmdb-blob       |
-| HNSW + persistence   | edges + BFS          | BLAKE3 blobs    |
+| mmdb-vector          | mmdb-graph           | mmdb-blob      |
+| HNSW + persistence   | edges + BFS          | BLAKE3 blobs   |
 +----------------------+----------+-----------+----------------+
 | mmdb-catalog         | mmdb-storage                          |
-| model/stats/snapshot | fjall partitions, node indexes         |
+| model/stats/snapshot | fjall partitions, node indexes        |
 +----------------------+---------------------------------------+
 | mmdb-core                                                    |
 | shared types, errors, KV traits                              |
