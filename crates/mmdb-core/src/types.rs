@@ -12,6 +12,16 @@ pub enum NodeKind {
     Artifact = 4,
 }
 
+/// Retrieval lifecycle for a memory. Old records deserialize as `Active`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MemoryState {
+    Pending,
+    #[default]
+    Active,
+    Superseded,
+    Retracted,
+}
+
 impl NodeKind {
     pub fn as_u8(self) -> u8 {
         self as u8
@@ -61,6 +71,29 @@ pub struct MemoryNode {
     pub content: Content,
     pub embeddings: SmallVec<[Embedding; 1]>,
     pub metadata: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub state: MemoryState,
+    #[serde(default)]
+    pub valid_from_ms: Option<i64>,
+    #[serde(default)]
+    pub valid_to_ms: Option<i64>,
+}
+
+impl MemoryNode {
+    /// Whether this revision may participate in recall at `as_of_ms`.
+    pub fn is_valid_at(&self, as_of_ms: i64) -> bool {
+        let from = self.valid_from_ms.unwrap_or(self.created_at_ms);
+        let in_window = from <= as_of_ms && self.valid_to_ms.is_none_or(|to| as_of_ms < to);
+        match self.state {
+            MemoryState::Pending => false,
+            MemoryState::Active => in_window,
+            MemoryState::Superseded | MemoryState::Retracted => {
+                self.valid_to_ms.is_some() && in_window
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,4 +104,19 @@ pub struct Edge {
     pub weight: f32,
     pub created_at_ms: i64,
     pub metadata: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub valid_from_ms: Option<i64>,
+    #[serde(default)]
+    pub valid_to_ms: Option<i64>,
+    #[serde(default)]
+    pub evidence: Vec<Ulid>,
+}
+
+impl Edge {
+    pub fn is_valid_at(&self, as_of_ms: i64) -> bool {
+        let from = self.valid_from_ms.unwrap_or(self.created_at_ms);
+        from <= as_of_ms && self.valid_to_ms.is_none_or(|to| as_of_ms < to)
+    }
 }

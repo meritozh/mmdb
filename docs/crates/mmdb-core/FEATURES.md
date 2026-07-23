@@ -37,6 +37,10 @@ dependencies.
 - `content`
 - `embeddings`
 - `metadata`
+- `revision`
+- `state` (`Pending`, `Active`, `Superseded`, or `Retracted`)
+- `valid_from_ms`
+- `valid_to_ms`
 
 `Edge` stores graph relationships between nodes:
 
@@ -46,6 +50,10 @@ dependencies.
 - `weight`
 - `created_at_ms`
 - `metadata`
+- `revision`
+- `valid_from_ms`
+- `valid_to_ms`
+- `evidence`
 
 ## KV Traits
 
@@ -67,10 +75,12 @@ every crate to depend directly on `fjall`.
   optimization, not the identity.
 - Embedding dimensions are recorded beside vector values so facade and vector
   storage can reject mismatches before persistence.
+- Missing lifecycle fields in legacy JSON records default to active, with
+  validity beginning at `created_at_ms`; opening a legacy database does not
+  rewrite its raw nodes.
 
 ## Source Files
 
 - `crates/mmdb-core/src/types.rs`: data model.
 - `crates/mmdb-core/src/error.rs`: shared errors.
 - `crates/mmdb-core/src/traits.rs`: storage traits.
-

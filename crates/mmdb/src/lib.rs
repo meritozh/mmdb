@@ -46,18 +46,39 @@ pub use mmdb_query as query;
 pub use mmdb_storage as storage;
 pub use mmdb_vector as vector;
 
+mod audit;
 mod builder;
 mod convert;
 mod db;
+mod dream;
 mod embedder;
+mod lexical;
 mod query_impl;
+mod recall;
+mod runtime;
 mod search;
 #[cfg(test)]
 mod tests;
 
+pub use audit::{AuditAction, AuditContext, AuditFilter, AuditRecord};
 pub use builder::{now_ms, NodeBuilder};
 pub use db::Database;
+pub use dream::{
+    DreamEdge, DreamEndpoint, DreamNode, DreamProposal, DreamRun, DreamRunStatus,
+    DreamSupersession, MaintenanceTrigger, SupersededSnapshot,
+};
 pub use embedder::{
     DatabaseConfig, EmbedBatchFuture, EmbedFuture, Embedder, DEFAULT_MODEL, DEFAULT_TENANT,
+};
+pub use recall::{
+    AdjudicatedRecall, CausalAnnotation, ChangeProposal, ChangeProposalStatus, GraphPath,
+    GraphSlice, LawyerVerdict, ProposedChange, RecallEvidence, RecallFilter, RecallRequest,
+    RecallStatus, VectorEvidence,
+};
+pub use runtime::{
+    AgentClient, AgentRequest, AgentResponse, AgentRole, BlobInput, ClientFuture, ClientRegistry,
+    DatabaseBuilder, DreamProfile, EmbeddingClient, EmbeddingDistance, EmbeddingInput,
+    EmbeddingOutput, EmbeddingProfile, IngestReport, LawyerFailureMode, LawyerProfile,
+    MemoryProfile, ProjectionState, ProjectionStatus, SupportedContent,
 };
 pub use search::{Hit, HybridOpts, VectorFilter};

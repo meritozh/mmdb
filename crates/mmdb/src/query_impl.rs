@@ -1,3 +1,4 @@
+use crate::audit::{AuditAction, AuditContext, AuditRecord, AuditStore};
 use crate::convert::{node_to_query_record, query_predicate_matches, resolve_query_vector};
 use crate::embedder::Embedder;
 use crate::Database;
@@ -6,6 +7,7 @@ use mmdb_core::Result;
 use mmdb_graph::{Direction, GraphStore};
 use mmdb_storage::Storage;
 use mmdb_vector::VectorStore;
+use serde_json::json;
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -24,6 +26,7 @@ pub(crate) struct QuerySourceHandle {
     pub(crate) graph_store: Arc<GraphStore>,
     pub(crate) embedder: Option<Arc<dyn Embedder>>,
     pub(crate) config: crate::embedder::DatabaseConfig,
+    pub(crate) audit_store: Arc<AuditStore>,
 }
 
 pub(crate) struct AsyncQueryRequest {
@@ -126,7 +129,27 @@ impl mmdb_query::QuerySource for QuerySourceHandle {
         k: usize,
         filter: Option<&mmdb_query::Predicate>,
     ) -> Result<Vec<mmdb_query::Record>> {
-        let vector = resolve_query_vector(query, model, self.embedder.as_deref())?;
+        let resolved = resolve_query_vector(query, model, self.embedder.as_deref());
+        if let mmdb_query::VectorRef::Text(text) = query {
+            let operation_id = Ulid::new();
+            self.audit_store.append(&AuditRecord {
+                id: Ulid::new(),
+                operation_id,
+                tenant: self.config.tenant,
+                at_ms: crate::now_ms(),
+                action: AuditAction::ClientCall,
+                name: "query_embedding".into(),
+                success: resolved.is_ok(),
+                context: AuditContext::default(),
+                details: json!({
+                    "request": {"type": "text", "text": text},
+                    "model": model.0,
+                    "response": resolved.as_ref().ok().map(|vector| json!({"dimension": vector.len()})),
+                }),
+                error: resolved.as_ref().err().map(ToString::to_string),
+            })?;
+        }
+        let vector = resolved?;
         let hits = self
             .vector_store
             .search(self.config.tenant, &model.0, &vector, k)?;
@@ -194,7 +217,23 @@ impl mmdb_query::QuerySource for Database {
         k: usize,
         filter: Option<&mmdb_query::Predicate>,
     ) -> Result<Vec<mmdb_query::Record>> {
-        let vector = resolve_query_vector(query, model, self.embedder.as_deref())?;
+        let resolved = resolve_query_vector(query, model, self.embedder.as_deref());
+        if let mmdb_query::VectorRef::Text(text) = query {
+            self.append_audit(
+                Ulid::new(),
+                AuditAction::ClientCall,
+                "query_embedding",
+                resolved.is_ok(),
+                AuditContext::default(),
+                json!({
+                    "request": {"type": "text", "text": text},
+                    "model": model.0,
+                    "response": resolved.as_ref().ok().map(|vector| json!({"dimension": vector.len()})),
+                }),
+                resolved.as_ref().err().map(ToString::to_string),
+            )?;
+        }
+        let vector = resolved?;
         let hits = self
             .vector_store
             .search(self.config.tenant, &model.0, &vector, k)?;

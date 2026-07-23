@@ -1121,6 +1121,8 @@ name = "mmdb"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
+ "fjall",
  "mmdb-blob",
  "mmdb-catalog",
  "mmdb-core",
@@ -1128,6 +1130,7 @@ dependencies = [
  "mmdb-query",
  "mmdb-storage",
  "mmdb-vector",
+ "serde",
  "serde_json",
  "smallvec",
  "tempfile",

@@ -1,8 +1,16 @@
+use crate::audit::{
+    node_snapshot, AuditAction, AuditContext, AuditFilter, AuditRecord, AuditStore,
+};
 use crate::builder::NodeBuilder;
 use crate::embedder::{DatabaseConfig, Embedder};
+use crate::lexical::{searchable_text, LexicalIndex};
 use crate::query_impl::{
     collect_query_operator, query_stats_from_catalog, rebuild_catalog, AsyncQueryFuture,
     AsyncQueryRequest, QuerySourceHandle, QueryUdfFn, QUERY_BATCH_SIZE,
+};
+use crate::runtime::{
+    validate_profile, ClientRegistry, DatabaseBuilder, EmbeddingDistance, EmbeddingProfile,
+    MemoryProfile, RuntimeStore, SupportedContent,
 };
 use mmdb_blob::{BlobStore, PutOutcome};
 use mmdb_catalog::Catalog;
@@ -10,6 +18,7 @@ use mmdb_core::{Content, Edge, Embedding, MemoryNode, NodeKind, Result};
 use mmdb_graph::GraphStore;
 use mmdb_storage::Storage;
 use mmdb_vector::VectorStore;
+use serde_json::json;
 use smallvec::SmallVec;
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -28,23 +37,112 @@ pub struct Database {
     pub(crate) query_udfs: RwLock<BTreeMap<String, Arc<QueryUdfFn>>>,
     pub(crate) config: DatabaseConfig,
     pub(crate) embedder: Option<Arc<dyn Embedder>>,
+    pub(crate) audit_store: Arc<AuditStore>,
+    pub(crate) lexical_index: Arc<LexicalIndex>,
+    pub(crate) runtime_store: Arc<RuntimeStore>,
+    pub(crate) clients: ClientRegistry,
+    pub(crate) profile: RwLock<MemoryProfile>,
 }
 
 impl Database {
     /// Open at `path` with [`DatabaseConfig::default`] (tenant=0, model="default").
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with(path, DatabaseConfig::default())
+        Self::builder(path).build()
+    }
+
+    pub fn builder(path: impl AsRef<Path>) -> DatabaseBuilder {
+        DatabaseBuilder::new(path)
     }
 
     /// Open with an explicit config.
     pub fn open_with(path: impl AsRef<Path>, config: DatabaseConfig) -> Result<Self> {
+        Self::builder(path).config(config).build()
+    }
+
+    pub(crate) fn open_runtime(
+        path: impl AsRef<Path>,
+        config: DatabaseConfig,
+        clients: ClientRegistry,
+        requested_profile: Option<MemoryProfile>,
+        legacy_embedder: Option<Box<dyn Embedder>>,
+    ) -> Result<Self> {
         let path = path.as_ref();
         let storage = Arc::new(Storage::open(path)?);
         let vector_store = Arc::new(VectorStore::open(storage.keyspace.clone())?);
         let graph_store = Arc::new(GraphStore::open(storage.keyspace.clone())?);
         let blob_store = Arc::new(BlobStore::open(path)?);
+        let audit_store = Arc::new(AuditStore::open(storage.keyspace.clone())?);
+        let lexical_index = Arc::new(LexicalIndex::open(storage.keyspace.clone())?);
+        let runtime_store = Arc::new(RuntimeStore::open(storage.keyspace.clone())?);
         let catalog = rebuild_catalog(&storage, config.tenant)?;
-        Ok(Self {
+        let persisted_profile = runtime_store.load_profile(config.tenant)?;
+        let migrate_legacy = requested_profile.is_none() && persisted_profile.is_none();
+        let mut profile = requested_profile
+            .clone()
+            .or(persisted_profile)
+            .unwrap_or_default();
+        if let Some(embedder) = legacy_embedder.as_ref() {
+            if !profile
+                .embedding_profiles
+                .iter()
+                .any(|candidate| candidate.model == embedder.model_name())
+            {
+                profile.embedding_profiles.push(EmbeddingProfile {
+                    id: format!("legacy:{}", embedder.model_name()),
+                    client_id: "legacy".into(),
+                    model: embedder.model_name().into(),
+                    model_revision: "compatibility".into(),
+                    dimension: embedder.dim(),
+                    distance: EmbeddingDistance::Cosine,
+                    supported_content: vec![SupportedContent::Text],
+                    supported_mime_types: Vec::new(),
+                    weight: 1.0,
+                });
+            }
+        }
+        let nodes = storage.scan_by_time(config.tenant, 0, i64::MAX, usize::MAX)?;
+        for node in &nodes {
+            if migrate_legacy {
+                for embedding in &node.embeddings {
+                    if !profile
+                        .embedding_profiles
+                        .iter()
+                        .any(|candidate| candidate.model == embedding.model)
+                    {
+                        profile.embedding_profiles.push(EmbeddingProfile {
+                            id: format!("legacy:{}", embedding.model),
+                            client_id: "legacy".into(),
+                            model: embedding.model.clone(),
+                            model_revision: "unknown".into(),
+                            dimension: embedding.dim,
+                            distance: EmbeddingDistance::Cosine,
+                            supported_content: vec![
+                                SupportedContent::Text,
+                                SupportedContent::Json,
+                                SupportedContent::Blob,
+                            ],
+                            supported_mime_types: Vec::new(),
+                            weight: 1.0,
+                        });
+                    }
+                }
+            }
+            let projections = runtime_store
+                .projection_statuses(config.tenant, node.id)?
+                .into_iter()
+                .filter(|status| {
+                    profile
+                        .embedding_profiles
+                        .iter()
+                        .any(|candidate| candidate.id == status.profile_id)
+                })
+                .filter_map(|status| status.searchable_text)
+                .collect::<Vec<_>>();
+            lexical_index.upsert(config.tenant, node.id, &searchable_text(node, &projections))?;
+        }
+        validate_profile(&profile)?;
+        runtime_store.put_profile(config.tenant, &profile)?;
+        let db = Self {
             storage,
             vector_store,
             graph_store,
@@ -52,8 +150,26 @@ impl Database {
             catalog: Arc::new(catalog),
             query_udfs: RwLock::new(BTreeMap::new()),
             config,
-            embedder: None,
-        })
+            embedder: legacy_embedder.map(Arc::from),
+            audit_store,
+            lexical_index,
+            runtime_store,
+            clients,
+            profile: RwLock::new(profile),
+        };
+        if requested_profile.is_some() {
+            db.append_audit(
+                Ulid::new(),
+                AuditAction::Configuration,
+                "memory_profile",
+                true,
+                AuditContext::default(),
+                json!({"profile": db.memory_profile()?}),
+                None,
+            )?;
+        }
+        db.repair_dream_runs()?;
+        Ok(db)
     }
 
     /// Open with an explicit config AND a text embedder. Enables auto-embedding
@@ -71,22 +187,10 @@ impl Database {
                 config.default_model
             )));
         }
-        let path = path.as_ref();
-        let storage = Arc::new(Storage::open(path)?);
-        let vector_store = Arc::new(VectorStore::open(storage.keyspace.clone())?);
-        let graph_store = Arc::new(GraphStore::open(storage.keyspace.clone())?);
-        let blob_store = Arc::new(BlobStore::open(path)?);
-        let catalog = rebuild_catalog(&storage, config.tenant)?;
-        Ok(Self {
-            storage,
-            vector_store,
-            graph_store,
-            blob_store,
-            catalog: Arc::new(catalog),
-            query_udfs: RwLock::new(BTreeMap::new()),
-            config,
-            embedder: Some(Arc::from(embedder)),
-        })
+        Self::builder(path)
+            .config(config)
+            .legacy_embedder(embedder)
+            .build()
     }
 
     /// Returns true if an auto-embedder is wired.
@@ -97,6 +201,53 @@ impl Database {
     /// Borrow the configuration this database was opened with.
     pub fn config(&self) -> &DatabaseConfig {
         &self.config
+    }
+
+    pub fn memory_profile(&self) -> Result<MemoryProfile> {
+        self.profile
+            .read()
+            .map(|profile| profile.clone())
+            .map_err(|_| mmdb_core::Error::Storage("memory profile lock poisoned".into()))
+    }
+
+    pub fn client_registry(&self) -> &ClientRegistry {
+        &self.clients
+    }
+
+    pub fn audit_records(&self, filter: AuditFilter) -> Result<Vec<AuditRecord>> {
+        self.audit_store.list(self.config.tenant, &filter)
+    }
+
+    pub fn inspect_operation(&self, operation_id: Ulid) -> Result<Vec<AuditRecord>> {
+        self.audit_records(AuditFilter {
+            operation_id: Some(operation_id),
+            ..AuditFilter::default()
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_audit(
+        &self,
+        operation_id: Ulid,
+        action: AuditAction,
+        name: impl Into<String>,
+        success: bool,
+        context: AuditContext,
+        details: serde_json::Value,
+        error: Option<String>,
+    ) -> Result<()> {
+        self.audit_store.append(&AuditRecord {
+            id: Ulid::new(),
+            operation_id,
+            tenant: self.config.tenant,
+            at_ms: crate::now_ms(),
+            action,
+            name: name.into(),
+            success,
+            context,
+            details,
+            error,
+        })
     }
 
     /// Register a facade-local query UDF used by [`Self::execute_query`].
@@ -117,10 +268,16 @@ impl Database {
     /// is configured and the node has no embedding under the embedder's
     /// model, the text body is encoded automatically. Returns the node id.
     pub fn insert(&self, node: MemoryNode) -> Result<Ulid> {
-        self.insert_inner(node, false)
+        self.insert_inner(node, false, true)
     }
 
-    fn insert_inner(&self, node: MemoryNode, blob_ref_already_acquired: bool) -> Result<Ulid> {
+    pub(crate) fn insert_inner(
+        &self,
+        node: MemoryNode,
+        blob_ref_already_acquired: bool,
+        run_legacy_embedder: bool,
+    ) -> Result<Ulid> {
+        let operation_id = Ulid::new();
         let mut node = node;
         // Force-stamp the configured tenant so users cannot accidentally cross
         // boundaries via NodeBuilder.
@@ -128,13 +285,27 @@ impl Database {
 
         // Auto-embed: if an embedder is configured AND the node has no
         // embedding under the embedder's model AND its content is text, embed.
-        if let Some(embedder) = self.embedder.as_ref() {
+        if let Some(embedder) = self.embedder.as_ref().filter(|_| run_legacy_embedder) {
             let model = embedder.model_name();
             let already = node.embeddings.iter().any(|e| e.model == model);
             if !already {
                 if let Content::Text(ref t) = node.content {
                     if !t.is_empty() {
-                        let v = embedder.embed(t)?;
+                        let embedded = embedder.embed(t);
+                        self.append_audit(
+                            operation_id,
+                            AuditAction::ClientCall,
+                            "legacy_embedding",
+                            embedded.is_ok(),
+                            AuditContext::default(),
+                            json!({
+                                "request": {"type": "text", "text": t},
+                                "model": model,
+                                "response": embedded.as_ref().ok().map(|vector| json!({"dimension": vector.len()})),
+                            }),
+                            embedded.as_ref().err().map(ToString::to_string),
+                        )?;
+                        let v = embedded?;
                         let dim = v.len() as u32;
                         debug_assert_eq!(
                             dim,
@@ -151,10 +322,19 @@ impl Database {
             }
         }
 
-        self.validate_node_embeddings(&node)?;
-
         let id = node.id;
         let previous = self.storage.get_node(self.config.tenant, id)?;
+        if previous.is_some() {
+            node.updated_at_ms = crate::now_ms();
+        }
+        node.revision = previous.as_ref().map_or(node.revision.max(1), |old| {
+            old.revision.max(node.revision).saturating_add(1).max(1)
+        });
+        if node.valid_from_ms.is_none() {
+            node.valid_from_ms = Some(node.created_at_ms);
+        }
+        self.validate_node_embeddings(&node)?;
+
         let previous_blob_hash = previous.as_ref().and_then(|node| blob_hash(&node.content));
         let next_blob_hash = blob_hash(&node.content);
         let acquired_next_blob =
@@ -175,8 +355,18 @@ impl Database {
                     let _ = self.blob_store.dec_ref(&hash);
                 }
             }
+            let _ = self.append_audit(
+                operation_id,
+                AuditAction::Failure,
+                "put_node",
+                false,
+                AuditContext::default(),
+                json!({"after": node_snapshot(&node)}),
+                Some(err.to_string()),
+            );
             return Err(err);
         }
+        let previous_snapshot = previous.as_ref().map(node_snapshot);
         if let Some(previous) = previous {
             for emb in &previous.embeddings {
                 self.vector_store
@@ -197,6 +387,30 @@ impl Database {
             self.vector_store
                 .insert(self.config.tenant, &emb.model, id, &emb.vector)?;
         }
+        let projections = self
+            .runtime_store
+            .projection_statuses(self.config.tenant, id)?
+            .into_iter()
+            .filter_map(|status| status.searchable_text)
+            .collect::<Vec<_>>();
+        self.lexical_index.upsert(
+            self.config.tenant,
+            id,
+            &searchable_text(&node, &projections),
+        )?;
+        self.append_audit(
+            operation_id,
+            AuditAction::Mutation,
+            if previous_snapshot.is_some() {
+                "update_node"
+            } else {
+                "insert_node"
+            },
+            true,
+            AuditContext::default(),
+            json!({"before": previous_snapshot, "after": node_snapshot(&node)}),
+            None,
+        )?;
         Ok(id)
     }
 
@@ -245,7 +459,22 @@ impl Database {
             )
         })?;
         let text = text.into();
-        let vector = embedder.embed_async(&text).await?;
+        let operation_id = Ulid::new();
+        let embedded = embedder.embed_async(&text).await;
+        self.append_audit(
+            operation_id,
+            AuditAction::ClientCall,
+            "legacy_embedding",
+            embedded.is_ok(),
+            AuditContext::default(),
+            json!({
+                "request": {"type": "text", "text": text},
+                "model": embedder.model_name(),
+                "response": embedded.as_ref().ok().map(|vector| json!({"dimension": vector.len()})),
+            }),
+            embedded.as_ref().err().map(ToString::to_string),
+        )?;
+        let vector = embedded?;
         debug_assert_eq!(
             vector.len() as u32,
             embedder.dim(),
@@ -271,6 +500,7 @@ impl Database {
 
     /// Hard-delete a node and all of its embeddings from every index.
     pub fn delete(&self, id: Ulid) -> Result<()> {
+        let operation_id = Ulid::new();
         if let Some(node) = self.storage.get_node(self.config.tenant, id)? {
             for emb in &node.embeddings {
                 self.vector_store
@@ -278,11 +508,30 @@ impl Database {
             }
             self.release_blob_ref(&node.content)?;
             self.storage.delete_node(self.config.tenant, id)?;
+            self.lexical_index.delete(self.config.tenant, id)?;
             self.catalog
                 .record_node_delete(self.config.tenant, node.kind);
+            self.append_audit(
+                operation_id,
+                AuditAction::Mutation,
+                "delete_node",
+                true,
+                AuditContext::default(),
+                json!({"before": node_snapshot(&node)}),
+                None,
+            )?;
             Ok(())
         } else {
-            self.storage.delete_node(self.config.tenant, id)
+            self.storage.delete_node(self.config.tenant, id)?;
+            self.append_audit(
+                operation_id,
+                AuditAction::Mutation,
+                "delete_node",
+                true,
+                AuditContext::default(),
+                json!({"id": id, "existed": false}),
+                None,
+            )
         }
     }
 
@@ -309,7 +558,7 @@ impl Database {
             }
         };
         let hash = blob_hash(&node.content).expect("blob content always has a hash");
-        match self.insert_inner(node, true) {
+        match self.insert_inner(node, true, true) {
             Ok(id) => Ok(id),
             Err(err) => {
                 let _ = self.blob_store.dec_ref(&hash);
@@ -356,7 +605,17 @@ impl Database {
 
     /// Physically remove blobs whose refcount reached zero.
     pub fn gc_blobs(&self) -> Result<usize> {
-        self.blob_store.gc()
+        let result = self.blob_store.gc();
+        self.append_audit(
+            Ulid::new(),
+            AuditAction::Mutation,
+            "gc_blobs",
+            result.is_ok(),
+            AuditContext::default(),
+            json!({"removed": result.as_ref().ok()}),
+            result.as_ref().err().map(ToString::to_string),
+        )?;
+        result
     }
 
     fn release_previous_blob_if_replaced(&self, previous: &Content, next: &Content) -> Result<()> {
@@ -384,13 +643,66 @@ impl Database {
     /// Add an edge between two nodes. The edge is duplicated into a reverse
     /// index so [`Self::neighbours_in`] is also O(neighbours).
     pub fn add_edge(&self, edge: Edge) -> Result<()> {
-        self.graph_store.add_edge(self.config.tenant, edge)
+        if !edge.weight.is_finite() || !(0.0..=1.0).contains(&edge.weight) {
+            return Err(mmdb_core::Error::InvalidArgument(
+                "edge weight must be finite and between 0 and 1".into(),
+            ));
+        }
+        for evidence in &edge.evidence {
+            if self
+                .storage
+                .get_node(self.config.tenant, *evidence)?
+                .is_none()
+            {
+                return Err(mmdb_core::Error::InvalidArgument(format!(
+                    "edge evidence node {evidence} does not exist"
+                )));
+            }
+        }
+        let operation_id = Ulid::new();
+        let mut edge = edge;
+        let previous = self
+            .graph_store
+            .neighbours_out(self.config.tenant, edge.src, Some(&edge.label))?
+            .into_iter()
+            .find(|candidate| candidate.dst == edge.dst);
+        edge.revision = previous.as_ref().map_or(edge.revision.max(1), |old| {
+            old.revision.max(edge.revision).saturating_add(1).max(1)
+        });
+        if edge.valid_from_ms.is_none() {
+            edge.valid_from_ms = Some(edge.created_at_ms);
+        }
+        self.graph_store
+            .add_edge(self.config.tenant, edge.clone())?;
+        self.append_audit(
+            operation_id,
+            AuditAction::Mutation,
+            "add_edge",
+            true,
+            AuditContext::default(),
+            json!({"before": previous, "after": edge}),
+            None,
+        )
     }
 
     /// Remove an edge identified by `(src, dst, label)`.
     pub fn remove_edge(&self, src: Ulid, dst: Ulid, label: &str) -> Result<()> {
+        let previous = self
+            .graph_store
+            .neighbours_out(self.config.tenant, src, Some(label))?
+            .into_iter()
+            .find(|edge| edge.dst == dst);
         self.graph_store
-            .remove_edge(self.config.tenant, src, dst, label)
+            .remove_edge(self.config.tenant, src, dst, label)?;
+        self.append_audit(
+            Ulid::new(),
+            AuditAction::Mutation,
+            "remove_edge",
+            true,
+            AuditContext::default(),
+            json!({"before": previous, "src": src, "dst": dst, "label": label}),
+            None,
+        )
     }
 
     /// List outgoing edges, optionally filtered by label.
@@ -431,9 +743,29 @@ impl Database {
         &self,
         plan: &mmdb_query::LogicalPlan,
     ) -> Result<Vec<mmdb_query::Record>> {
-        let executor = self.source_executor_with_udfs()?;
-        let mut op = executor.compile(plan, QUERY_BATCH_SIZE)?;
-        collect_query_operator(&mut *op)
+        let operation_id = Ulid::new();
+        let result = (|| {
+            let executor = self.source_executor_with_udfs()?;
+            let mut op = executor.compile(plan, QUERY_BATCH_SIZE)?;
+            collect_query_operator(&mut *op)
+        })();
+        self.append_audit(
+            operation_id,
+            AuditAction::Query,
+            "execute_query",
+            result.is_ok(),
+            AuditContext::default(),
+            json!({
+                "plan": audit_plan(plan),
+                "result_count": result.as_ref().map(Vec::len).ok(),
+                "results": result.as_ref().ok().map(|rows| rows.iter().map(|row| json!({
+                    "node_id": row.node_id,
+                    "score": row.score,
+                })).collect::<Vec<_>>()),
+            }),
+            result.as_ref().err().map(ToString::to_string),
+        )?;
+        result
     }
 
     fn source_executor_with_udfs(&self) -> Result<mmdb_query::SourceExecutor<'_, Self>> {
@@ -473,17 +805,45 @@ impl Database {
         &self,
         plan: &mmdb_query::LogicalPlan,
     ) -> impl Future<Output = Result<Vec<mmdb_query::Record>>> + Send + 'static {
-        AsyncQueryFuture::new(AsyncQueryRequest {
+        let future = AsyncQueryFuture::new(AsyncQueryRequest {
             source: QuerySourceHandle {
                 storage: self.storage.clone(),
                 vector_store: self.vector_store.clone(),
                 graph_store: self.graph_store.clone(),
                 embedder: self.embedder.clone(),
                 config: self.config.clone(),
+                audit_store: self.audit_store.clone(),
             },
             udfs: self.query_udfs_snapshot(),
             plan: plan.clone(),
-        })
+        });
+        let audit_store = self.audit_store.clone();
+        let tenant = self.config.tenant;
+        let operation_id = Ulid::new();
+        let plan = audit_plan(plan);
+        async move {
+            let result = future.await;
+            audit_store.append(&AuditRecord {
+                id: Ulid::new(),
+                operation_id,
+                tenant,
+                at_ms: crate::now_ms(),
+                action: AuditAction::Query,
+                name: "execute_query_async".into(),
+                success: result.is_ok(),
+                context: AuditContext::default(),
+                details: json!({
+                    "plan": plan,
+                    "result_count": result.as_ref().map(Vec::len).ok(),
+                    "results": result.as_ref().ok().map(|rows| rows.iter().map(|row| json!({
+                        "node_id": row.node_id,
+                        "score": row.score,
+                    })).collect::<Vec<_>>()),
+                }),
+                error: result.as_ref().err().map(ToString::to_string),
+            })?;
+            result
+        }
     }
 
     pub(crate) fn graph_expand_query_rows(
@@ -507,5 +867,85 @@ fn blob_hash(content: &Content) -> Option<[u8; 32]> {
     match content {
         Content::Blob { hash, .. } => Some(*hash),
         _ => None,
+    }
+}
+
+fn audit_plan(plan: &mmdb_query::LogicalPlan) -> serde_json::Value {
+    use mmdb_query::{LogicalPlan, VectorRef};
+
+    match plan {
+        LogicalPlan::Scan { table, filter } => json!({
+            "operator": "scan",
+            "table": format!("{table:?}"),
+            "filter": filter.as_ref().map(|value| format!("{value:#?}")),
+        }),
+        LogicalPlan::VectorSearch {
+            query,
+            k,
+            filter,
+            model,
+        } => json!({
+            "operator": "vector_search",
+            "query": match query {
+                VectorRef::Text(text) => json!({"type": "text", "text": text}),
+                VectorRef::Vector(vector) => json!({"type": "vector", "dimension": vector.len()}),
+            },
+            "k": k,
+            "filter": filter.as_ref().map(|value| format!("{value:#?}")),
+            "model": model.0,
+        }),
+        LogicalPlan::GraphExpand {
+            from,
+            relation,
+            depth,
+        } => json!({
+            "operator": "graph_expand",
+            "from": audit_plan(from),
+            "relation": relation,
+            "depth": depth,
+        }),
+        LogicalPlan::Filter { input, pred } => json!({
+            "operator": "filter",
+            "input": audit_plan(input),
+            "predicate": format!("{pred:#?}"),
+        }),
+        LogicalPlan::Score { input, expr } => json!({
+            "operator": "score",
+            "input": audit_plan(input),
+            "expression": format!("{expr:#?}"),
+        }),
+        LogicalPlan::TopK { input, k, by } => json!({
+            "operator": "top_k",
+            "input": audit_plan(input),
+            "k": k,
+            "by": format!("{by:?}"),
+        }),
+        LogicalPlan::Join { left, right, on } => json!({
+            "operator": "join",
+            "left": audit_plan(left),
+            "right": audit_plan(right),
+            "on": format!("{on:?}"),
+        }),
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregate,
+        } => json!({
+            "operator": "aggregate",
+            "input": audit_plan(input),
+            "group_by": format!("{group_by:?}"),
+            "aggregate": format!("{aggregate:?}"),
+        }),
+        LogicalPlan::Project { input, fields } => json!({
+            "operator": "project",
+            "input": audit_plan(input),
+            "fields": format!("{fields:?}"),
+        }),
+        LogicalPlan::Udf { input, name, args } => json!({
+            "operator": "udf",
+            "input": audit_plan(input),
+            "name": name,
+            "arguments": format!("{args:?}"),
+        }),
     }
 }

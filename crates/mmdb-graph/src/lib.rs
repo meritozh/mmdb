@@ -325,6 +325,10 @@ mod tests {
             weight: 1.0,
             created_at_ms: 0,
             metadata: BTreeMap::new(),
+            revision: 1,
+            valid_from_ms: Some(0),
+            valid_to_ms: None,
+            evidence: Vec::new(),
         }
     }
 

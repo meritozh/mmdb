@@ -12,6 +12,10 @@ blob, catalog, and query crates into one `Database` handle.
 - Keep storage, vector indexes, graph indexes, blob refcounts, and catalog stats
   consistent at the facade boundary.
 - Bind `mmdb-query` `LogicalPlan` leaves to the real persisted stores.
+- Orchestrate runtime-only embedding and agent clients while persisting only
+  public, versioned profiles.
+- Fuse BM25, multiple vector branches, and weighted graph evidence.
+- Validate and audit lawyer proposals and reversible dream maintenance.
 
 ## Opening
 
@@ -30,6 +34,14 @@ let db = mmdb::Database::open_with(
 `open_with_embedder` attaches a text embedder. The embedder model name must match
 `DatabaseConfig::default_model`, which prevents automatic text embeddings from
 being written into a different model space than default recall uses.
+
+`Database::builder` accepts a `MemoryProfile` and `ClientRegistry`. Profiles are
+durable; clients are runtime-only. The host owns authentication, provider SDKs,
+endpoints, timeouts, and retries.
+
+The current HNSW backend uses cosine distance, so profile validation rejects
+dot-product or Euclidean declarations rather than silently searching with the
+wrong metric.
 
 ## Node API
 
@@ -58,6 +70,14 @@ embedding for the embedder model if the node does not already carry one.
 Explicit embeddings win. A node that already has an embedding for the configured
 model is not re-embedded.
 
+`Database::ingest` is the multi-model path. It persists the raw memory before
+calling any compatible `EmbeddingClient`, records each `ProjectionStatus`, and
+keeps failed work retryable through `retry_projection`. Clients receive owned
+text/JSON or a reopenable `BlobInput`.
+
+`ingest_blob` applies the same raw-first workflow to bytes placed in the
+content-addressed blob store.
+
 The facade validates:
 
 - embedding `dim` matches vector length;
@@ -80,6 +100,23 @@ set, then combines it with the fast `nodes_meta` kind/time path.
 
 `hybrid_search` starts with vector seeds, expands graph neighbors with BFS, and
 blends vector score with graph-neighbor contribution using `HybridOpts`.
+
+`recall` additionally runs the persisted BM25 inverted index, weighted RRF,
+point-in-time lifecycle filtering, directional causal traversal, provenance,
+and contradiction surfacing. It returns `RecallEvidence` rather than an opaque
+score.
+
+An optional lawyer profile receives at most 50 candidates and 128 KiB. Its
+validated `LawyerVerdict` can gate/rerank recall and stage `ChangeProposal`
+records. Only `apply_proposal` can mutate, after revision revalidation.
+
+## Dream And Audit APIs
+
+- `maintain`: deterministic bounded dream batches through `AgentClient`.
+- `dream_runs` / `dream_run`: inspect provenance and status.
+- `revert_dream`: retract created output and restore superseded derived memory.
+- `audit_records` / `inspect_operation`: review append-only sanitized history.
+- `graph_slice`: display valid nodes, timestamps, evidence, paths, and weights.
 
 ## Graph API
 
@@ -130,9 +167,13 @@ Facade-local UDFs are Rust closures registered by name. The WASM runtime lives i
 
 - `crates/mmdb/src/db.rs`: facade handle and node/blob/graph/query APIs.
 - `crates/mmdb/src/search.rs`: vector filters and hybrid scoring.
+- `crates/mmdb/src/runtime.rs`: client traits, profiles, builder, projection work.
+- `crates/mmdb/src/lexical.rs`: fjall-backed BM25 index.
+- `crates/mmdb/src/recall.rs`: evidence fusion, temporal rules, lawyer proposals.
+- `crates/mmdb/src/dream.rs`: validated staged maintenance and reversal.
+- `crates/mmdb/src/audit.rs`: append-only sanitized operation journal.
 - `crates/mmdb/src/embedder.rs`: embedder trait and database config.
 - `crates/mmdb/src/query_impl.rs`: source-backed query bridge and async worker.
 - `crates/mmdb/src/convert.rs`: node/query record conversion and predicate
   evaluation.
 - `crates/mmdb/src/builder.rs`: `NodeBuilder`.
-

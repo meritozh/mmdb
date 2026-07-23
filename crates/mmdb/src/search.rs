@@ -1,7 +1,9 @@
+use crate::audit::{node_snapshot, AuditAction, AuditContext};
 use crate::Database;
 use mmdb_core::{MemoryNode, NodeKind, Result};
 use mmdb_graph::Direction;
 use mmdb_storage::Storage;
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
 use ulid::Ulid;
 
@@ -139,30 +141,61 @@ impl Default for HybridOpts {
 impl Database {
     /// Convenience: embed a query string and run vector_search.
     pub fn search_text(&self, query: &str, k: usize) -> Result<Vec<Hit>> {
-        let embedder = self.embedder.as_ref().ok_or_else(|| {
-            mmdb_core::Error::InvalidArgument(
-                "search_text requires an embedder (use Database::open_with_embedder)".into(),
-            )
-        })?;
-        let q = embedder.embed(query)?;
-        self.vector_search_with_model(embedder.model_name(), &q, k)
+        let operation_id = Ulid::new();
+        let embedded = (|| {
+            let embedder = self.embedder.as_ref().ok_or_else(|| {
+                mmdb_core::Error::InvalidArgument(
+                    "search_text requires an embedder (use Database::open_with_embedder)".into(),
+                )
+            })?;
+            embedder
+                .embed(query)
+                .map(|vector| (embedder.model_name().to_string(), vector))
+        })();
+        self.audit_legacy_embedding(operation_id, query, &embedded)?;
+        let result =
+            embedded.and_then(|(model, vector)| self.vector_search_raw(&model, &vector, k));
+        self.finish_hit_query(
+            operation_id,
+            "search_text",
+            json!({"query": query, "k": k}),
+            result,
+        )
     }
 
     /// Async variant of [`Self::search_text`] for remote embedding providers.
     pub async fn search_text_async(&self, query: &str, k: usize) -> Result<Vec<Hit>> {
-        let embedder = self.embedder.as_ref().ok_or_else(|| {
-            mmdb_core::Error::InvalidArgument(
+        let operation_id = Ulid::new();
+        let embedded = match self.embedder.as_ref() {
+            Some(embedder) => embedder
+                .embed_async(query)
+                .await
+                .map(|vector| (embedder.model_name().to_string(), vector)),
+            None => Err(mmdb_core::Error::InvalidArgument(
                 "search_text_async requires an embedder (use Database::open_with_embedder)".into(),
-            )
-        })?;
-        let q = embedder.embed_async(query).await?;
-        self.vector_search_with_model(embedder.model_name(), &q, k)
+            )),
+        };
+        self.audit_legacy_embedding(operation_id, query, &embedded)?;
+        let result =
+            embedded.and_then(|(model, vector)| self.vector_search_raw(&model, &vector, k));
+        self.finish_hit_query(
+            operation_id,
+            "search_text_async",
+            json!({"query": query, "k": k}),
+            result,
+        )
     }
 
     /// Vector search using the database default model.
     pub fn vector_search(&self, query: &[f32], k: usize) -> Result<Vec<Hit>> {
         let model = self.config.default_model.clone();
-        self.vector_search_with_model(&model, query, k)
+        let result = self.vector_search_raw(&model, query, k);
+        self.finish_hit_query(
+            Ulid::new(),
+            "vector_search",
+            json!({"model": model, "query_dimension": query.len(), "k": k}),
+            result,
+        )
     }
 
     /// Vector search with structured post-filter (kind / time window).
@@ -174,40 +207,49 @@ impl Database {
         k: usize,
         filter: VectorFilter,
     ) -> Result<Vec<Hit>> {
-        let model = self.config.default_model.clone();
-        let tenant = self.config.tenant;
-        let storage = &self.storage;
-        let allowed_by_metadata = if filter.metadata.is_empty() {
-            None
-        } else {
-            Some(metadata_candidate_set(storage, tenant, &filter.metadata)?)
-        };
-        let f = &filter;
-        let pred = move |id: Ulid| -> bool {
-            if let Some(allowed) = &allowed_by_metadata {
-                if !allowed.contains(&id) {
-                    return false;
+        let operation_id = Ulid::new();
+        let details = json!({
+            "model": self.config.default_model,
+            "query_dimension": query.len(),
+            "k": k,
+            "filter": format!("{filter:#?}"),
+        });
+        let result = (|| {
+            let model = self.config.default_model.clone();
+            let tenant = self.config.tenant;
+            let storage = &self.storage;
+            let allowed_by_metadata = if filter.metadata.is_empty() {
+                None
+            } else {
+                Some(metadata_candidate_set(storage, tenant, &filter.metadata)?)
+            };
+            let f = &filter;
+            let pred = move |id: Ulid| -> bool {
+                if let Some(allowed) = &allowed_by_metadata {
+                    if !allowed.contains(&id) {
+                        return false;
+                    }
+                }
+                match storage.get_node_meta(tenant, id) {
+                    Ok(Some(metadata)) => f.matches_meta(metadata.kind, metadata.created_at_ms),
+                    _ => false,
+                }
+            };
+            let scored =
+                self.vector_store
+                    .search_with_filter(tenant, &model, query, k, Some(&pred))?;
+            let mut hits = Vec::with_capacity(scored.len());
+            for hit in scored {
+                if let Some(node) = self.storage.get_node(tenant, hit.node_id)? {
+                    hits.push(Hit {
+                        node,
+                        score: hit.score,
+                    });
                 }
             }
-            // Fast path: lightweight meta (kind + ts) without full node decode.
-            match storage.get_node_meta(tenant, id) {
-                Ok(Some(m)) => f.matches_meta(m.kind, m.created_at_ms),
-                _ => false,
-            }
-        };
-        let scored = self
-            .vector_store
-            .search_with_filter(tenant, &model, query, k, Some(&pred))?;
-        let mut hits = Vec::with_capacity(scored.len());
-        for sh in scored {
-            if let Some(node) = self.storage.get_node(tenant, sh.node_id)? {
-                hits.push(Hit {
-                    node,
-                    score: sh.score,
-                });
-            }
-        }
-        Ok(hits)
+            Ok(hits)
+        })();
+        self.finish_hit_query(operation_id, "vector_search_filtered", details, result)
     }
 
     /// Vector search against an explicit model name. Use this only when you
@@ -218,19 +260,13 @@ impl Database {
         query: &[f32],
         k: usize,
     ) -> Result<Vec<Hit>> {
-        let scored = self
-            .vector_store
-            .search(self.config.tenant, model, query, k)?;
-        let mut hits = Vec::with_capacity(scored.len());
-        for s in scored {
-            if let Some(node) = self.storage.get_node(self.config.tenant, s.node_id)? {
-                hits.push(Hit {
-                    node,
-                    score: s.score,
-                });
-            }
-        }
-        Ok(hits)
+        let result = self.vector_search_raw(model, query, k);
+        self.finish_hit_query(
+            Ulid::new(),
+            "vector_search_with_model",
+            json!({"model": model, "query_dimension": query.len(), "k": k}),
+            result,
+        )
     }
 
     /// Vector recall then BFS expansion then blended score reranking.
@@ -243,7 +279,15 @@ impl Database {
     ///                        * decay ^ hop_distance
     /// ```
     pub fn hybrid_search(&self, query: &[f32], opts: HybridOpts) -> Result<Vec<Hit>> {
-        let seeds = self.vector_search(query, opts.seed_k.max(opts.k))?;
+        let operation_id = Ulid::new();
+        let details = json!({"query_dimension": query.len(), "options": format!("{opts:#?}")});
+        let result = self.hybrid_search_inner(query, &opts);
+        self.finish_hit_query(operation_id, "hybrid_search", details, result)
+    }
+
+    fn hybrid_search_inner(&self, query: &[f32], opts: &HybridOpts) -> Result<Vec<Hit>> {
+        let seeds =
+            self.vector_search_raw(&self.config.default_model, query, opts.seed_k.max(opts.k))?;
         if seeds.is_empty() {
             return Ok(Vec::new());
         }
@@ -323,5 +367,77 @@ impl Database {
             }
         }
         Ok(hits)
+    }
+
+    fn vector_search_raw(&self, model: &str, query: &[f32], k: usize) -> Result<Vec<Hit>> {
+        let scored = self
+            .vector_store
+            .search(self.config.tenant, model, query, k)?;
+        let mut hits = Vec::with_capacity(scored.len());
+        for hit in scored {
+            if let Some(node) = self.storage.get_node(self.config.tenant, hit.node_id)? {
+                hits.push(Hit {
+                    node,
+                    score: hit.score,
+                });
+            }
+        }
+        Ok(hits)
+    }
+
+    fn finish_hit_query(
+        &self,
+        operation_id: Ulid,
+        name: &str,
+        mut details: Value,
+        result: Result<Vec<Hit>>,
+    ) -> Result<Vec<Hit>> {
+        if let Value::Object(values) = &mut details {
+            values.insert(
+                "results".into(),
+                result
+                    .as_ref()
+                    .ok()
+                    .map(|hits| {
+                        hits.iter()
+                            .map(
+                                |hit| json!({"score": hit.score, "node": node_snapshot(&hit.node)}),
+                            )
+                            .collect::<Vec<_>>()
+                    })
+                    .map_or(Value::Null, Value::Array),
+            );
+        }
+        self.append_audit(
+            operation_id,
+            AuditAction::Query,
+            name,
+            result.is_ok(),
+            AuditContext::default(),
+            details,
+            result.as_ref().err().map(ToString::to_string),
+        )?;
+        result
+    }
+
+    fn audit_legacy_embedding(
+        &self,
+        operation_id: Ulid,
+        query: &str,
+        result: &Result<(String, Vec<f32>)>,
+    ) -> Result<()> {
+        self.append_audit(
+            operation_id,
+            AuditAction::ClientCall,
+            "legacy_embedding",
+            result.is_ok(),
+            AuditContext::default(),
+            json!({
+                "request": {"type": "text", "text": query},
+                "model": result.as_ref().ok().map(|(model, _)| model),
+                "response": result.as_ref().ok().map(|(_, vector)| json!({"dimension": vector.len()})),
+            }),
+            result.as_ref().err().map(ToString::to_string),
+        )
     }
 }

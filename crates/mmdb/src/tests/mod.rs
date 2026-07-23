@@ -395,6 +395,10 @@ fn execute_query_uses_vector_and_graph_stores() {
         weight: 1.0,
         created_at_ms: 1_300,
         metadata: BTreeMap::new(),
+        revision: 1,
+        valid_from_ms: None,
+        valid_to_ms: None,
+        evidence: Vec::new(),
     })
     .unwrap();
 
@@ -484,6 +488,10 @@ fn source_executor_runs_against_database_stores() {
         weight: 1.0,
         created_at_ms: 1_200,
         metadata: BTreeMap::new(),
+        revision: 1,
+        valid_from_ms: None,
+        valid_to_ms: None,
+        evidence: Vec::new(),
     })
     .unwrap();
 
@@ -555,6 +563,10 @@ fn execute_query_physical_matches_facade_for_udf_free_plan() {
         weight: 1.0,
         created_at_ms: 1_200,
         metadata: BTreeMap::new(),
+        revision: 1,
+        valid_from_ms: None,
+        valid_to_ms: None,
+        evidence: Vec::new(),
     })
     .unwrap();
     let plan = LogicalPlan::TopK {
@@ -1114,6 +1126,10 @@ fn hybrid_search_promotes_neighbour_via_graph() {
         weight: 1.0,
         created_at_ms: 0,
         metadata: BTreeMap::new(),
+        revision: 1,
+        valid_from_ms: None,
+        valid_to_ms: None,
+        evidence: Vec::new(),
     })
     .unwrap();
 
@@ -1184,6 +1200,10 @@ fn edge_labels_are_available_from_facade() {
         weight: 1.0,
         created_at_ms: 0,
         metadata: BTreeMap::new(),
+        revision: 1,
+        valid_from_ms: None,
+        valid_to_ms: None,
+        evidence: Vec::new(),
     })
     .unwrap();
 
@@ -1228,6 +1248,630 @@ fn insert_blob_stores_artifact_and_reads_stream() {
         .read_to_end(&mut bytes)
         .unwrap();
     assert_eq!(bytes, b"blob payload");
+}
+
+mod agent_memory {
+    use super::{block_on, Database, NodeBuilder};
+    use crate::{
+        AgentClient, AgentRequest, AgentResponse, AuditAction, AuditFilter, ChangeProposalStatus,
+        ClientFuture, ClientRegistry, DreamProfile, DreamRun, DreamRunStatus, EmbeddingClient,
+        EmbeddingDistance, EmbeddingInput, EmbeddingOutput, EmbeddingProfile, LawyerFailureMode,
+        LawyerProfile, MaintenanceTrigger, MemoryProfile, ProjectionState, RecallRequest,
+        RecallStatus, SupportedContent,
+    };
+    use fjall::PersistMode;
+    use mmdb_core::{Edge, MemoryState, NodeKind};
+    use std::collections::BTreeMap;
+    use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
+    use tempfile::tempdir;
+    use ulid::Ulid;
+
+    struct FixedEmbedding {
+        vector: Vec<f32>,
+        projection: Option<String>,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl EmbeddingClient for FixedEmbedding {
+        fn embed<'a>(
+            &'a self,
+            input: EmbeddingInput,
+            profile: &'a EmbeddingProfile,
+        ) -> ClientFuture<'a, EmbeddingOutput> {
+            let input_type = match input {
+                EmbeddingInput::Text(_) => "text",
+                EmbeddingInput::Json(_) => "json",
+                EmbeddingInput::Blob(blob) => {
+                    blob.open().unwrap();
+                    "blob"
+                }
+            };
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("{}:{input_type}", profile.id));
+            let output = EmbeddingOutput {
+                vector: self.vector.clone(),
+                searchable_text: self.projection.clone(),
+            };
+            Box::pin(async move { Ok(output) })
+        }
+    }
+
+    struct DynamicAgent {
+        handler: Arc<dyn Fn(&AgentRequest) -> serde_json::Value + Send + Sync>,
+    }
+
+    impl AgentClient for DynamicAgent {
+        fn call<'a>(&'a self, request: AgentRequest) -> ClientFuture<'a, AgentResponse> {
+            let payload = (self.handler)(&request);
+            Box::pin(async move { Ok(AgentResponse { payload }) })
+        }
+    }
+
+    fn embedding_profile(
+        id: &str,
+        client_id: &str,
+        model: &str,
+        dimension: u32,
+    ) -> EmbeddingProfile {
+        EmbeddingProfile {
+            id: id.into(),
+            client_id: client_id.into(),
+            model: model.into(),
+            model_revision: "r1".into(),
+            dimension,
+            distance: EmbeddingDistance::Cosine,
+            supported_content: vec![
+                SupportedContent::Text,
+                SupportedContent::Json,
+                SupportedContent::Blob,
+            ],
+            supported_mime_types: Vec::new(),
+            weight: 1.0,
+        }
+    }
+
+    fn edge(src: Ulid, dst: Ulid, label: &str, at: i64) -> Edge {
+        Edge {
+            src,
+            dst,
+            label: label.into(),
+            weight: 1.0,
+            created_at_ms: at,
+            metadata: BTreeMap::new(),
+            revision: 1,
+            valid_from_ms: Some(at),
+            valid_to_ms: None,
+            evidence: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn multimodel_ingest_is_raw_first_retryable_and_lexically_searchable() {
+        let dir = tempdir().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let clients = ClientRegistry::new();
+        clients
+            .register_embedding(
+                "good-client",
+                Arc::new(FixedEmbedding {
+                    vector: vec![1.0, 0.0],
+                    projection: Some("model generated projection".into()),
+                    calls: calls.clone(),
+                }),
+            )
+            .unwrap();
+        clients
+            .register_embedding(
+                "bad-client",
+                Arc::new(FixedEmbedding {
+                    vector: vec![1.0],
+                    projection: None,
+                    calls: calls.clone(),
+                }),
+            )
+            .unwrap();
+        let profile = MemoryProfile {
+            version: 1,
+            revision: 1,
+            embedding_profiles: vec![
+                embedding_profile("good", "good-client", "good-model", 2),
+                embedding_profile("bad", "bad-client", "bad-model", 2),
+            ],
+            dreamer: None,
+            lawyer: None,
+        };
+        let db = Database::builder(dir.path())
+            .clients(clients)
+            .profile(profile)
+            .build()
+            .unwrap();
+
+        let report = block_on(
+            db.ingest(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("source survives provider failure")
+                    .build(),
+            ),
+        )
+        .unwrap();
+        assert!(db.get(report.node_id).unwrap().is_some());
+        assert_eq!(report.projections.len(), 2);
+        assert_eq!(report.projections[0].state, ProjectionState::Ready);
+        assert_eq!(report.projections[1].state, ProjectionState::Failed);
+        block_on(
+            db.ingest(
+                NodeBuilder::new(NodeKind::Fact)
+                    .structured(serde_json::json!({
+                        "topic": "structured",
+                        "api_key": "must-not-enter-audit"
+                    }))
+                    .build(),
+            ),
+        )
+        .unwrap();
+        block_on(db.ingest_blob(
+            NodeKind::Artifact,
+            Cursor::new(b"blob payload"),
+            "application/octet-stream",
+        ))
+        .unwrap();
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [
+                "good:text",
+                "bad:text",
+                "good:json",
+                "bad:json",
+                "good:blob",
+                "bad:blob"
+            ]
+        );
+
+        let mut request = RecallRequest::new("model generated projection");
+        request.vector_profiles.clear();
+        request.limit = 5;
+        let recalled = block_on(db.recall(request)).unwrap();
+        assert_eq!(recalled.evidence[0].node.id, report.node_id);
+        assert!(matches!(recalled.status, RecallStatus::Degraded { .. }));
+
+        let audit = db.audit_records(AuditFilter::default()).unwrap();
+        let encoded = serde_json::to_string(&audit).unwrap();
+        assert!(!encoded.contains("[1.0,0.0]"));
+        assert!(!encoded.contains("must-not-enter-audit"));
+        assert!(audit
+            .iter()
+            .any(|record| record.action == AuditAction::ClientCall));
+    }
+
+    #[test]
+    fn recall_applies_temporal_causal_and_conflict_rules_before_models() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let active = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("weather is sunny")
+                    .created_at(50)
+                    .build(),
+            )
+            .unwrap();
+        let future = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("weather future")
+                    .created_at(150)
+                    .build(),
+            )
+            .unwrap();
+        let mut expired = NodeBuilder::new(NodeKind::Fact)
+            .text("weather expired")
+            .created_at(20)
+            .build();
+        expired.valid_to_ms = Some(90);
+        let expired = db.insert(expired).unwrap();
+        let mut superseded = NodeBuilder::new(NodeKind::Fact)
+            .text("weather superseded")
+            .created_at(10)
+            .build();
+        superseded.state = MemoryState::Superseded;
+        let superseded = db.insert(superseded).unwrap();
+        let mut historical = NodeBuilder::new(NodeKind::Fact)
+            .text("historical marker")
+            .created_at(10)
+            .build();
+        historical.state = MemoryState::Superseded;
+        historical.valid_to_ms = Some(80);
+        let historical = db.insert(historical).unwrap();
+        let contradiction = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("sky is green")
+                    .created_at(40)
+                    .build(),
+            )
+            .unwrap();
+        let causal_past = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("past effect")
+                    .created_at(10)
+                    .build(),
+            )
+            .unwrap();
+        db.add_edge(edge(active, contradiction, "contradicts", 60))
+            .unwrap();
+        db.add_edge(edge(active, causal_past, "causes", 60))
+            .unwrap();
+
+        let mut request = RecallRequest::new("weather");
+        request.as_of_ms = 100;
+        request.graph_depth = 2;
+        let recalled = block_on(db.recall(request)).unwrap();
+        let ids: Vec<_> = recalled.evidence.iter().map(|item| item.node.id).collect();
+        assert!(ids.contains(&active));
+        assert!(ids.contains(&contradiction));
+        assert!(!ids.contains(&future));
+        assert!(!ids.contains(&expired));
+        assert!(!ids.contains(&superseded));
+        assert!(!ids.contains(&causal_past));
+        let active_evidence = recalled
+            .evidence
+            .iter()
+            .find(|item| item.node.id == active)
+            .unwrap();
+        assert_eq!(active_evidence.conflicts, vec![contradiction]);
+        assert!(!active_evidence.verified);
+
+        let mut historical_request = RecallRequest::new("historical marker");
+        historical_request.as_of_ms = 70;
+        let historical_recall = block_on(db.recall(historical_request)).unwrap();
+        assert_eq!(historical_recall.evidence[0].node.id, historical);
+    }
+
+    #[test]
+    fn lawyer_can_gate_and_propose_but_stale_proposals_cannot_mutate() {
+        let dir = tempdir().unwrap();
+        let clients = ClientRegistry::new();
+        clients
+            .register_agent(
+                "law-client",
+                Arc::new(DynamicAgent {
+                    handler: Arc::new(|request| {
+                        let node = &request.payload["evidence"][0]["node"];
+                        let id = node["id"].clone();
+                        let revision = node["revision"].clone();
+                        serde_json::json!({
+                            "accepted_candidate_ids": [id.clone()],
+                            "rejected_candidate_ids": [],
+                            "final_order": [id.clone()],
+                            "annotations": [],
+                            "cited_evidence_ids": [id.clone()],
+                            "unresolved_conflicts": [],
+                            "proposals": [{
+                                "reason": "review retirement",
+                                "changes": [{
+                                    "type": "set_state",
+                                    "node_id": id,
+                                    "expected_revision": revision,
+                                    "state": "Retracted"
+                                }]
+                            }]
+                        })
+                    }),
+                }),
+            )
+            .unwrap();
+        let profile = MemoryProfile {
+            version: 1,
+            revision: 1,
+            embedding_profiles: Vec::new(),
+            dreamer: None,
+            lawyer: Some(LawyerProfile {
+                id: "causal-lawyer".into(),
+                client_id: "law-client".into(),
+                agent_id: "law-agent".into(),
+                model_id: "law-model".into(),
+                prompt_version: "v1".into(),
+                rule_set: "temporal-causal-v1".into(),
+                evidence_limit: 50,
+                failure_mode: LawyerFailureMode::ReturnDeterministic,
+            }),
+        };
+        let db = Database::builder(dir.path())
+            .clients(clients)
+            .profile(profile)
+            .build()
+            .unwrap();
+        let id = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("owner is Alice")
+                    .build(),
+            )
+            .unwrap();
+        let mut request = RecallRequest::new("owner Alice");
+        request.lawyer_profile = Some("causal-lawyer".into());
+        let recalled = block_on(db.recall(request.clone())).unwrap();
+        assert_eq!(recalled.status, RecallStatus::Adjudicated);
+        assert_eq!(recalled.evidence[0].node.id, id);
+        let proposal_id = recalled.verdict.unwrap().proposals[0].id;
+        assert_eq!(db.get(id).unwrap().unwrap().state, MemoryState::Active);
+
+        let node = db.get(id).unwrap().unwrap();
+        db.insert(node).unwrap();
+        assert!(db.apply_proposal(proposal_id, Default::default()).is_err());
+        assert_eq!(
+            db.proposal(proposal_id).unwrap().unwrap().status,
+            ChangeProposalStatus::Stale
+        );
+        assert_eq!(db.get(id).unwrap().unwrap().state, MemoryState::Active);
+
+        let operation_records = db.inspect_operation(recalled.operation_id).unwrap();
+        assert_eq!(
+            operation_records
+                .iter()
+                .filter(|record| record.action == AuditAction::Query)
+                .count(),
+            1
+        );
+
+        let fresh = block_on(db.recall(request)).unwrap();
+        let fresh_proposal = fresh.verdict.unwrap().proposals[0].id;
+        db.apply_proposal(fresh_proposal, Default::default())
+            .unwrap();
+        assert_eq!(db.get(id).unwrap().unwrap().state, MemoryState::Retracted);
+    }
+
+    #[test]
+    fn lawyer_rejects_out_of_scope_verdicts_with_configured_failure_mode() {
+        let dir = tempdir().unwrap();
+        let clients = ClientRegistry::new();
+        clients
+            .register_agent(
+                "bad-lawyer",
+                Arc::new(DynamicAgent {
+                    handler: Arc::new(|_| {
+                        let unknown = Ulid::new();
+                        serde_json::json!({
+                            "accepted_candidate_ids": [unknown],
+                            "rejected_candidate_ids": [],
+                            "final_order": [unknown],
+                            "annotations": [],
+                            "cited_evidence_ids": [],
+                            "unresolved_conflicts": [],
+                            "proposals": []
+                        })
+                    }),
+                }),
+            )
+            .unwrap();
+        let lawyer = LawyerProfile {
+            id: "strict".into(),
+            client_id: "bad-lawyer".into(),
+            agent_id: "law-agent".into(),
+            model_id: "law-model".into(),
+            prompt_version: "v1".into(),
+            rule_set: "temporal-causal-v1".into(),
+            evidence_limit: 50,
+            failure_mode: LawyerFailureMode::ReturnDeterministic,
+        };
+        let profile = MemoryProfile {
+            version: 1,
+            revision: 1,
+            embedding_profiles: Vec::new(),
+            dreamer: None,
+            lawyer: Some(lawyer),
+        };
+        let db = Database::builder(dir.path())
+            .clients(clients)
+            .profile(profile)
+            .build()
+            .unwrap();
+        let id = db
+            .insert(NodeBuilder::new(NodeKind::Fact).text("stable fact").build())
+            .unwrap();
+        let mut request = RecallRequest::new("stable fact");
+        request.lawyer_profile = Some("strict".into());
+        let recalled = block_on(db.recall(request.clone())).unwrap();
+        assert_eq!(recalled.evidence[0].node.id, id);
+        assert!(matches!(recalled.status, RecallStatus::Degraded { .. }));
+
+        let mut profile = db.memory_profile().unwrap();
+        profile.lawyer.as_mut().unwrap().failure_mode = LawyerFailureMode::FailClosed;
+        db.set_memory_profile(profile, Default::default()).unwrap();
+        assert!(block_on(db.recall(request)).is_err());
+    }
+
+    #[test]
+    fn dream_runs_are_provenanced_idempotent_and_reversible() {
+        let dir = tempdir().unwrap();
+        let clients = ClientRegistry::new();
+        clients
+            .register_agent(
+                "dream-client",
+                Arc::new(DynamicAgent {
+                    handler: Arc::new(|request| {
+                        let source = request.payload["sources"][0]["id"].clone();
+                        serde_json::json!({
+                            "nodes": [{
+                                "temporary_id": "summary",
+                                "kind": "Fact",
+                                "content": {"Text": "durable summary"},
+                                "source_citations": [source],
+                                "metadata": {"confidence": 0.9}
+                            }],
+                            "edges": [],
+                            "supersede": [],
+                            "explanation": "compact one episode"
+                        })
+                    }),
+                }),
+            )
+            .unwrap();
+        let profile = MemoryProfile {
+            version: 1,
+            revision: 1,
+            embedding_profiles: Vec::new(),
+            dreamer: Some(DreamProfile {
+                id: "nightly".into(),
+                revision: "r1".into(),
+                client_id: "dream-client".into(),
+                agent_id: "dream-agent".into(),
+                model_id: "dream-model".into(),
+                prompt_version: "v1".into(),
+                response_schema: serde_json::json!({"type": "object"}),
+                turn_end_threshold: 32,
+                max_nodes: 128,
+                max_input_bytes: 256 * 1024,
+            }),
+            lawyer: None,
+        };
+        let db = Database::builder(dir.path())
+            .clients(clients)
+            .profile(profile)
+            .build()
+            .unwrap();
+        let source = db
+            .insert(
+                NodeBuilder::new(NodeKind::Episode)
+                    .text("user prefers tea")
+                    .build(),
+            )
+            .unwrap();
+        assert!(
+            block_on(db.maintain(MaintenanceTrigger::TurnEnd, Default::default()))
+                .unwrap()
+                .is_none()
+        );
+        let run = block_on(db.maintain(MaintenanceTrigger::Manual, Default::default()))
+            .unwrap()
+            .unwrap();
+        let created = run.created_ids[0];
+        assert_eq!(db.get(source).unwrap().unwrap().state, MemoryState::Active);
+        assert_eq!(db.get(created).unwrap().unwrap().state, MemoryState::Active);
+        assert_eq!(
+            db.neighbours_out(created, Some("derived_from")).unwrap()[0].dst,
+            source
+        );
+        assert!(
+            block_on(db.maintain(MaintenanceTrigger::Manual, Default::default()))
+                .unwrap()
+                .is_none()
+        );
+
+        db.revert_dream(run.id, Default::default()).unwrap();
+        let retracted = db.get(created).unwrap().unwrap();
+        assert_eq!(retracted.state, MemoryState::Retracted);
+        let retracted_at = retracted.valid_to_ms.unwrap();
+        if retracted.valid_from_ms.unwrap() < retracted_at {
+            assert!(retracted.is_valid_at(retracted_at - 1));
+        }
+        assert!(!retracted.is_valid_at(retracted_at));
+        assert!(db
+            .neighbours_out(created, Some("derived_from"))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn reopen_repairs_incomplete_dream_staging() {
+        let dir = tempdir().unwrap();
+        let run_id = Ulid::new();
+        let staged_id;
+        {
+            let db = Database::open(dir.path()).unwrap();
+            let mut staged = NodeBuilder::new(NodeKind::Fact)
+                .text("never published")
+                .build();
+            staged.state = MemoryState::Pending;
+            staged
+                .metadata
+                .insert("dream_run_id".into(), serde_json::json!(run_id));
+            staged_id = db.insert(staged).unwrap();
+            let run = DreamRun {
+                id: run_id,
+                profile_id: "test".into(),
+                profile_revision: "r1".into(),
+                source_hash: "incomplete".into(),
+                source_ids: Vec::new(),
+                created_ids: vec![staged_id],
+                added_edges: Vec::new(),
+                superseded: Vec::new(),
+                explanation: "simulate interrupted staging".into(),
+                status: DreamRunStatus::Pending,
+                created_at_ms: crate::now_ms(),
+                completed_at_ms: None,
+                error: None,
+            };
+            db.runtime_store.put_dream_run(0, run_id, &run).unwrap();
+        }
+
+        let db = Database::open(dir.path()).unwrap();
+        let staged = db.get(staged_id).unwrap().unwrap();
+        assert_eq!(staged.state, MemoryState::Retracted);
+        assert!(!staged.is_valid_at(crate::now_ms()));
+        assert_eq!(
+            db.dream_run(run_id).unwrap().unwrap().status,
+            DreamRunStatus::Repaired
+        );
+        assert!(db
+            .audit_records(AuditFilter {
+                action: Some(AuditAction::Repair),
+                ..AuditFilter::default()
+            })
+            .unwrap()
+            .iter()
+            .any(|record| record.name == "repair_dream"));
+    }
+
+    #[test]
+    fn reopen_migrates_legacy_schema_without_rewriting_raw_nodes() {
+        let dir = tempdir().unwrap();
+        let node = NodeBuilder::new(NodeKind::Fact)
+            .text("legacy")
+            .embedding("old-model", vec![1.0, 0.0])
+            .created_at(10)
+            .build();
+        let id = node.id;
+        {
+            let storage = mmdb_storage::Storage::open(dir.path()).unwrap();
+            storage.put_node(&node).unwrap();
+            let vectors = mmdb_vector::VectorStore::open(storage.keyspace.clone()).unwrap();
+            vectors.insert(0, "old-model", id, &[1.0, 0.0]).unwrap();
+            let key = mmdb_storage::keys::node_key(0, id);
+            let value = storage.nodes.get(&key).unwrap().unwrap();
+            let mut value: serde_json::Value = serde_json::from_slice(&value).unwrap();
+            let object = value.as_object_mut().unwrap();
+            object.remove("revision");
+            object.remove("state");
+            object.remove("valid_from_ms");
+            object.remove("valid_to_ms");
+            storage
+                .nodes
+                .insert(key, serde_json::to_vec(&value).unwrap())
+                .unwrap();
+            storage.keyspace.persist(PersistMode::SyncAll).unwrap();
+        }
+        let db = Database::open(dir.path()).unwrap();
+        let node = db.get(id).unwrap().unwrap();
+        assert_eq!(node.revision, 0);
+        assert_eq!(node.state, MemoryState::Active);
+        assert!(node.is_valid_at(10));
+        assert!(db
+            .memory_profile()
+            .unwrap()
+            .embedding_profiles
+            .iter()
+            .any(|profile| profile.id == "legacy:old-model"));
+
+        let key = mmdb_storage::keys::node_key(0, id);
+        let raw = db.storage.nodes.get(key).unwrap().unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert!(raw.get("revision").is_none());
+    }
 }
 
 #[test]

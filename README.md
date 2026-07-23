@@ -12,7 +12,11 @@ single engine.
 - **Time-ordered** — tenant-prefixed, big-endian ULID keys for efficient time-range scans
 - **Node-centric data model** — `MemoryNode` with Episode / Fact / Entity / Artifact kinds
 - **Builder API** — ergonomic `NodeBuilder` for fluent node construction
-- **Hybrid recall** — vector seeds can be reranked with graph-neighbour signal
+- **Client-aware projections** — caller-owned embedding and agent clients; credentials never persist
+- **Evidence recall** — BM25 + multiple vector models + weighted graph paths with temporal rules
+- **Lawyer workflow** — bounded adjudication with explicit, revision-checked change proposals
+- **Reversible dreaming** — deterministic batches, cited derived memories, repair, and rollback
+- **Auditable** — append-only records for queries, mutations, client calls, compaction, and repair
 - **MMQL/IR/executor** — MMQL and builder plans lower into shared `LogicalPlan`
 
 ## Quick Start
@@ -34,6 +38,12 @@ let id = db.insert(node)?;
 let recent = db.scan_by_time(0, mmdb::now_ms() + 1, 50)?;
 db.delete(id)?;
 ```
+
+For remote models, use `Database::builder(path)` with a persisted
+`MemoryProfile` and a runtime-only `ClientRegistry`. `EmbeddingClient` and
+`AgentClient` implementations own provider SDKs, endpoints, credentials,
+timeouts, and retries. `Database::ingest`, `Database::recall`, and
+`Database::maintain` persist and audit only typed public inputs and outputs.
 
 ## Architecture
 
@@ -71,7 +81,7 @@ db.delete(id)?;
 ```bash
 cargo check          # type-check all crates
 cargo test           # run all tests
-cargo run --example agent_memory  # run quickstart
+cargo run -p mmdb --example agent_memory  # run quickstart
 ```
 
 ## Documentation

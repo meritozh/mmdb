@@ -1,5 +1,5 @@
 use crate::DEFAULT_TENANT;
-use mmdb_core::{Content, Embedding, MemoryNode, NodeKind};
+use mmdb_core::{Content, Embedding, MemoryNode, MemoryState, NodeKind};
 use smallvec::SmallVec;
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -113,6 +113,10 @@ impl NodeBuilder {
             content: self.content.unwrap_or(Content::Text(String::new())),
             embeddings: self.embeddings,
             metadata: self.metadata,
+            revision: 1,
+            state: MemoryState::Active,
+            valid_from_ms: Some(now),
+            valid_to_ms: None,
         }
     }
 }
