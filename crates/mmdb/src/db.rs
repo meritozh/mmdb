@@ -12,6 +12,7 @@ use crate::runtime::{
     validate_profile, ClientRegistry, DatabaseBuilder, EmbeddingDistance, EmbeddingProfile,
     MemoryProfile, RuntimeStore, SupportedContent,
 };
+use crate::state::StateStore;
 use mmdb_blob::{BlobStore, PutOutcome};
 use mmdb_catalog::Catalog;
 use mmdb_core::{Content, Edge, Embedding, MemoryNode, NodeKind, Result};
@@ -40,6 +41,7 @@ pub struct Database {
     pub(crate) audit_store: Arc<AuditStore>,
     pub(crate) lexical_index: Arc<LexicalIndex>,
     pub(crate) runtime_store: Arc<RuntimeStore>,
+    pub(crate) state_store: Arc<StateStore>,
     pub(crate) clients: ClientRegistry,
     pub(crate) profile: RwLock<MemoryProfile>,
 }
@@ -74,6 +76,7 @@ impl Database {
         let audit_store = Arc::new(AuditStore::open(storage.keyspace.clone())?);
         let lexical_index = Arc::new(LexicalIndex::open(storage.keyspace.clone())?);
         let runtime_store = Arc::new(RuntimeStore::open(storage.keyspace.clone())?);
+        let state_store = Arc::new(StateStore::open(storage.keyspace.clone(), config.tenant)?);
         let catalog = rebuild_catalog(&storage, config.tenant)?;
         let persisted_profile = runtime_store.load_profile(config.tenant)?;
         let migrate_legacy = requested_profile.is_none() && persisted_profile.is_none();
@@ -154,6 +157,7 @@ impl Database {
             audit_store,
             lexical_index,
             runtime_store,
+            state_store,
             clients,
             profile: RwLock::new(profile),
         };
@@ -212,6 +216,10 @@ impl Database {
 
     pub fn client_registry(&self) -> &ClientRegistry {
         &self.clients
+    }
+
+    pub fn state(&self) -> &StateStore {
+        &self.state_store
     }
 
     pub fn audit_records(&self, filter: AuditFilter) -> Result<Vec<AuditRecord>> {

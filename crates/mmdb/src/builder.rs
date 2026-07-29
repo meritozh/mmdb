@@ -7,6 +7,7 @@ use ulid::Ulid;
 
 /// Fluent builder for [`MemoryNode`]. Tenant is set by [`crate::Database::insert`].
 pub struct NodeBuilder {
+    id: Option<Ulid>,
     kind: NodeKind,
     content: Option<Content>,
     embeddings: SmallVec<[Embedding; 1]>,
@@ -18,12 +19,19 @@ impl NodeBuilder {
     /// Start a new builder for the given [`NodeKind`].
     pub fn new(kind: NodeKind) -> Self {
         Self {
+            id: None,
             kind,
             content: None,
             embeddings: SmallVec::new(),
             metadata: BTreeMap::new(),
             created_at_ms: None,
         }
+    }
+
+    /// Override the generated id for idempotent ingestion and imports.
+    pub fn id(mut self, id: Ulid) -> Self {
+        self.id = Some(id);
+        self
     }
 
     /// Set the node body to plain text.
@@ -103,8 +111,12 @@ impl NodeBuilder {
     /// default and gets overwritten by [`crate::Database::insert`].
     pub fn build(self) -> MemoryNode {
         let now = self.created_at_ms.unwrap_or_else(now_ms);
+        let id = match self.id {
+            Some(id) => id,
+            None => Ulid::new(),
+        };
         MemoryNode {
-            id: Ulid::new(),
+            id,
             // tenant placeholder; Database::insert will overwrite with its config.
             tenant: DEFAULT_TENANT,
             kind: self.kind,
@@ -127,4 +139,23 @@ pub fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_generates_fresh_ids_unless_overridden() {
+        let first = NodeBuilder::new(NodeKind::Fact).build().id;
+        let second = NodeBuilder::new(NodeKind::Fact).build().id;
+        assert_ne!(first, Ulid::default());
+        assert_ne!(first, second);
+
+        let explicit = Ulid::new();
+        assert_eq!(
+            NodeBuilder::new(NodeKind::Fact).id(explicit).build().id,
+            explicit
+        );
+    }
 }

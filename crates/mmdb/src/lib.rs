@@ -57,6 +57,7 @@ mod query_impl;
 mod recall;
 mod runtime;
 mod search;
+mod state;
 #[cfg(test)]
 mod tests;
 
@@ -82,3 +83,4 @@ pub use runtime::{
     MemoryProfile, ProjectionState, ProjectionStatus, SupportedContent,
 };
 pub use search::{Hit, HybridOpts, VectorFilter};
+pub use state::{StateEntry, StateMutation, StateStore};

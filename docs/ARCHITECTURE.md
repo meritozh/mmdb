@@ -18,6 +18,11 @@ The project intentionally does not try to be a distributed database, a complete
 SQL engine, or a vector-only service. Vectors are one projection of a
 node-centric memory model.
 
+Applications that want one embedded engine can also store non-semantic runtime
+state through the facade's namespaced `StateStore`. State records remain
+separate from `MemoryNode`s so chat sessions, workflow runs, and cursors never
+pollute semantic recall.
+
 ## Design Principles
 
 1. One engine, many models.
@@ -147,6 +152,7 @@ into lower crates:
 | `change_proposals_v1` | lawyer proposals and approval state |
 | `dream_runs_v1` | staged, repairable, reversible compaction runs |
 | `audit_journal_v1` | append-only operation records |
+| `app_state_v1` | versioned application state with atomic batches and prefix scans |
 
 `mmdb-blob` stores bytes outside the node LSM in a BLAKE3-addressed filesystem
 layout with a small fjall-backed metadata store for size, chunking, and

@@ -1130,6 +1130,7 @@ dependencies = [
  "mmdb-query",
  "mmdb-storage",
  "mmdb-vector",
+ "parking_lot",
  "serde",
  "serde_json",
  "smallvec",
