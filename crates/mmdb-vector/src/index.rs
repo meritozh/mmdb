@@ -12,6 +12,8 @@ pub const INDEX_DEFAULT_M: usize = 16;
 pub const INDEX_DEFAULT_EF_CONSTRUCTION: usize = 200;
 pub const INDEX_DEFAULT_MAX_ELEMENTS: usize = 1_000_000;
 pub const INDEX_DEFAULT_MAX_LAYER: usize = 16;
+const INDEX_MAX_SEARCH_RESULTS: usize = 100_000;
+const INDEX_MAX_SEARCH_EF: usize = 400_000;
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct IndexKey {
@@ -143,7 +145,13 @@ impl VectorIndex {
 
     /// Returns (internal_id, distance) pairs, with tombstoned entries filtered.
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
-        let raw = self.inner.search(query, k * 2, ef.max(k));
+        let k = k.min(self.point_count()).min(INDEX_MAX_SEARCH_RESULTS);
+        if k == 0 {
+            return Vec::new();
+        }
+        let raw_k = k.saturating_mul(2).min(INDEX_DEFAULT_MAX_ELEMENTS);
+        let ef = ef.min(INDEX_MAX_SEARCH_EF).max(k);
+        let raw = self.inner.search(query, raw_k, ef);
         let mut out = Vec::with_capacity(k);
         for n in raw {
             let id = n.d_id as u64;
@@ -206,6 +214,11 @@ impl VectorIndex {
         k: usize,
         ef: usize,
     ) -> Result<Vec<(u64, f32)>> {
+        if k > INDEX_MAX_SEARCH_RESULTS || ef > INDEX_MAX_SEARCH_EF {
+            return Err(Error::InvalidArgument(format!(
+                "snapshot search limits must not exceed k={INDEX_MAX_SEARCH_RESULTS}, ef={INDEX_MAX_SEARCH_EF}"
+            )));
+        }
         let mut loader = HnswIo::new(dir.as_ref(), basename);
         let hnsw: Hnsw<'_, f32, DistCosine> = loader
             .load_hnsw::<f32, DistCosine>()
@@ -247,5 +260,27 @@ mod tests {
             VectorIndex::search_snapshot(dir.path(), &basename, &[1.0, 0.0, 0.0], 1, 32).unwrap();
 
         assert_eq!(hits[0].0, id);
+    }
+
+    #[test]
+    fn low_level_search_limits_cannot_overflow() {
+        let dir = tempdir().unwrap();
+        let idx = VectorIndex::new(3);
+        let id = idx.insert(&[1.0, 0.0, 0.0]);
+
+        let hits = idx.search(&[1.0, 0.0, 0.0], usize::MAX, usize::MAX);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, id);
+
+        let basename = idx.snapshot_to_dir(dir.path(), "bounded-search").unwrap();
+        let error = VectorIndex::search_snapshot(
+            dir.path(),
+            &basename,
+            &[1.0, 0.0, 0.0],
+            usize::MAX,
+            usize::MAX,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("search limits"));
     }
 }

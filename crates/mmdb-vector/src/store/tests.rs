@@ -54,6 +54,44 @@ fn dim_mismatch_is_rejected() {
 }
 
 #[test]
+fn zero_norm_and_non_normalizable_vectors_are_rejected_at_write_and_query_boundaries() {
+    let dir = tempdir().unwrap();
+    let s = make_store_at(dir.path());
+
+    let zero_insert = s.insert(0, "m", Ulid::new(), &[0.0, 0.0]).unwrap_err();
+    assert!(zero_insert.to_string().contains("non-zero L2 norm"));
+    let overflow_insert = s
+        .insert(0, "m", Ulid::new(), &[f32::MAX, f32::MAX])
+        .unwrap_err();
+    assert!(overflow_insert
+        .to_string()
+        .contains("finite, non-zero L2 norm"));
+    let non_finite_insert = s.insert(0, "m", Ulid::new(), &[f32::NAN, 1.0]).unwrap_err();
+    assert!(non_finite_insert.to_string().contains("must all be finite"));
+
+    let id = Ulid::new();
+    s.insert(0, "m", id, &[1.0, 0.0]).unwrap();
+    let zero_query = s.search(0, "m", &[0.0, 0.0], 1).unwrap_err();
+    assert!(zero_query.to_string().contains("non-zero L2 norm"));
+    assert_eq!(s.search(0, "m", &[1.0, 0.0], 1).unwrap()[0].node_id, id);
+}
+
+#[test]
+fn persisted_zero_norm_vectors_are_defensively_excluded_from_exact_search() {
+    let dir = tempdir().unwrap();
+    let s = make_store_at(dir.path());
+    let id = Ulid::new();
+    s.insert(0, "m", id, &[1.0, 0.0]).unwrap();
+
+    let key = meta_key_bytes(0, "m", id);
+    let mut value = s.meta.get(&key).unwrap().unwrap().to_vec();
+    value[12..].fill(0);
+    s.meta.insert(key, value).unwrap();
+
+    assert!(s.search(0, "m", &[1.0, 0.0], 1).unwrap().is_empty());
+}
+
+#[test]
 fn empty_index_search_returns_empty() {
     let dir = tempdir().unwrap();
     let s = make_store_at(dir.path());
@@ -229,4 +267,14 @@ fn search_with_filter_keeps_only_matching() {
         .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].node_id, keep);
+}
+
+#[test]
+fn search_rejects_unbounded_result_limits_without_overflowing() {
+    let dir = tempdir().unwrap();
+    let s = make_store_at(dir.path());
+    let error = s
+        .search(0, "m", &norm(vec![1.0, 0.0, 0.0, 0.0]), usize::MAX)
+        .unwrap_err();
+    assert!(error.to_string().contains("must not exceed"));
 }

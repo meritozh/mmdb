@@ -46,6 +46,7 @@ pub use mmdb_query as query;
 pub use mmdb_storage as storage;
 pub use mmdb_vector as vector;
 
+mod access;
 mod audit;
 mod builder;
 mod convert;
@@ -61,6 +62,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
+pub use access::AccessStats;
 pub use audit::{AuditAction, AuditContext, AuditFilter, AuditRecord};
 pub use builder::{now_ms, NodeBuilder};
 pub use db::Database;

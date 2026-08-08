@@ -50,6 +50,8 @@ Core node operations:
 - `insert`
 - `get`
 - `scan_by_time`
+- `nodes_by_metadata`
+- `retract`
 - `delete`
 - `insert_text`
 - `insert_text_async`
@@ -57,6 +59,11 @@ Core node operations:
 `insert` force-stamps the configured tenant on every node. This keeps the public
 API simple while retaining the on-disk tenant prefix for future isolation and
 branching work.
+
+`retract` is the idempotent soft-forget path: it moves a node to `Retracted` and
+closes its current validity interval while preserving historical recall. Optional
+revision checks reject stale callers. `delete` remains the lower-level hard node
+deletion primitive.
 
 When inserting over an existing id, the facade removes old vector entries,
 releases replaced blob references, updates storage indexes, and adjusts catalog
@@ -74,6 +81,15 @@ model is not re-embedded.
 calling any compatible `EmbeddingClient`, records each `ProjectionStatus`, and
 keeps failed work retryable through `retry_projection`. Clients receive owned
 text/JSON or a reopenable `BlobInput`.
+
+Embedding vectors and vector queries must contain finite values with a finite,
+non-zero L2 norm. Invalid vectors are rejected before either exact or HNSW search.
+Invalid provider output is recorded as a retryable `ProjectionState::Failed`
+without removing the raw node. Every projection status carries the deterministic
+full-profile fingerprint; legacy statuses deserialize with an empty fingerprint
+and therefore cannot be mistaken for current work after a same-ID profile change.
+Vector search rejects result limits above 100,000 and uses saturating, capped
+HNSW over-fetch arithmetic, so adversarial limits cannot overflow.
 
 `ingest_blob` applies the same raw-first workflow to bytes placed in the
 content-addressed blob store.
@@ -104,11 +120,20 @@ blends vector score with graph-neighbor contribution using `HybridOpts`.
 `recall` additionally runs the persisted BM25 inverted index, weighted RRF,
 point-in-time lifecycle filtering, directional causal traversal, provenance,
 and contradiction surfacing. It returns `RecallEvidence` rather than an opaque
-score.
+score. Lifecycle and metadata predicates are applied before the candidate budget,
+so invalid high-scoring memories cannot hide valid results. An optional
+`min_vector_similarity` drops weak vector-only evidence without suppressing
+independent lexical matches. Storage failures while hydrating a candidate are
+returned to the caller rather than treated as ordinary filter misses.
 
 An optional lawyer profile receives at most 50 candidates and 128 KiB. Its
 validated `LawyerVerdict` can gate/rerank recall and stage `ChangeProposal`
-records. Only `apply_proposal` can mutate, after revision revalidation.
+records. Only `apply_proposal` can mutate, after revision revalidation. Apply
+persists an `Applying` status plus a per-change cursor; every change is
+replay-safe, and database reopen resumes interrupted work while reconciling
+indexes for a node write that already committed. Apply and reject are serialized
+with node and edge mutations through terminal status. `AddEdge` proposals cannot
+overwrite an existing edge.
 
 ## Dream And Audit APIs
 
@@ -117,6 +142,24 @@ records. Only `apply_proposal` can mutate, after revision revalidation.
 - `revert_dream`: retract created output and restore superseded derived memory.
 - `audit_records` / `inspect_operation`: review append-only sanitized history.
 - `graph_slice`: display valid nodes, timestamps, evidence, paths, and weights.
+
+Dream response validation and checkpointed application are serialized after the
+external client call completes. Runs remain `Pending` through projection work
+and enter a durable `Completing` checkpoint before planned edges, supersessions,
+and output activation are published. They capture output revisions before
+becoming `Completed`. Reopen cleanup removes only staging that still matches the
+run's ownership and semantic fingerprints, preserving external edits. Concurrent
+equivalent runs deduplicate at that boundary, and revert/repair share the same
+mutation lock. Revert refuses to erase a created node or added edge whose
+revision or owned state changed after the run completed; duplicate edge
+overwrites and self-referential `derived_from` provenance are rejected during
+validation.
+
+`record_access` and `access_stats` persist retrieval-use counters in a dedicated
+sidecar partition. Access accounting therefore does not bump semantic node
+revisions or rebuild projections. `merge_access_stats` atomically transfers
+duplicate counters to a canonical node and removes the source sidecars, making
+consolidation retries idempotent.
 
 ## Graph API
 

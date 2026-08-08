@@ -153,6 +153,7 @@ into lower crates:
 | `dream_runs_v1` | staged, repairable, reversible compaction runs |
 | `audit_journal_v1` | append-only operation records |
 | `app_state_v1` | versioned application state with atomic batches and prefix scans |
+| `memory_access_v1` | per-node retrieval counts and last-access timestamps |
 
 `mmdb-blob` stores bytes outside the node LSM in a BLAKE3-addressed filesystem
 layout with a small fjall-backed metadata store for size, chunking, and
@@ -231,15 +232,35 @@ embedding profiles, fuses branches with weighted reciprocal-rank fusion, then
 expands valid weighted graph paths. Before optional lawyer adjudication it:
 
 - excludes future, expired, superseded, retracted, and pending memories;
+- treats `derived_from` provenance as directional from derivative to source;
 - follows causal relations only from source to effect;
 - rejects causal paths whose node validity runs backward;
 - returns contradictory memories together;
 - marks facts without provenance as unverified.
 
+Lifecycle and metadata filters run inside lexical and vector candidate selection,
+before `candidate_limit`. `min_vector_similarity`, when set, removes weak vector
+hits before evidence fusion while leaving lexical evidence independent. Candidate
+node read failures are returned instead of being mistaken for filtered misses.
+Embedding writes and queries reject non-finite or non-normalizable vectors.
+
 Lawyer requests are capped at 50 candidates and 128 KiB of sanitized textual
 evidence. A verdict may gate or reorder the returned candidates and create
 `ChangeProposal` records, but it cannot mutate during recall. `apply_proposal`
-rechecks every referenced revision before applying changes.
+rechecks every referenced revision, persists an `Applying` checkpoint, and
+advances a durable per-change cursor. Each change is replay-safe; reopen resumes
+an interrupted proposal and reconciles node indexes before advancing past a
+node write that may have committed just before a crash. Proposal apply and
+reject transitions share the node-mutation critical section, so validation,
+node/edge changes, and terminal proposal status are serializable. Proposed
+edges must be new rather than overwriting an existing graph fact.
+
+Hosts call `record_access` after evidence is actually consumed. The counters are
+kept outside `MemoryNode`, so retrieval does not change semantic revisions or
+force projection rebuilds. `merge_access_stats` atomically transfers source
+counters into a canonical node and removes the source sidecars, so consolidation
+retries do not double-count. `retract` is the audited, revision-checkable soft
+forget path; it closes current validity while retaining historical evidence.
 
 ## Dream Maintenance
 
@@ -250,9 +271,19 @@ input is pending. Batches never exceed 128 nodes or 256 KiB.
 
 Dream responses may create cited fact/entity nodes, add reserved relations, and
 supersede memories previously created by a dream run. New nodes are staged as
-`Pending`, then activated after complete validation. Raw episodes are never
-changed. Incomplete pending runs are retracted and repaired on reopen, and
-`revert_dream` retracts outputs while restoring superseded derived memories.
+`Pending` through projection work. After semantic fingerprint validation, a
+durable `Completing` checkpoint precedes edge creation, input supersession, and
+output activation; the run then captures each output revision before publishing
+`Completed`. Raw episodes are never changed. Reopen rolls back only staging that
+still matches the run's ownership and semantic fingerprints, preserving external
+edits rather than silently erasing them. `revert_dream` first verifies
+that every created node is still active, owned by the run, and at its captured
+revision, and that every added edge still matches its captured revision; it
+refuses to erase post-dream edits. A valid revert retracts outputs while
+restoring superseded derived memories.
+The external dreamer call stays outside the mutation lock; response validation,
+application checkpoints, concurrent-run deduplication, repair, and revert run
+inside it.
 
 ## Audit Journal
 

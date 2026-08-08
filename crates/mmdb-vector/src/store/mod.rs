@@ -27,6 +27,8 @@ pub(crate) const PART_META: &str = "vector_meta";
 pub(crate) const PART_REV: &str = "vector_rev";
 pub(crate) const PART_TOMB: &str = "vector_tomb";
 pub(crate) const EXACT_SEARCH_MAX_ROWS: usize = 1_024;
+pub(crate) const MAX_SEARCH_RESULTS: usize = 100_000;
+pub(crate) const MAX_HNSW_EF: usize = 400_000;
 pub(crate) const SNAPSHOT_DIR_NAME: &str = "vector_hnsw_snapshots";
 pub(crate) const SNAPSHOT_MANIFEST_VERSION: u32 = 1;
 

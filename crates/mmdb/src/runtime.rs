@@ -190,6 +190,18 @@ pub struct EmbeddingProfile {
     pub weight: f32,
 }
 
+impl EmbeddingProfile {
+    /// Stable fingerprint of every field that affects projection behavior.
+    pub fn fingerprint(&self) -> String {
+        let encoded = serde_json::to_vec(self)
+            .expect("EmbeddingProfile serialization is infallible for validated profiles");
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"mmdb.embedding-profile.v1\0");
+        hasher.update(&encoded);
+        hasher.finalize().to_hex().to_string()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LawyerFailureMode {
@@ -269,11 +281,32 @@ pub struct ProjectionStatus {
     pub node_id: Ulid,
     pub node_revision: u64,
     pub profile_id: String,
+    #[serde(default)]
+    pub profile_fingerprint: String,
+    #[serde(default)]
+    pub content_fingerprint: String,
     pub state: ProjectionState,
     pub attempts: u32,
     pub updated_at_ms: i64,
     pub last_error: Option<String>,
     pub searchable_text: Option<String>,
+}
+
+impl ProjectionStatus {
+    /// Whether this completed projection still belongs to `profile` and the
+    /// node content from which its vector and searchable text were produced.
+    pub fn is_current_for(&self, profile: &EmbeddingProfile, node: &MemoryNode) -> bool {
+        self.state == ProjectionState::Ready
+            && self.node_id == node.id
+            && self.profile_id == profile.id
+            && !self.profile_fingerprint.is_empty()
+            && self.profile_fingerprint == profile.fingerprint()
+            && !self.content_fingerprint.is_empty()
+            && self.content_fingerprint == projection_content_fingerprint(&node.content)
+            && node.embeddings.iter().any(|embedding| {
+                embedding.model == profile.model && embedding.dim == profile.dimension
+            })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -405,6 +438,7 @@ impl Database {
             )?;
             return Err(error);
         }
+        let _guard = self.node_mutation_lock.lock();
         let previous = self.memory_profile()?;
         profile.revision = previous
             .revision
@@ -421,7 +455,7 @@ impl Database {
             .storage
             .scan_by_time(self.config.tenant, 0, i64::MAX, usize::MAX)?
         {
-            self.reindex_node(&node)?;
+            self.reindex_node_unlocked(&node)?;
         }
         self.append_audit(
             Ulid::new(),
@@ -439,22 +473,39 @@ impl Database {
         node: MemoryNode,
         profile: &EmbeddingProfile,
     ) -> Result<ProjectionStatus> {
-        let previous = self
-            .runtime_store
-            .projection(self.config.tenant, node.id, &profile.id)?;
-        let mut status = ProjectionStatus {
-            node_id: node.id,
-            node_revision: node.revision,
-            profile_id: profile.id.clone(),
-            state: ProjectionState::Pending,
-            attempts: previous.as_ref().map_or(1, |old| old.attempts + 1),
-            updated_at_ms: crate::now_ms(),
-            last_error: None,
-            searchable_text: None,
+        let profile_fingerprint = profile.fingerprint();
+        let (node, mut status) = {
+            let _guard = self.node_mutation_lock.lock();
+            let current_profile = self.memory_profile()?;
+            if !current_profile.embedding_profiles.iter().any(|candidate| {
+                candidate.id == profile.id && candidate.fingerprint() == profile_fingerprint
+            }) {
+                return Err(Error::InvalidArgument(format!(
+                    "embedding profile `{}` changed before projection started",
+                    profile.id
+                )));
+            }
+            let node = self.get(node.id)?.ok_or(Error::NotFound)?;
+            let previous =
+                self.runtime_store
+                    .projection(self.config.tenant, node.id, &profile.id)?;
+            let status = ProjectionStatus {
+                node_id: node.id,
+                node_revision: node.revision,
+                profile_id: profile.id.clone(),
+                profile_fingerprint: profile_fingerprint.clone(),
+                content_fingerprint: projection_content_fingerprint(&node.content),
+                state: ProjectionState::Pending,
+                attempts: previous.as_ref().map_or(1, |old| old.attempts + 1),
+                updated_at_ms: crate::now_ms(),
+                last_error: None,
+                searchable_text: None,
+            };
+            self.runtime_store
+                .put_projection(self.config.tenant, &status)?;
+            self.reindex_node_unlocked(&node)?;
+            (node, status)
         };
-        self.runtime_store
-            .put_projection(self.config.tenant, &status)?;
-        self.reindex_node(&node)?;
         let operation_id = Ulid::new();
         let Some(client) = self.clients.embedding(&profile.client_id)? else {
             status.state = ProjectionState::Failed;
@@ -463,8 +514,16 @@ impl Database {
                 profile.client_id
             ));
             status.updated_at_ms = crate::now_ms();
-            self.runtime_store
-                .put_projection(self.config.tenant, &status)?;
+            {
+                let _guard = self.node_mutation_lock.lock();
+                if self.projection_attempt_is_current(&status)? {
+                    self.runtime_store
+                        .put_projection(self.config.tenant, &status)?;
+                    if let Some(current) = self.get(node.id)? {
+                        self.reindex_node_unlocked(&current)?;
+                    }
+                }
+            }
             self.append_audit(
                 operation_id,
                 AuditAction::ClientCall,
@@ -477,35 +536,86 @@ impl Database {
             return Ok(status);
         };
         let input = self.embedding_input(&node.content)?;
-        let response = client.embed(input, profile).await;
-        match response {
+        let response = client.embed(input, profile).await.and_then(|output| {
+            if output.vector.len() != profile.dimension as usize {
+                return Err(Error::InvalidArgument(format!(
+                    "invalid embedding output: expected {} values, got {}",
+                    profile.dimension,
+                    output.vector.len()
+                )));
+            }
+            self.vector_store
+                .validate_insert(self.config.tenant, &profile.model, &output.vector)
+                .map_err(|error| match error {
+                    Error::InvalidArgument(message) => {
+                        Error::InvalidArgument(format!("invalid embedding output: {message}"))
+                    }
+                    error => error,
+                })?;
             Ok(output)
-                if output.vector.len() == profile.dimension as usize
-                    && output.vector.iter().all(|value| value.is_finite()) =>
-            {
-                let mut current = self.get(node.id)?.ok_or(Error::NotFound)?;
-                current
-                    .embeddings
-                    .retain(|embedding| embedding.model != profile.model);
-                current.embeddings.push(Embedding {
-                    model: profile.model.clone(),
-                    dim: profile.dimension,
-                    vector: SmallVec::from_vec(output.vector),
-                });
-                self.insert_inner(current, false, false)?;
-                let current = self.get(node.id)?.ok_or(Error::NotFound)?;
-                status.node_revision = current.revision;
-                status.state = ProjectionState::Ready;
-                status.updated_at_ms = crate::now_ms();
-                status.searchable_text = output.searchable_text;
-                self.runtime_store
-                    .put_projection(self.config.tenant, &status)?;
-                self.reindex_node(&current)?;
+        });
+        match response {
+            Ok(output) => {
+                let installation_error = {
+                    let _guard = self.node_mutation_lock.lock();
+                    let current_profile = self.memory_profile()?;
+                    let profile_is_current =
+                        current_profile.embedding_profiles.iter().any(|candidate| {
+                            candidate.id == profile.id
+                                && candidate.fingerprint() == status.profile_fingerprint
+                        });
+                    let current = self.get(node.id)?;
+                    let content_is_current = current.as_ref().is_some_and(|current| {
+                        projection_content_fingerprint(&current.content)
+                            == status.content_fingerprint
+                    });
+                    let owns_attempt = self.projection_attempt_is_current(&status)?;
+                    if !profile_is_current || !content_is_current || !owns_attempt {
+                        let error = if !profile_is_current {
+                            "embedding profile changed during projection"
+                        } else if !content_is_current {
+                            "node content changed during projection"
+                        } else {
+                            "projection attempt was superseded"
+                        };
+                        status.state = ProjectionState::Failed;
+                        status.updated_at_ms = crate::now_ms();
+                        status.last_error = Some(error.into());
+                        if owns_attempt {
+                            self.runtime_store
+                                .put_projection(self.config.tenant, &status)?;
+                            if let Some(current) = current.as_ref() {
+                                self.reindex_node_unlocked(current)?;
+                            }
+                        }
+                        Some(error)
+                    } else {
+                        let mut current = current.expect("current content was checked above");
+                        current
+                            .embeddings
+                            .retain(|embedding| embedding.model != profile.model);
+                        current.embeddings.push(Embedding {
+                            model: profile.model.clone(),
+                            dim: profile.dimension,
+                            vector: SmallVec::from_vec(output.vector),
+                        });
+                        self.insert_inner_unlocked(current, false, false)?;
+                        let current = self.get(node.id)?.ok_or(Error::NotFound)?;
+                        status.node_revision = current.revision;
+                        status.state = ProjectionState::Ready;
+                        status.updated_at_ms = crate::now_ms();
+                        status.searchable_text = output.searchable_text;
+                        self.runtime_store
+                            .put_projection(self.config.tenant, &status)?;
+                        self.reindex_node_unlocked(&current)?;
+                        None
+                    }
+                };
                 self.append_audit(
                     operation_id,
                     AuditAction::ClientCall,
                     "embedding",
-                    true,
+                    installation_error.is_none(),
                     AuditContext::default(),
                     json!({
                         "node_id": node.id,
@@ -516,35 +626,23 @@ impl Database {
                             "searchable_text_bytes": status.searchable_text.as_ref().map_or(0, |text| text.len()),
                         },
                     }),
-                    None,
-                )?;
-            }
-            Ok(output) => {
-                status.state = ProjectionState::Failed;
-                status.updated_at_ms = crate::now_ms();
-                status.last_error = Some(format!(
-                    "invalid embedding output: expected {} finite values, got {}",
-                    profile.dimension,
-                    output.vector.len()
-                ));
-                self.runtime_store
-                    .put_projection(self.config.tenant, &status)?;
-                self.append_audit(
-                    operation_id,
-                    AuditAction::ClientCall,
-                    "embedding",
-                    false,
-                    AuditContext::default(),
-                    json!({"node_id": node.id, "profile": profile, "input": input_summary(&node.content)}),
-                    status.last_error.clone(),
+                    installation_error.map(str::to_owned),
                 )?;
             }
             Err(error) => {
                 status.state = ProjectionState::Failed;
                 status.updated_at_ms = crate::now_ms();
                 status.last_error = Some(error.to_string());
-                self.runtime_store
-                    .put_projection(self.config.tenant, &status)?;
+                {
+                    let _guard = self.node_mutation_lock.lock();
+                    if self.projection_attempt_is_current(&status)? {
+                        self.runtime_store
+                            .put_projection(self.config.tenant, &status)?;
+                        if let Some(current) = self.get(node.id)? {
+                            self.reindex_node_unlocked(&current)?;
+                        }
+                    }
+                }
                 self.append_audit(
                     operation_id,
                     AuditAction::ClientCall,
@@ -557,6 +655,18 @@ impl Database {
             }
         }
         Ok(status)
+    }
+
+    fn projection_attempt_is_current(&self, status: &ProjectionStatus) -> Result<bool> {
+        Ok(self
+            .runtime_store
+            .projection(self.config.tenant, status.node_id, &status.profile_id)?
+            .is_some_and(|current| {
+                current.state == ProjectionState::Pending
+                    && current.attempts == status.attempts
+                    && current.profile_fingerprint == status.profile_fingerprint
+                    && current.content_fingerprint == status.content_fingerprint
+            }))
     }
 
     fn embedding_input(&self, content: &Content) -> Result<EmbeddingInput> {
@@ -577,21 +687,27 @@ impl Database {
         }
     }
 
-    fn reindex_node(&self, node: &MemoryNode) -> Result<()> {
-        let active_profiles: Vec<_> = self
-            .memory_profile()?
-            .embedding_profiles
-            .into_iter()
-            .map(|profile| profile.id)
-            .collect();
+    pub(crate) fn current_projection_texts(&self, node: &MemoryNode) -> Result<Vec<String>> {
+        let profiles = self.memory_profile()?.embedding_profiles;
         let projections = self
             .runtime_store
             .projection_statuses(self.config.tenant, node.id)?
             .into_iter()
-            .filter(|status| active_profiles.contains(&status.profile_id))
-            .filter(|status| status.state == ProjectionState::Ready)
-            .filter_map(|status| status.searchable_text)
+            .filter_map(|status| {
+                let profile = profiles
+                    .iter()
+                    .find(|profile| profile.id == status.profile_id)?;
+                status
+                    .is_current_for(profile, node)
+                    .then_some(status.searchable_text)
+                    .flatten()
+            })
             .collect::<Vec<_>>();
+        Ok(projections)
+    }
+
+    pub(crate) fn reindex_node_unlocked(&self, node: &MemoryNode) -> Result<()> {
+        let projections = self.current_projection_texts(node)?;
         self.lexical_index.upsert(
             self.config.tenant,
             node.id,
@@ -601,29 +717,34 @@ impl Database {
 
     pub(crate) async fn project_configured(&self, node_id: Ulid) -> Result<Vec<ProjectionStatus>> {
         let profiles = self.memory_profile()?.embedding_profiles;
-        let node = self.get(node_id)?.ok_or(Error::NotFound)?;
-        for profile in profiles
-            .iter()
-            .filter(|profile| supports(profile, &node.content))
         {
-            let previous =
-                self.runtime_store
-                    .projection(self.config.tenant, node_id, &profile.id)?;
-            self.runtime_store.put_projection(
-                self.config.tenant,
-                &ProjectionStatus {
-                    node_id,
-                    node_revision: node.revision,
-                    profile_id: profile.id.clone(),
-                    state: ProjectionState::Pending,
-                    attempts: previous.map_or(0, |status| status.attempts),
-                    updated_at_ms: crate::now_ms(),
-                    last_error: None,
-                    searchable_text: None,
-                },
-            )?;
+            let _guard = self.node_mutation_lock.lock();
+            let node = self.get(node_id)?.ok_or(Error::NotFound)?;
+            for profile in profiles
+                .iter()
+                .filter(|profile| supports(profile, &node.content))
+            {
+                let previous =
+                    self.runtime_store
+                        .projection(self.config.tenant, node_id, &profile.id)?;
+                self.runtime_store.put_projection(
+                    self.config.tenant,
+                    &ProjectionStatus {
+                        node_id,
+                        node_revision: node.revision,
+                        profile_id: profile.id.clone(),
+                        profile_fingerprint: profile.fingerprint(),
+                        content_fingerprint: projection_content_fingerprint(&node.content),
+                        state: ProjectionState::Pending,
+                        attempts: previous.map_or(0, |status| status.attempts),
+                        updated_at_ms: crate::now_ms(),
+                        last_error: None,
+                        searchable_text: None,
+                    },
+                )?;
+            }
+            self.reindex_node_unlocked(&node)?;
         }
-        self.reindex_node(&node)?;
         let mut statuses = Vec::new();
         for profile in profiles {
             let node = self.get(node_id)?.ok_or(Error::NotFound)?;
@@ -844,6 +965,37 @@ fn input_summary(content: &Content) -> Value {
         }
         Content::Blob { size, mime, .. } => json!({"type": "blob", "size": size, "mime": mime}),
     }
+}
+
+fn projection_content_fingerprint(content: &Content) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"mmdb.projection-content.v1\0");
+    match content {
+        Content::Text(text) => {
+            hasher.update(b"text\0");
+            update_fingerprint_bytes(&mut hasher, text.as_bytes());
+        }
+        Content::Structured(value) => {
+            hasher.update(b"structured\0");
+            let encoded =
+                serde_json::to_vec(value).expect("serde_json::Value serialization cannot fail");
+            update_fingerprint_bytes(&mut hasher, &encoded);
+        }
+        Content::Blob {
+            hash, size, mime, ..
+        } => {
+            hasher.update(b"blob\0");
+            hasher.update(hash);
+            hasher.update(&size.to_be_bytes());
+            update_fingerprint_bytes(&mut hasher, mime.as_bytes());
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn update_fingerprint_bytes(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_be_bytes());
+    hasher.update(value);
 }
 
 pub(crate) fn validate_profile(profile: &MemoryProfile) -> Result<()> {

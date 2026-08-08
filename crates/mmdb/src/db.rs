@@ -1,3 +1,4 @@
+use crate::access::AccessStore;
 use crate::audit::{
     node_snapshot, AuditAction, AuditContext, AuditFilter, AuditRecord, AuditStore,
 };
@@ -19,6 +20,7 @@ use mmdb_core::{Content, Edge, Embedding, MemoryNode, NodeKind, Result};
 use mmdb_graph::GraphStore;
 use mmdb_storage::Storage;
 use mmdb_vector::VectorStore;
+use parking_lot::Mutex;
 use serde_json::json;
 use smallvec::SmallVec;
 use std::collections::BTreeMap;
@@ -42,6 +44,8 @@ pub struct Database {
     pub(crate) lexical_index: Arc<LexicalIndex>,
     pub(crate) runtime_store: Arc<RuntimeStore>,
     pub(crate) state_store: Arc<StateStore>,
+    pub(crate) access_store: Arc<AccessStore>,
+    pub(crate) node_mutation_lock: Mutex<()>,
     pub(crate) clients: ClientRegistry,
     pub(crate) profile: RwLock<MemoryProfile>,
 }
@@ -77,6 +81,7 @@ impl Database {
         let lexical_index = Arc::new(LexicalIndex::open(storage.keyspace.clone())?);
         let runtime_store = Arc::new(RuntimeStore::open(storage.keyspace.clone())?);
         let state_store = Arc::new(StateStore::open(storage.keyspace.clone(), config.tenant)?);
+        let access_store = Arc::new(AccessStore::open(storage.keyspace.clone())?);
         let catalog = rebuild_catalog(&storage, config.tenant)?;
         let persisted_profile = runtime_store.load_profile(config.tenant)?;
         let migrate_legacy = requested_profile.is_none() && persisted_profile.is_none();
@@ -133,13 +138,16 @@ impl Database {
             let projections = runtime_store
                 .projection_statuses(config.tenant, node.id)?
                 .into_iter()
-                .filter(|status| {
-                    profile
+                .filter_map(|status| {
+                    let embedding_profile = profile
                         .embedding_profiles
                         .iter()
-                        .any(|candidate| candidate.id == status.profile_id)
+                        .find(|candidate| candidate.id == status.profile_id)?;
+                    status
+                        .is_current_for(embedding_profile, node)
+                        .then_some(status.searchable_text)
+                        .flatten()
                 })
-                .filter_map(|status| status.searchable_text)
                 .collect::<Vec<_>>();
             lexical_index.upsert(config.tenant, node.id, &searchable_text(node, &projections))?;
         }
@@ -158,6 +166,8 @@ impl Database {
             lexical_index,
             runtime_store,
             state_store,
+            access_store,
+            node_mutation_lock: Mutex::new(()),
             clients,
             profile: RwLock::new(profile),
         };
@@ -173,6 +183,7 @@ impl Database {
             )?;
         }
         db.repair_dream_runs()?;
+        db.repair_applying_proposals()?;
         Ok(db)
     }
 
@@ -280,6 +291,16 @@ impl Database {
     }
 
     pub(crate) fn insert_inner(
+        &self,
+        node: MemoryNode,
+        blob_ref_already_acquired: bool,
+        run_legacy_embedder: bool,
+    ) -> Result<Ulid> {
+        let _guard = self.node_mutation_lock.lock();
+        self.insert_inner_unlocked(node, blob_ref_already_acquired, run_legacy_embedder)
+    }
+
+    pub(crate) fn insert_inner_unlocked(
         &self,
         node: MemoryNode,
         blob_ref_already_acquired: bool,
@@ -395,12 +416,7 @@ impl Database {
             self.vector_store
                 .insert(self.config.tenant, &emb.model, id, &emb.vector)?;
         }
-        let projections = self
-            .runtime_store
-            .projection_statuses(self.config.tenant, id)?
-            .into_iter()
-            .filter_map(|status| status.searchable_text)
-            .collect::<Vec<_>>();
+        let projections = self.current_projection_texts(&node)?;
         self.lexical_index.upsert(
             self.config.tenant,
             id,
@@ -446,6 +462,21 @@ impl Database {
             )?;
         }
         Ok(())
+    }
+
+    pub(crate) fn reconcile_node_indexes_unlocked(&self, node: &MemoryNode) -> Result<()> {
+        self.validate_node_embeddings(node)?;
+        for embedding in &node.embeddings {
+            self.vector_store
+                .delete(self.config.tenant, &embedding.model, node.id)?;
+            self.vector_store.insert(
+                self.config.tenant,
+                &embedding.model,
+                node.id,
+                embedding.vector.as_slice(),
+            )?;
+        }
+        self.reindex_node_unlocked(node)
     }
 
     /// Convenience: insert raw text. Requires an embedder to be configured.
@@ -506,8 +537,103 @@ impl Database {
             .scan_by_time(self.config.tenant, from_ms, to_ms, limit)
     }
 
+    /// Return nodes whose metadata contains exactly `key = value`.
+    ///
+    /// Results are ordered by creation time and then node id, independent of the
+    /// metadata index's internal iteration order. Lifecycle state is not filtered.
+    pub fn nodes_by_metadata(
+        &self,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> Result<Vec<MemoryNode>> {
+        let ids = self
+            .storage
+            .node_ids_by_metadata(self.config.tenant, key, value)?;
+        let mut nodes = ids
+            .into_iter()
+            .filter_map(|id| self.storage.get_node(self.config.tenant, id).transpose())
+            .collect::<Result<Vec<_>>>()?;
+        nodes.sort_by(|left, right| {
+            left.created_at_ms
+                .cmp(&right.created_at_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(nodes)
+    }
+
+    /// Soft-retract a memory from current recall while preserving historical state.
+    ///
+    /// Calling this without an expected revision is idempotent. When a revision is
+    /// supplied it must match the current node, including for an already-retracted
+    /// node, so stale callers receive an explicit conflict instead of silent success.
+    pub fn retract(
+        &self,
+        id: Ulid,
+        expected_revision: Option<u64>,
+        reason: impl Into<String>,
+        context: AuditContext,
+    ) -> Result<MemoryNode> {
+        let operation_id = Ulid::new();
+        let reason = reason.into();
+        let (before, already_retracted, result) = {
+            let _guard = self.node_mutation_lock.lock();
+            let before = self.get(id)?;
+            let already_retracted = before
+                .as_ref()
+                .is_some_and(|node| node.state == mmdb_core::MemoryState::Retracted);
+            let result = (|| {
+                let mut node = before.clone().ok_or(mmdb_core::Error::NotFound)?;
+                if let Some(expected) = expected_revision {
+                    if node.revision != expected {
+                        return Err(mmdb_core::Error::InvalidArgument(format!(
+                            "stale node revision for {id}: expected {expected}, found {}",
+                            node.revision
+                        )));
+                    }
+                }
+                if node.state == mmdb_core::MemoryState::Retracted && node.valid_to_ms.is_some() {
+                    return Ok(node);
+                }
+
+                let retracted_at = crate::now_ms();
+                let was_pending = node.state == mmdb_core::MemoryState::Pending;
+                node.state = mmdb_core::MemoryState::Retracted;
+                if was_pending {
+                    node.valid_from_ms = Some(retracted_at);
+                    node.valid_to_ms = Some(retracted_at);
+                } else {
+                    node.valid_to_ms = Some(
+                        node.valid_to_ms
+                            .map_or(retracted_at, |current| current.min(retracted_at)),
+                    );
+                }
+                self.insert_inner_unlocked(node, false, false)?;
+                self.get(id)?.ok_or(mmdb_core::Error::NotFound)
+            })();
+            (before, already_retracted, result)
+        };
+        self.append_audit(
+            operation_id,
+            AuditAction::Mutation,
+            "retract_node",
+            result.is_ok(),
+            context,
+            json!({
+                "id": id,
+                "expected_revision": expected_revision,
+                "reason": reason,
+                "outcome": result.as_ref().ok().map(|_| if already_retracted { "already_retracted" } else { "retracted" }),
+                "before": before.as_ref().map(node_snapshot),
+                "after": result.as_ref().ok().map(node_snapshot),
+            }),
+            result.as_ref().err().map(ToString::to_string),
+        )?;
+        result
+    }
+
     /// Hard-delete a node and all of its embeddings from every index.
     pub fn delete(&self, id: Ulid) -> Result<()> {
+        let _guard = self.node_mutation_lock.lock();
         let operation_id = Ulid::new();
         if let Some(node) = self.storage.get_node(self.config.tenant, id)? {
             for emb in &node.embeddings {
@@ -517,6 +643,7 @@ impl Database {
             self.release_blob_ref(&node.content)?;
             self.storage.delete_node(self.config.tenant, id)?;
             self.lexical_index.delete(self.config.tenant, id)?;
+            self.access_store.delete(self.config.tenant, id)?;
             self.catalog
                 .record_node_delete(self.config.tenant, node.kind);
             self.append_audit(
@@ -531,6 +658,7 @@ impl Database {
             Ok(())
         } else {
             self.storage.delete_node(self.config.tenant, id)?;
+            self.access_store.delete(self.config.tenant, id)?;
             self.append_audit(
                 operation_id,
                 AuditAction::Mutation,
@@ -561,9 +689,9 @@ impl Database {
             PutOutcome::InlinedSmall { r#ref, bytes } => NodeBuilder::new(kind)
                 .blob_inlined(r#ref.hash, bytes, mime)
                 .build(),
-            PutOutcome::OnDisk(r#ref) => {
-                NodeBuilder::new(kind).blob(r#ref.hash, r#ref.size, mime).build()
-            }
+            PutOutcome::OnDisk(r#ref) => NodeBuilder::new(kind)
+                .blob(r#ref.hash, r#ref.size, mime)
+                .build(),
         };
         let hash = blob_hash(&node.content).expect("blob content always has a hash");
         match self.insert_inner(node, true, true) {
@@ -586,11 +714,7 @@ impl Database {
 
     /// Read blob bytes by content hash, trying to short-circuit to inlined
     /// bytes if the specific node `id` already has them embedded.
-    pub fn get_blob_stream_for(
-        &self,
-        hash: &[u8; 32],
-        id: Ulid,
-    ) -> Result<Box<dyn Read + Send>> {
+    pub fn get_blob_stream_for(&self, hash: &[u8; 32], id: Ulid) -> Result<Box<dyn Read + Send>> {
         if let Some(node) = self.storage.get_node(self.config.tenant, id)? {
             if let Content::Blob {
                 hash: node_hash,
@@ -651,6 +775,16 @@ impl Database {
     /// Add an edge between two nodes. The edge is duplicated into a reverse
     /// index so [`Self::neighbours_in`] is also O(neighbours).
     pub fn add_edge(&self, edge: Edge) -> Result<()> {
+        let _guard = self.node_mutation_lock.lock();
+        self.add_edge_unlocked(edge)
+    }
+
+    pub(crate) fn add_edge_unlocked(&self, edge: Edge) -> Result<()> {
+        if edge.label == "derived_from" && edge.src == edge.dst {
+            return Err(mmdb_core::Error::InvalidArgument(
+                "derived_from relation cannot reference itself".into(),
+            ));
+        }
         if !edge.weight.is_finite() || !(0.0..=1.0).contains(&edge.weight) {
             return Err(mmdb_core::Error::InvalidArgument(
                 "edge weight must be finite and between 0 and 1".into(),
@@ -695,6 +829,11 @@ impl Database {
 
     /// Remove an edge identified by `(src, dst, label)`.
     pub fn remove_edge(&self, src: Ulid, dst: Ulid, label: &str) -> Result<()> {
+        let _guard = self.node_mutation_lock.lock();
+        self.remove_edge_unlocked(src, dst, label)
+    }
+
+    pub(crate) fn remove_edge_unlocked(&self, src: Ulid, dst: Ulid, label: &str) -> Result<()> {
         let previous = self
             .graph_store
             .neighbours_out(self.config.tenant, src, Some(label))?

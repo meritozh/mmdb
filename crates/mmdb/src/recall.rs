@@ -1,5 +1,7 @@
 use crate::audit::{node_snapshot, sanitize_value, AuditAction, AuditContext};
-use crate::runtime::{AgentRequest, AgentRole, EmbeddingInput, LawyerFailureMode, LawyerProfile};
+use crate::runtime::{
+    AgentRequest, AgentRole, EmbeddingInput, EmbeddingProfile, LawyerFailureMode, LawyerProfile,
+};
 use crate::{Database, MemoryProfile};
 use mmdb_core::{Edge, Error, MemoryNode, MemoryState, NodeKind, Result};
 use serde::{Deserialize, Serialize};
@@ -15,6 +17,14 @@ const MAX_LAWYER_BYTES: usize = 128 * 1024;
 pub struct RecallFilter {
     pub kinds: Vec<NodeKind>,
     pub metadata: BTreeMap<String, Value>,
+    /// Exclude facts without durable provenance before any candidate limit is
+    /// applied. Non-fact memories are trusted by construction.
+    #[serde(default)]
+    pub require_verified: bool,
+    /// Metadata keys whose presence marks an otherwise unverified fact as an
+    /// explicitly trusted application-owned record.
+    #[serde(default)]
+    pub allow_unverified_metadata_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +34,8 @@ pub struct RecallRequest {
     pub limit: usize,
     pub candidate_limit: usize,
     pub vector_profiles: Vec<String>,
+    #[serde(default)]
+    pub min_vector_similarity: Option<f32>,
     pub lexical: bool,
     pub graph_depth: usize,
     pub lawyer_profile: Option<String>,
@@ -40,6 +52,7 @@ impl RecallRequest {
             limit: 10,
             candidate_limit: 50,
             vector_profiles: Vec::new(),
+            min_vector_similarity: None,
             lexical: true,
             graph_depth: 1,
             lawyer_profile: None,
@@ -117,6 +130,7 @@ pub struct LawyerVerdict {
 #[serde(rename_all = "snake_case")]
 pub enum ChangeProposalStatus {
     Pending,
+    Applying,
     Applied,
     Rejected,
     Stale,
@@ -163,6 +177,10 @@ pub struct ChangeProposal {
     pub created_at_ms: i64,
     #[serde(default)]
     pub applied_at_ms: Option<i64>,
+    /// Number of changes durably applied. `Applying` proposals resume at this
+    /// cursor after an interrupted process or retry.
+    #[serde(default)]
+    pub next_change: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,6 +199,12 @@ struct EvidenceBuilder {
     lexical_terms: Vec<String>,
     vectors: Vec<VectorEvidence>,
     graph_paths: Vec<GraphPath>,
+}
+
+struct PreparedVectorQuery {
+    profile: EmbeddingProfile,
+    profile_fingerprint: String,
+    vector: Vec<f32>,
 }
 
 impl Database {
@@ -210,6 +234,14 @@ impl Database {
         operation_id: Ulid,
         request: &RecallRequest,
     ) -> Result<AdjudicatedRecall> {
+        if request
+            .min_vector_similarity
+            .is_some_and(|threshold| !threshold.is_finite() || !(0.0..=1.0).contains(&threshold))
+        {
+            return Err(Error::InvalidArgument(
+                "min_vector_similarity must be finite and between 0 and 1".into(),
+            ));
+        }
         if request.limit == 0 || request.candidate_limit == 0 {
             return Ok(AdjudicatedRecall {
                 operation_id,
@@ -218,28 +250,16 @@ impl Database {
                 status: RecallStatus::Deterministic,
             });
         }
-        let profile = self.memory_profile()?;
-        let mut builders: BTreeMap<Ulid, EvidenceBuilder> = BTreeMap::new();
-        let candidate_limit = request.candidate_limit.max(request.limit);
-        if request.lexical {
-            for (rank, hit) in self
-                .lexical_index
-                .search(self.config.tenant, &request.query, candidate_limit)?
-                .into_iter()
-                .enumerate()
-            {
-                let entry = builders.entry(hit.node_id).or_default();
-                entry.score += 1.0 / (RRF_K + rank as f32 + 1.0);
-                entry.lexical_score = Some(hit.score);
-                entry.lexical_rank = Some(rank + 1);
-                entry.lexical_terms = hit.terms;
-            }
-        }
-        let selected_profiles = select_vector_profiles(&profile, &request.vector_profiles)?;
+        let initial_profile = self.memory_profile()?;
+        let selected_profiles = select_vector_profiles(&initial_profile, &request.vector_profiles)?
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
         let mut degraded = Vec::new();
+        let mut prepared = Vec::new();
         for embedding_profile in selected_profiles {
             let query_vector = match self
-                .embed_recall_query(operation_id, &request.query, embedding_profile)
+                .embed_recall_query(operation_id, &request.query, &embedding_profile)
                 .await
             {
                 Ok(vector) => vector,
@@ -248,87 +268,33 @@ impl Database {
                     continue;
                 }
             };
-            let hits = self.vector_store.search(
-                self.config.tenant,
-                &embedding_profile.model,
-                &query_vector,
-                candidate_limit,
-            )?;
-            for (rank, hit) in hits.into_iter().enumerate() {
-                let entry = builders.entry(hit.node_id).or_default();
-                entry.score += embedding_profile.weight / (RRF_K + rank as f32 + 1.0);
-                entry.vectors.push(VectorEvidence {
-                    profile_id: embedding_profile.id.clone(),
-                    model: embedding_profile.model.clone(),
-                    rank: rank + 1,
-                    similarity: hit.score,
-                });
-            }
-        }
-        let mut invalid = Vec::new();
-        for id in builders.keys() {
-            let valid = self
-                .storage
-                .get_node(self.config.tenant, *id)?
-                .is_some_and(|node| {
-                    node.is_valid_at(request.as_of_ms) && request.filter.matches(&node)
-                });
-            if !valid {
-                invalid.push(*id);
-            }
-        }
-        for id in invalid {
-            builders.remove(&id);
-        }
-        let mut seeds: Vec<(Ulid, f32)> = builders
-            .iter()
-            .map(|(id, evidence)| (*id, evidence.score))
-            .collect();
-        seeds.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        seeds.truncate(candidate_limit);
-        if request.graph_depth > 0 {
-            for (seed, seed_score) in seeds {
-                for path in self.graph_paths(seed, request.as_of_ms, request.graph_depth)? {
-                    let Some(node_id) = path.nodes.last().copied() else {
-                        continue;
-                    };
-                    let entry = builders.entry(node_id).or_default();
-                    entry.score += seed_score * path.weight * 0.25;
-                    entry.graph_paths.push(path);
-                }
-            }
-        }
-        let mut evidence = Vec::new();
-        for (id, builder) in builders {
-            let Some(node) = self.storage.get_node(self.config.tenant, id)? else {
-                continue;
-            };
-            if !node.is_valid_at(request.as_of_ms) || !request.filter.matches(&node) {
-                continue;
-            }
-            let (provenance, conflicts) = self.provenance_and_conflicts(id, request.as_of_ms)?;
-            let verified = node.kind != NodeKind::Fact || !provenance.is_empty();
-            evidence.push(RecallEvidence {
-                node,
-                score: builder.score,
-                lexical_score: builder.lexical_score,
-                lexical_rank: builder.lexical_rank,
-                lexical_terms: builder.lexical_terms,
-                vectors: builder.vectors,
-                graph_paths: builder.graph_paths,
-                provenance,
-                conflicts,
-                verified,
+            prepared.push(PreparedVectorQuery {
+                profile_fingerprint: embedding_profile.fingerprint(),
+                profile: embedding_profile,
+                vector: query_vector,
             });
         }
-        self.surface_conflicts(&mut evidence, request)?;
-        evidence.sort_by(|a, b| {
-            b.score
-                .total_cmp(&a.score)
-                .then_with(|| a.node.id.cmp(&b.node.id))
-        });
-        evidence.truncate(candidate_limit);
-        let deterministic = evidence;
+        let (profile, deterministic) = {
+            let _guard = self.node_mutation_lock.lock();
+            let profile = self.memory_profile()?;
+            prepared.retain(|query| {
+                let current = profile
+                    .embedding_profiles
+                    .iter()
+                    .find(|candidate| candidate.id == query.profile.id);
+                let current = current
+                    .is_some_and(|candidate| candidate.fingerprint() == query.profile_fingerprint);
+                if !current {
+                    degraded.push(format!(
+                        "embedding profile `{}` changed while preparing recall",
+                        query.profile.id
+                    ));
+                }
+                current
+            });
+            let evidence = self.deterministic_recall(request, &prepared)?;
+            (profile, evidence)
+        };
         let Some(lawyer_id) = request.lawyer_profile.as_deref() else {
             let mut evidence = deterministic;
             evidence.truncate(request.limit);
@@ -370,6 +336,181 @@ impl Database {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Build all index, lifecycle, graph, and hydration evidence while the
+    /// caller holds `node_mutation_lock`. Remote embedding and lawyer calls
+    /// deliberately live outside this synchronous snapshot.
+    fn deterministic_recall(
+        &self,
+        request: &RecallRequest,
+        prepared: &[PreparedVectorQuery],
+    ) -> Result<Vec<RecallEvidence>> {
+        let candidate_limit = request.candidate_limit.max(request.limit);
+        let mut builders: BTreeMap<Ulid, EvidenceBuilder> = BTreeMap::new();
+        let candidate_error = parking_lot::Mutex::new(None);
+
+        if request.lexical {
+            let filter = |id| match self.recall_candidate_matches(id, request, None) {
+                Ok(matches) => matches,
+                Err(error) => {
+                    let mut deferred = candidate_error.lock();
+                    if deferred.is_none() {
+                        *deferred = Some(error);
+                    }
+                    false
+                }
+            };
+            let lexical_hits = self.lexical_index.search_with_filter(
+                self.config.tenant,
+                &request.query,
+                candidate_limit,
+                filter,
+            );
+            if let Some(error) = candidate_error.lock().take() {
+                return Err(error);
+            }
+            for (rank, hit) in lexical_hits?.into_iter().enumerate() {
+                let entry = builders.entry(hit.node_id).or_default();
+                entry.score += 1.0 / (RRF_K + rank as f32 + 1.0);
+                entry.lexical_score = Some(hit.score);
+                entry.lexical_rank = Some(rank + 1);
+                entry.lexical_terms = hit.terms;
+            }
+        }
+
+        for query in prepared {
+            let filter = |id| match self.recall_candidate_matches(id, request, Some(&query.profile))
+            {
+                Ok(matches) => matches,
+                Err(error) => {
+                    let mut deferred = candidate_error.lock();
+                    if deferred.is_none() {
+                        *deferred = Some(error);
+                    }
+                    false
+                }
+            };
+            let hits = self.vector_store.search_with_filter(
+                self.config.tenant,
+                &query.profile.model,
+                &query.vector,
+                candidate_limit,
+                Some(&filter),
+            );
+            if let Some(error) = candidate_error.lock().take() {
+                return Err(error);
+            }
+            for (rank, hit) in hits?
+                .into_iter()
+                .filter(|hit| {
+                    request
+                        .min_vector_similarity
+                        .is_none_or(|minimum| hit.score >= minimum)
+                })
+                .enumerate()
+            {
+                let entry = builders.entry(hit.node_id).or_default();
+                entry.score += query.profile.weight / (RRF_K + rank as f32 + 1.0);
+                entry.vectors.push(VectorEvidence {
+                    profile_id: query.profile.id.clone(),
+                    model: query.profile.model.clone(),
+                    rank: rank + 1,
+                    similarity: hit.score,
+                });
+            }
+        }
+
+        let mut invalid = Vec::new();
+        for id in builders.keys() {
+            if !self.recall_candidate_matches(*id, request, None)? {
+                invalid.push(*id);
+            }
+        }
+        for id in invalid {
+            builders.remove(&id);
+        }
+
+        let mut seeds: Vec<(Ulid, f32)> = builders
+            .iter()
+            .map(|(id, evidence)| (*id, evidence.score))
+            .collect();
+        seeds.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        seeds.truncate(candidate_limit);
+        if request.graph_depth > 0 {
+            for (seed, seed_score) in seeds {
+                for path in self.graph_paths(seed, request.as_of_ms, request.graph_depth)? {
+                    let Some(node_id) = path.nodes.last().copied() else {
+                        continue;
+                    };
+                    let entry = builders.entry(node_id).or_default();
+                    entry.score += seed_score * path.weight * 0.25;
+                    entry.graph_paths.push(path);
+                }
+            }
+        }
+
+        let mut evidence = Vec::new();
+        for (id, builder) in builders {
+            let Some(node) = self.storage.get_node(self.config.tenant, id)? else {
+                continue;
+            };
+            if !node.is_valid_at(request.as_of_ms) || !request.filter.matches(&node) {
+                continue;
+            }
+            let (provenance, conflicts) = self.provenance_and_conflicts(id, request.as_of_ms)?;
+            let verified = node.kind != NodeKind::Fact || !provenance.is_empty();
+            evidence.push(RecallEvidence {
+                node,
+                score: builder.score,
+                lexical_score: builder.lexical_score,
+                lexical_rank: builder.lexical_rank,
+                lexical_terms: builder.lexical_terms,
+                vectors: builder.vectors,
+                graph_paths: builder.graph_paths,
+                provenance,
+                conflicts,
+                verified,
+            });
+        }
+        self.surface_conflicts(&mut evidence, request)?;
+        evidence.retain(|candidate| request.filter.accepts_trust(candidate));
+        evidence.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.node.id.cmp(&b.node.id))
+        });
+        evidence.truncate(candidate_limit);
+        Ok(evidence)
+    }
+
+    fn recall_candidate_matches(
+        &self,
+        id: Ulid,
+        request: &RecallRequest,
+        embedding_profile: Option<&EmbeddingProfile>,
+    ) -> Result<bool> {
+        let Some(node) = self.storage.get_node(self.config.tenant, id)? else {
+            return Ok(false);
+        };
+        if !node.is_valid_at(request.as_of_ms) || !request.filter.matches(&node) {
+            return Ok(false);
+        }
+        if request.filter.requires_provenance(&node) {
+            let (provenance, _) = self.provenance_and_conflicts(id, request.as_of_ms)?;
+            if provenance.is_empty() {
+                return Ok(false);
+            }
+        }
+        if let Some(profile) = embedding_profile {
+            if let Some(status) =
+                self.runtime_store
+                    .projection(self.config.tenant, id, &profile.id)?
+            {
+                return Ok(status.is_current_for(profile, &node));
+            }
+        }
+        Ok(true)
     }
 
     async fn embed_recall_query(
@@ -485,6 +626,7 @@ impl Database {
             proposal.source_operation = Some(operation_id);
             proposal.created_at_ms = crate::now_ms();
             proposal.applied_at_ms = None;
+            proposal.next_change = 0;
             validate_proposal_scope(proposal, &allowed_proposal_ids)?;
             self.validate_proposal(proposal)?;
             self.runtime_store
@@ -519,69 +661,224 @@ impl Database {
     }
 
     pub fn apply_proposal(&self, id: Ulid, context: AuditContext) -> Result<()> {
+        let _guard = self.node_mutation_lock.lock();
         let mut proposal: ChangeProposal = self.proposal(id)?.ok_or(Error::NotFound)?;
-        if proposal.status != ChangeProposalStatus::Pending {
-            return Err(Error::InvalidArgument(format!(
-                "proposal {id} is not pending"
-            )));
-        }
-        if let Err(error) = self.validate_proposal(&proposal) {
-            proposal.status = ChangeProposalStatus::Stale;
-            self.runtime_store
-                .put_proposal(self.config.tenant, id, &proposal)?;
-            self.append_audit(
-                Ulid::new(),
-                AuditAction::Proposal,
-                "apply_proposal",
-                false,
-                context,
-                json!({"proposal": proposal}),
-                Some(error.to_string()),
-            )?;
-            return Err(error);
-        }
-        for change in proposal.changes.clone() {
-            match change {
-                ProposedChange::SetValidity {
-                    node_id,
-                    valid_from_ms,
-                    valid_to_ms,
-                    ..
-                } => {
-                    let mut node = self.get(node_id)?.ok_or(Error::NotFound)?;
-                    node.valid_from_ms = valid_from_ms;
-                    node.valid_to_ms = valid_to_ms;
-                    self.insert_inner(node, false, false)?;
+        match proposal.status {
+            ChangeProposalStatus::Pending => {
+                if let Err(error) = self.validate_proposal(&proposal) {
+                    proposal.status = ChangeProposalStatus::Stale;
+                    self.runtime_store
+                        .put_proposal(self.config.tenant, id, &proposal)?;
+                    self.append_audit(
+                        Ulid::new(),
+                        AuditAction::Proposal,
+                        "apply_proposal",
+                        false,
+                        context,
+                        json!({"proposal": proposal}),
+                        Some(error.to_string()),
+                    )?;
+                    return Err(error);
                 }
-                ProposedChange::SetState { node_id, state, .. } => {
-                    let mut node = self.get(node_id)?.ok_or(Error::NotFound)?;
-                    node.state = state;
-                    if matches!(state, MemoryState::Superseded | MemoryState::Retracted)
-                        && node.valid_to_ms.is_none()
-                    {
-                        node.valid_to_ms = Some(crate::now_ms());
-                    }
-                    self.insert_inner(node, false, false)?;
-                }
-                ProposedChange::AddEdge { edge, .. } => self.add_edge(edge)?,
+                proposal.status = ChangeProposalStatus::Applying;
+                proposal.next_change = 0;
+                self.runtime_store
+                    .put_proposal(self.config.tenant, id, &proposal)?;
+            }
+            ChangeProposalStatus::Applying => {}
+            _ => {
+                return Err(Error::InvalidArgument(format!(
+                    "proposal {id} is not pending or applying"
+                )));
             }
         }
-        proposal.status = ChangeProposalStatus::Applied;
-        proposal.applied_at_ms = Some(crate::now_ms());
-        self.runtime_store
-            .put_proposal(self.config.tenant, id, &proposal)?;
+
+        let result = self.resume_proposal_unlocked(&mut proposal);
         self.append_audit(
             Ulid::new(),
             AuditAction::Proposal,
             "apply_proposal",
-            true,
+            result.is_ok(),
             context,
             json!({"proposal": proposal}),
-            None,
-        )
+            result.as_ref().err().map(ToString::to_string),
+        )?;
+        result
+    }
+
+    fn resume_proposal_unlocked(&self, proposal: &mut ChangeProposal) -> Result<()> {
+        if proposal.status != ChangeProposalStatus::Applying {
+            return Err(Error::InvalidArgument(format!(
+                "proposal {} is not applying",
+                proposal.id
+            )));
+        }
+        if proposal.next_change > proposal.changes.len() {
+            return Err(Error::InvalidArgument(format!(
+                "proposal {} has an invalid apply cursor {} for {} changes",
+                proposal.id,
+                proposal.next_change,
+                proposal.changes.len()
+            )));
+        }
+        while proposal.next_change < proposal.changes.len() {
+            let index = proposal.next_change;
+            let change = proposal.changes[index].clone();
+            self.apply_proposed_change_unlocked(proposal, index, change)?;
+            proposal.next_change = index + 1;
+            self.runtime_store
+                .put_proposal(self.config.tenant, proposal.id, proposal)?;
+        }
+        proposal.status = ChangeProposalStatus::Applied;
+        proposal.applied_at_ms = Some(crate::now_ms());
+        self.runtime_store
+            .put_proposal(self.config.tenant, proposal.id, proposal)
+    }
+
+    fn apply_proposed_change_unlocked(
+        &self,
+        proposal: &ChangeProposal,
+        index: usize,
+        change: ProposedChange,
+    ) -> Result<()> {
+        match change {
+            ProposedChange::SetValidity {
+                node_id,
+                expected_revision,
+                valid_from_ms,
+                valid_to_ms,
+            } => {
+                let prior = prior_node_changes(&proposal.changes[..index], node_id);
+                let before_revision = expected_revision.saturating_add(prior);
+                let after_revision = before_revision.saturating_add(1);
+                let mut node = self.get(node_id)?.ok_or(Error::NotFound)?;
+                if node.revision == after_revision
+                    && node.valid_from_ms == valid_from_ms
+                    && node.valid_to_ms == valid_to_ms
+                {
+                    return self.reconcile_proposal_node_indexes_unlocked(&node);
+                }
+                if node.revision != before_revision {
+                    return Err(proposal_resume_conflict(
+                        proposal.id,
+                        node_id,
+                        before_revision,
+                        after_revision,
+                        node.revision,
+                    ));
+                }
+                node.valid_from_ms = valid_from_ms;
+                node.valid_to_ms = valid_to_ms;
+                self.insert_inner_unlocked(node, false, false)?;
+                Ok(())
+            }
+            ProposedChange::SetState {
+                node_id,
+                expected_revision,
+                state,
+            } => {
+                let prior = prior_node_changes(&proposal.changes[..index], node_id);
+                let before_revision = expected_revision.saturating_add(prior);
+                let after_revision = before_revision.saturating_add(1);
+                let mut node = self.get(node_id)?.ok_or(Error::NotFound)?;
+                let terminal_validity_is_set =
+                    !matches!(state, MemoryState::Superseded | MemoryState::Retracted)
+                        || node.valid_to_ms.is_some();
+                if node.revision == after_revision
+                    && node.state == state
+                    && terminal_validity_is_set
+                {
+                    return self.reconcile_proposal_node_indexes_unlocked(&node);
+                }
+                if node.revision != before_revision {
+                    return Err(proposal_resume_conflict(
+                        proposal.id,
+                        node_id,
+                        before_revision,
+                        after_revision,
+                        node.revision,
+                    ));
+                }
+                node.state = state;
+                if matches!(state, MemoryState::Superseded | MemoryState::Retracted)
+                    && node.valid_to_ms.is_none()
+                {
+                    node.valid_to_ms = Some(crate::now_ms());
+                }
+                self.insert_inner_unlocked(node, false, false)?;
+                Ok(())
+            }
+            ProposedChange::AddEdge {
+                edge,
+                expected_src_revision,
+                expected_dst_revision,
+            } => {
+                let expected = normalized_new_edge(edge);
+                match self.proposal_edge(&expected)? {
+                    Some(current) if same_proposal_edge(&current, &expected) => Ok(()),
+                    Some(_) => Err(Error::InvalidArgument(format!(
+                        "cannot resume proposal {}: edge {} -[{}]-> {} changed while applying",
+                        proposal.id, expected.src, expected.label, expected.dst
+                    ))),
+                    None => {
+                        for (role, node_id, base_revision) in [
+                            ("source", expected.src, expected_src_revision),
+                            ("destination", expected.dst, expected_dst_revision),
+                        ] {
+                            let expected_revision = base_revision.saturating_add(
+                                prior_node_changes(&proposal.changes[..index], node_id),
+                            );
+                            let actual_revision =
+                                self.get(node_id)?.ok_or(Error::NotFound)?.revision;
+                            if actual_revision != expected_revision {
+                                return Err(Error::InvalidArgument(format!(
+                                    "cannot resume proposal {}: edge {role} {node_id} expected revision {expected_revision}, found {actual_revision}",
+                                    proposal.id
+                                )));
+                            }
+                        }
+                        self.add_edge_unlocked(expected)
+                    }
+                }
+            }
+        }
+    }
+
+    fn reconcile_proposal_node_indexes_unlocked(&self, node: &MemoryNode) -> Result<()> {
+        self.reconcile_node_indexes_unlocked(node)
+    }
+
+    fn proposal_edge(&self, expected: &Edge) -> Result<Option<Edge>> {
+        Ok(self
+            .graph_store
+            .neighbours_out(self.config.tenant, expected.src, Some(&expected.label))?
+            .into_iter()
+            .find(|edge| edge.dst == expected.dst))
+    }
+
+    pub(crate) fn repair_applying_proposals(&self) -> Result<()> {
+        let _guard = self.node_mutation_lock.lock();
+        for mut proposal in self.proposals()? {
+            if proposal.status != ChangeProposalStatus::Applying {
+                continue;
+            }
+            let result = self.resume_proposal_unlocked(&mut proposal);
+            self.append_audit(
+                Ulid::new(),
+                AuditAction::Repair,
+                "repair_proposal",
+                result.is_ok(),
+                AuditContext::default(),
+                json!({"proposal": proposal}),
+                result.as_ref().err().map(ToString::to_string),
+            )?;
+            result?;
+        }
+        Ok(())
     }
 
     pub fn reject_proposal(&self, id: Ulid, context: AuditContext) -> Result<()> {
+        let _guard = self.node_mutation_lock.lock();
         let mut proposal: ChangeProposal = self.proposal(id)?.ok_or(Error::NotFound)?;
         if proposal.status != ChangeProposalStatus::Pending {
             return Err(Error::InvalidArgument(format!(
@@ -603,6 +900,7 @@ impl Database {
     }
 
     fn validate_proposal(&self, proposal: &ChangeProposal) -> Result<()> {
+        let mut added_edges = HashSet::new();
         for change in &proposal.changes {
             match change {
                 ProposedChange::SetValidity {
@@ -634,6 +932,18 @@ impl Database {
                     require_revision(self, edge.src, *expected_src_revision)?;
                     require_revision(self, edge.dst, *expected_dst_revision)?;
                     validate_relation(edge)?;
+                    if !added_edges.insert((edge.src, edge.dst, edge.label.clone())) {
+                        return Err(Error::InvalidArgument(format!(
+                            "proposal contains duplicate `{}` edge",
+                            edge.label
+                        )));
+                    }
+                    if self.proposal_edge(edge)?.is_some() {
+                        return Err(Error::InvalidArgument(format!(
+                            "proposal may not overwrite existing edge {} -[{}]-> {}",
+                            edge.src, edge.label, edge.dst
+                        )));
+                    }
                     for evidence in &edge.evidence {
                         if self.get(*evidence)?.is_none() {
                             return Err(Error::InvalidArgument(format!(
@@ -764,6 +1074,9 @@ impl Database {
                 .neighbours_in(self.config.tenant, id, None)?,
         );
         for edge in edges.into_iter().filter(|edge| edge.is_valid_at(as_of_ms)) {
+            if edge.label == "derived_from" && (edge.src != id || edge.dst == id) {
+                continue;
+            }
             let other = if edge.src == id { edge.dst } else { edge.src };
             if self
                 .get(other)?
@@ -775,9 +1088,10 @@ impl Database {
                 provenance.insert(other);
             }
             for evidence in &edge.evidence {
-                if self
-                    .get(*evidence)?
-                    .is_some_and(|node| node.is_valid_at(as_of_ms))
+                if *evidence != id
+                    && self
+                        .get(*evidence)?
+                        .is_some_and(|node| node.is_valid_at(as_of_ms))
                 {
                     provenance.insert(*evidence);
                 }
@@ -841,6 +1155,20 @@ impl RecallFilter {
                 .metadata
                 .iter()
                 .all(|(key, value)| node.metadata.get(key) == Some(value))
+    }
+
+    fn allows_unverified(&self, node: &MemoryNode) -> bool {
+        self.allow_unverified_metadata_keys
+            .iter()
+            .any(|key| node.metadata.contains_key(key))
+    }
+
+    fn requires_provenance(&self, node: &MemoryNode) -> bool {
+        self.require_verified && node.kind == NodeKind::Fact && !self.allows_unverified(node)
+    }
+
+    fn accepts_trust(&self, evidence: &RecallEvidence) -> bool {
+        !self.require_verified || evidence.verified || self.allows_unverified(&evidence.node)
     }
 }
 
@@ -1052,6 +1380,50 @@ fn require_revision(database: &Database, id: Ulid, expected: u64) -> Result<()> 
     Ok(())
 }
 
+fn prior_node_changes(changes: &[ProposedChange], node_id: Ulid) -> u64 {
+    changes
+        .iter()
+        .filter(|change| match change {
+            ProposedChange::SetValidity { node_id: id, .. }
+            | ProposedChange::SetState { node_id: id, .. } => *id == node_id,
+            ProposedChange::AddEdge { .. } => false,
+        })
+        .count() as u64
+}
+
+fn proposal_resume_conflict(
+    proposal_id: Ulid,
+    node_id: Ulid,
+    before_revision: u64,
+    after_revision: u64,
+    actual_revision: u64,
+) -> Error {
+    Error::InvalidArgument(format!(
+        "cannot resume proposal {proposal_id}: node {node_id} expected revision {before_revision} before or {after_revision} after the change, found {actual_revision}"
+    ))
+}
+
+fn normalized_new_edge(mut edge: Edge) -> Edge {
+    edge.revision = edge.revision.max(1);
+    if edge.valid_from_ms.is_none() {
+        edge.valid_from_ms = Some(edge.created_at_ms);
+    }
+    edge
+}
+
+fn same_proposal_edge(current: &Edge, expected: &Edge) -> bool {
+    current.src == expected.src
+        && current.dst == expected.dst
+        && current.label == expected.label
+        && current.weight.to_bits() == expected.weight.to_bits()
+        && current.created_at_ms == expected.created_at_ms
+        && current.metadata == expected.metadata
+        && current.revision == expected.revision
+        && current.valid_from_ms == expected.valid_from_ms
+        && current.valid_to_ms == expected.valid_to_ms
+        && current.evidence == expected.evidence
+}
+
 pub(crate) fn validate_relation(edge: &Edge) -> Result<()> {
     const RELATIONS: [&str; 7] = [
         "contains",
@@ -1067,6 +1439,11 @@ pub(crate) fn validate_relation(edge: &Edge) -> Result<()> {
             "unsupported agent relation `{}`",
             edge.label
         )));
+    }
+    if edge.label == "derived_from" && edge.src == edge.dst {
+        return Err(Error::InvalidArgument(
+            "derived_from relation cannot reference itself".into(),
+        ));
     }
     if !edge.weight.is_finite() || !(0.0..=1.0).contains(&edge.weight) {
         return Err(Error::InvalidArgument("invalid relation weight".into()));

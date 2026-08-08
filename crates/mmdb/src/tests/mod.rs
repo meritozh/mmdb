@@ -34,6 +34,290 @@ fn insert_get_scan_delete_roundtrip() {
 }
 
 #[test]
+fn metadata_lookup_is_exact_and_deterministically_ordered() {
+    let dir = tempdir().unwrap();
+    let db = Database::open(dir.path()).unwrap();
+    let later = db
+        .insert(
+            NodeBuilder::new(NodeKind::Fact)
+                .text("later")
+                .metadata("memory_key", serde_json::json!("preference:tea"))
+                .created_at(20)
+                .build(),
+        )
+        .unwrap();
+    let earlier = db
+        .insert(
+            NodeBuilder::new(NodeKind::Fact)
+                .text("earlier")
+                .metadata("memory_key", serde_json::json!("preference:tea"))
+                .created_at(10)
+                .build(),
+        )
+        .unwrap();
+    db.insert(
+        NodeBuilder::new(NodeKind::Fact)
+            .text("other")
+            .metadata("memory_key", serde_json::json!("preference:coffee"))
+            .created_at(5)
+            .build(),
+    )
+    .unwrap();
+
+    let found = db
+        .nodes_by_metadata("memory_key", &serde_json::json!("preference:tea"))
+        .unwrap();
+    assert_eq!(
+        found.iter().map(|node| node.id).collect::<Vec<_>>(),
+        vec![earlier, later]
+    );
+}
+
+#[test]
+fn access_stats_serialize_concurrent_increments_and_survive_reopen() {
+    use std::sync::Arc;
+
+    let dir = tempdir().unwrap();
+    let id;
+    {
+        let db = Arc::new(Database::open(dir.path()).unwrap());
+        id = db
+            .insert(NodeBuilder::new(NodeKind::Fact).text("remember me").build())
+            .unwrap();
+        let threads = (0..8)
+            .map(|_| {
+                let db = Arc::clone(&db);
+                std::thread::spawn(move || {
+                    db.record_access([id, id], Default::default()).unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let stats = db.access_stats(id).unwrap().unwrap();
+        assert_eq!(stats.node_id, id);
+        assert_eq!(stats.access_count, 8);
+        assert_eq!(db.get(id).unwrap().unwrap().revision, 1);
+        assert_eq!(
+            db.audit_records(Default::default())
+                .unwrap()
+                .iter()
+                .filter(|record| record.name == "record_access")
+                .count(),
+            8
+        );
+    }
+
+    let db = Database::open(dir.path()).unwrap();
+    assert_eq!(db.access_stats(id).unwrap().unwrap().access_count, 8);
+}
+
+#[test]
+fn access_stats_merge_is_additive_idempotent_and_survives_reopen() {
+    let dir = tempdir().unwrap();
+    let target;
+    let source;
+    {
+        let db = Database::open(dir.path()).unwrap();
+        target = db
+            .insert(NodeBuilder::new(NodeKind::Fact).text("canonical").build())
+            .unwrap();
+        source = db
+            .insert(NodeBuilder::new(NodeKind::Fact).text("duplicate").build())
+            .unwrap();
+        for _ in 0..3 {
+            db.record_access([target], Default::default()).unwrap();
+        }
+        for _ in 0..2 {
+            db.record_access([source], Default::default()).unwrap();
+        }
+
+        let merged = db
+            .merge_access_stats(target, [source], Default::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.access_count, 5);
+        assert!(db.access_stats(source).unwrap().is_none());
+        assert_eq!(
+            db.merge_access_stats(target, [source], Default::default())
+                .unwrap()
+                .unwrap()
+                .access_count,
+            5
+        );
+        db.record_access([target], Default::default()).unwrap();
+        assert_eq!(db.access_stats(target).unwrap().unwrap().access_count, 6);
+    }
+
+    let db = Database::open(dir.path()).unwrap();
+    assert_eq!(db.access_stats(target).unwrap().unwrap().access_count, 6);
+    assert!(db.access_stats(source).unwrap().is_none());
+}
+
+#[test]
+fn access_timestamp_is_monotonic_and_hard_delete_clears_stats() {
+    let dir = tempdir().unwrap();
+    let db = Database::open(dir.path()).unwrap();
+    let id = db
+        .insert(NodeBuilder::new(NodeKind::Fact).text("accessed fact").build())
+        .unwrap();
+    let future = now_ms() + 60_000;
+
+    db.access_store
+        .record(DEFAULT_TENANT, &[id], future)
+        .unwrap();
+    db.record_access([id], Default::default()).unwrap();
+    let stats = db.access_stats(id).unwrap().unwrap();
+    assert_eq!(stats.access_count, 2);
+    assert_eq!(stats.last_accessed_at_ms, future);
+
+    db.delete(id).unwrap();
+    assert!(db.access_stats(id).unwrap().is_none());
+}
+
+#[test]
+fn record_access_and_delete_do_not_leave_orphan_stats() {
+    use std::sync::{Arc, Barrier};
+
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::open(dir.path()).unwrap());
+    for index in 0..8 {
+        let id = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text(format!("race {index}"))
+                    .build(),
+            )
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let access = {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                db.record_access([id], Default::default())
+            })
+        };
+        let deletion = {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                db.delete(id)
+            })
+        };
+        barrier.wait();
+        let _ = access.join().unwrap();
+        deletion.join().unwrap().unwrap();
+
+        assert!(db.get(id).unwrap().is_none());
+        assert!(db.access_stats(id).unwrap().is_none());
+    }
+}
+
+#[test]
+fn concurrent_retract_and_insert_are_serializable() {
+    use std::sync::{Arc, Barrier};
+
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::open(dir.path()).unwrap());
+    for index in 0..8 {
+        let id = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text(format!("before {index}"))
+                    .build(),
+            )
+            .unwrap();
+        let original = db.get(id).unwrap().unwrap();
+        let mut replacement = original.clone();
+        replacement.content = Content::Text(format!("after {index}"));
+        let barrier = Arc::new(Barrier::new(3));
+        let retraction = {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                db.retract(
+                    id,
+                    Some(original.revision),
+                    "concurrent update",
+                    Default::default(),
+                )
+            })
+        };
+        let insertion = {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                db.insert(replacement)
+            })
+        };
+        barrier.wait();
+        let retract_result = retraction.join().unwrap();
+        insertion.join().unwrap().unwrap();
+
+        let final_node = db.get(id).unwrap().unwrap();
+        assert!(matches!(
+            &final_node.content,
+            Content::Text(text) if text == &format!("after {index}")
+        ));
+        assert_eq!(final_node.state, mmdb_core::MemoryState::Active);
+        if let Err(error) = retract_result {
+            assert!(error.to_string().contains("stale node revision"));
+        }
+    }
+}
+
+#[test]
+fn concurrent_retract_and_delete_never_resurrect_a_node() {
+    use std::sync::{Arc, Barrier};
+
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::open(dir.path()).unwrap());
+    for index in 0..8 {
+        let id = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text(format!("delete race {index}"))
+                    .build(),
+            )
+            .unwrap();
+        let revision = db.get(id).unwrap().unwrap().revision;
+        let barrier = Arc::new(Barrier::new(3));
+        let retraction = {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                db.retract(
+                    id,
+                    Some(revision),
+                    "concurrent delete",
+                    Default::default(),
+                )
+            })
+        };
+        let deletion = {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                db.delete(id)
+            })
+        };
+        barrier.wait();
+        let _ = retraction.join().unwrap();
+        deletion.join().unwrap().unwrap();
+
+        assert!(db.get(id).unwrap().is_none());
+    }
+}
+
+#[test]
 fn open_with_custom_model_persists_config() {
     let dir = tempdir().unwrap();
     let cfg = DatabaseConfig {
@@ -1253,17 +1537,18 @@ fn insert_blob_stores_artifact_and_reads_stream() {
 mod agent_memory {
     use super::{block_on, Database, NodeBuilder};
     use crate::{
-        AgentClient, AgentRequest, AgentResponse, AuditAction, AuditFilter, ChangeProposalStatus,
-        ClientFuture, ClientRegistry, DreamProfile, DreamRun, DreamRunStatus, EmbeddingClient,
-        EmbeddingDistance, EmbeddingInput, EmbeddingOutput, EmbeddingProfile, LawyerFailureMode,
-        LawyerProfile, MaintenanceTrigger, MemoryProfile, ProjectionState, RecallRequest,
-        RecallStatus, SupportedContent,
+        AgentClient, AgentRequest, AgentResponse, AuditAction, AuditFilter, ChangeProposal,
+        ChangeProposalStatus, ClientFuture, ClientRegistry, DreamProfile, DreamRun,
+        DreamRunStatus, EmbeddingClient, EmbeddingDistance, EmbeddingInput, EmbeddingOutput,
+        EmbeddingProfile, LawyerFailureMode, LawyerProfile, MaintenanceTrigger, MemoryProfile,
+        ProjectionState, ProjectionStatus, ProposedChange, RecallRequest, RecallStatus,
+        SupportedContent,
     };
     use fjall::PersistMode;
     use mmdb_core::{Edge, MemoryState, NodeKind};
     use std::collections::BTreeMap;
     use std::io::Cursor;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Barrier, Mutex};
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -1296,6 +1581,34 @@ mod agent_memory {
                 searchable_text: self.projection.clone(),
             };
             Box::pin(async move { Ok(output) })
+        }
+    }
+
+    struct BlockingEmbedding {
+        vector: Vec<f32>,
+        projection: Option<String>,
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    impl EmbeddingClient for BlockingEmbedding {
+        fn embed<'a>(
+            &'a self,
+            _input: EmbeddingInput,
+            _profile: &'a EmbeddingProfile,
+        ) -> ClientFuture<'a, EmbeddingOutput> {
+            let vector = self.vector.clone();
+            let searchable_text = self.projection.clone();
+            let entered = Arc::clone(&self.entered);
+            let release = Arc::clone(&self.release);
+            Box::pin(async move {
+                entered.wait();
+                release.wait();
+                Ok(EmbeddingOutput {
+                    vector,
+                    searchable_text,
+                })
+            })
         }
     }
 
@@ -1346,6 +1659,80 @@ mod agent_memory {
             valid_to_ms: None,
             evidence: Vec::new(),
         }
+    }
+
+    fn pending_state_proposal(
+        node_id: Ulid,
+        expected_revision: u64,
+        state: MemoryState,
+    ) -> ChangeProposal {
+        ChangeProposal {
+            id: Ulid::new(),
+            reason: "concurrency regression".into(),
+            changes: vec![ProposedChange::SetState {
+                node_id,
+                expected_revision,
+                state,
+            }],
+            status: ChangeProposalStatus::Pending,
+            source_operation: None,
+            created_at_ms: crate::now_ms(),
+            applied_at_ms: None,
+            next_change: 0,
+        }
+    }
+
+    #[test]
+    fn embedding_profile_fingerprint_is_full_deterministic_and_legacy_statuses_default_empty() {
+        let base = embedding_profile("profile", "client", "model", 2);
+        let fingerprint = base.fingerprint();
+        assert_eq!(fingerprint, base.clone().fingerprint());
+        assert_eq!(fingerprint.len(), 64);
+
+        let mut variants = Vec::new();
+        let mut variant = base.clone();
+        variant.id = "other-profile".into();
+        variants.push(variant);
+        let mut variant = base.clone();
+        variant.client_id = "other-client".into();
+        variants.push(variant);
+        let mut variant = base.clone();
+        variant.model = "other-model".into();
+        variants.push(variant);
+        let mut variant = base.clone();
+        variant.model_revision = "r2".into();
+        variants.push(variant);
+        let mut variant = base.clone();
+        variant.dimension = 3;
+        variants.push(variant);
+        let mut variant = base.clone();
+        variant.distance = EmbeddingDistance::Dot;
+        variants.push(variant);
+        let mut variant = base.clone();
+        variant.supported_content = vec![SupportedContent::Text];
+        variants.push(variant);
+        let mut variant = base.clone();
+        variant.supported_mime_types = vec!["text/plain".into()];
+        variants.push(variant);
+        let mut variant = base;
+        variant.weight = 0.5;
+        variants.push(variant);
+        assert!(variants
+            .iter()
+            .all(|variant| variant.fingerprint() != fingerprint));
+
+        let legacy: ProjectionStatus = serde_json::from_value(serde_json::json!({
+            "node_id": Ulid::new(),
+            "node_revision": 1,
+            "profile_id": "profile",
+            "state": "ready",
+            "attempts": 1,
+            "updated_at_ms": 10,
+            "last_error": null,
+            "searchable_text": null
+        }))
+        .unwrap();
+        assert!(legacy.profile_fingerprint.is_empty());
     }
 
     #[test]
@@ -1401,6 +1788,15 @@ mod agent_memory {
         assert_eq!(report.projections.len(), 2);
         assert_eq!(report.projections[0].state, ProjectionState::Ready);
         assert_eq!(report.projections[1].state, ProjectionState::Failed);
+        let current_profile = db.memory_profile().unwrap();
+        for status in &report.projections {
+            let profile = current_profile
+                .embedding_profiles
+                .iter()
+                .find(|profile| profile.id == status.profile_id)
+                .unwrap();
+            assert_eq!(status.profile_fingerprint, profile.fingerprint());
+        }
         block_on(
             db.ingest(
                 NodeBuilder::new(NodeKind::Fact)
@@ -1444,6 +1840,323 @@ mod agent_memory {
         assert!(audit
             .iter()
             .any(|record| record.action == AuditAction::ClientCall));
+    }
+
+    #[test]
+    fn zero_and_overflow_norm_projection_outputs_fail_without_aborting_raw_ingest() {
+        let dir = tempdir().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let clients = ClientRegistry::new();
+        clients
+            .register_embedding(
+                "zero-client",
+                Arc::new(FixedEmbedding {
+                    vector: vec![0.0, 0.0],
+                    projection: None,
+                    calls: Arc::clone(&calls),
+                }),
+            )
+            .unwrap();
+        clients
+            .register_embedding(
+                "overflow-client",
+                Arc::new(FixedEmbedding {
+                    vector: vec![f32::MAX, f32::MAX],
+                    projection: None,
+                    calls,
+                }),
+            )
+            .unwrap();
+        let profile = MemoryProfile {
+            version: 1,
+            revision: 1,
+            embedding_profiles: vec![
+                embedding_profile("zero", "zero-client", "zero-model", 2),
+                embedding_profile("overflow", "overflow-client", "overflow-model", 2),
+            ],
+            dreamer: None,
+            lawyer: None,
+        };
+        let db = Database::builder(dir.path())
+            .clients(clients)
+            .profile(profile)
+            .build()
+            .unwrap();
+        let raw = NodeBuilder::new(NodeKind::Episode)
+            .text("raw episode survives invalid projections")
+            .build();
+        let raw_id = raw.id;
+
+        let report = block_on(db.ingest(raw)).unwrap();
+        assert_eq!(report.node_id, raw_id);
+        assert_eq!(report.projections.len(), 2);
+        let current_profile = db.memory_profile().unwrap();
+        for status in &report.projections {
+            assert_eq!(status.state, ProjectionState::Failed);
+            let profile = current_profile
+                .embedding_profiles
+                .iter()
+                .find(|profile| profile.id == status.profile_id)
+                .unwrap();
+            assert_eq!(status.profile_fingerprint, profile.fingerprint());
+            assert!(status
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("finite, non-zero L2 norm")));
+        }
+        let stored = db.get(raw_id).unwrap().unwrap();
+        assert_eq!(stored.revision, 1);
+        assert!(stored.embeddings.is_empty());
+        assert!(matches!(
+            &stored.content,
+            mmdb_core::Content::Text(text)
+                if text == "raw episode survives invalid projections"
+        ));
+        assert_eq!(
+            db.projection_statuses(raw_id)
+                .unwrap()
+                .iter()
+                .filter(|status| status.state == ProjectionState::Failed)
+                .count(),
+            2
+        );
+
+        let retried = block_on(db.retry_projection(raw_id, "zero")).unwrap();
+        assert_eq!(retried.state, ProjectionState::Failed);
+        assert_eq!(retried.attempts, 2);
+    }
+
+    #[test]
+    fn projection_currentness_tracks_content_and_profile_not_incidental_revision() {
+        let dir = tempdir().unwrap();
+        let clients = ClientRegistry::new();
+        clients
+            .register_embedding(
+                "projection-client",
+                Arc::new(FixedEmbedding {
+                    vector: vec![1.0, 0.0],
+                    projection: Some("projected-only-token".into()),
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                }),
+            )
+            .unwrap();
+        let profile = MemoryProfile {
+            version: 1,
+            revision: 1,
+            embedding_profiles: vec![embedding_profile(
+                "projection",
+                "projection-client",
+                "projection-model",
+                2,
+            )],
+            dreamer: None,
+            lawyer: None,
+        };
+        let db = Database::builder(dir.path())
+            .clients(clients.clone())
+            .profile(profile)
+            .build()
+            .unwrap();
+        let report = block_on(
+            db.ingest(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("raw source text")
+                    .build(),
+            ),
+        )
+        .unwrap();
+        let mut node = db.get(report.node_id).unwrap().unwrap();
+        let status = report.projections[0].clone();
+        let active_profile = db.memory_profile().unwrap().embedding_profiles.remove(0);
+        assert!(status.is_current_for(&active_profile, &node));
+
+        node.metadata.insert("touch".into(), serde_json::json!(true));
+        db.insert(node).unwrap();
+        let node = db.get(report.node_id).unwrap().unwrap();
+        assert_ne!(node.revision, status.node_revision);
+        assert!(status.is_current_for(&active_profile, &node));
+
+        let mut changed = db.memory_profile().unwrap();
+        changed.embedding_profiles[0].model_revision = "r2".into();
+        db.set_memory_profile(changed, Default::default()).unwrap();
+        clients
+            .register_embedding(
+                "projection-client",
+                Arc::new(FixedEmbedding {
+                    vector: vec![0.0, 1.0],
+                    projection: None,
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                }),
+            )
+            .unwrap();
+
+        let mut stale = RecallRequest::new("projected-only-token");
+        stale.graph_depth = 0;
+        stale.min_vector_similarity = Some(0.99);
+        assert!(block_on(db.recall(stale.clone()))
+            .unwrap()
+            .evidence
+            .is_empty());
+        drop(db);
+
+        let db = Database::builder(dir.path())
+            .clients(clients)
+            .build()
+            .unwrap();
+        assert!(block_on(db.recall(stale)).unwrap().evidence.is_empty());
+
+        let direct = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("direct explicit vector")
+                    .embedding("projection-model", vec![0.0, 1.0])
+                    .build(),
+            )
+            .unwrap();
+        let mut direct_request = RecallRequest::new("vector-only-query");
+        direct_request.lexical = false;
+        direct_request.graph_depth = 0;
+        direct_request.min_vector_similarity = Some(0.99);
+        let recalled = block_on(db.recall(direct_request)).unwrap();
+        assert_eq!(recalled.evidence.len(), 1);
+        assert_eq!(recalled.evidence[0].node.id, direct);
+    }
+
+    #[test]
+    fn failed_reprojection_hides_prior_vector_and_searchable_text() {
+        let dir = tempdir().unwrap();
+        let clients = ClientRegistry::new();
+        clients
+            .register_embedding(
+                "projection-client",
+                Arc::new(FixedEmbedding {
+                    vector: vec![1.0, 0.0],
+                    projection: Some("failed-projection-token".into()),
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                }),
+            )
+            .unwrap();
+        let profile = MemoryProfile {
+            version: 1,
+            revision: 1,
+            embedding_profiles: vec![embedding_profile(
+                "projection",
+                "projection-client",
+                "projection-model",
+                2,
+            )],
+            dreamer: None,
+            lawyer: None,
+        };
+        let db = Database::builder(dir.path())
+            .clients(clients.clone())
+            .profile(profile)
+            .build()
+            .unwrap();
+        let report = block_on(
+            db.ingest(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("raw content only")
+                    .build(),
+            ),
+        )
+        .unwrap();
+        clients
+            .register_embedding(
+                "projection-client",
+                Arc::new(FixedEmbedding {
+                    vector: vec![0.0, 0.0],
+                    projection: None,
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                }),
+            )
+            .unwrap();
+        let failed = block_on(db.retry_projection(report.node_id, "projection")).unwrap();
+        assert_eq!(failed.state, ProjectionState::Failed);
+        clients
+            .register_embedding(
+                "projection-client",
+                Arc::new(FixedEmbedding {
+                    vector: vec![1.0, 0.0],
+                    projection: None,
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                }),
+            )
+            .unwrap();
+
+        let mut request = RecallRequest::new("failed-projection-token");
+        request.graph_depth = 0;
+        request.min_vector_similarity = Some(0.99);
+        assert!(block_on(db.recall(request)).unwrap().evidence.is_empty());
+    }
+
+    #[test]
+    fn projection_result_does_not_overwrite_content_changed_during_client_wait() {
+        let dir = tempdir().unwrap();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let clients = ClientRegistry::new();
+        clients
+            .register_embedding(
+                "blocking-client",
+                Arc::new(BlockingEmbedding {
+                    vector: vec![1.0, 0.0],
+                    projection: Some("stale generated text".into()),
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                }),
+            )
+            .unwrap();
+        let profile = MemoryProfile {
+            version: 1,
+            revision: 1,
+            embedding_profiles: vec![embedding_profile(
+                "projection",
+                "blocking-client",
+                "projection-model",
+                2,
+            )],
+            dreamer: None,
+            lawyer: None,
+        };
+        let db = Arc::new(
+            Database::builder(dir.path())
+                .clients(clients)
+                .profile(profile)
+                .build()
+                .unwrap(),
+        );
+        let id = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("old content")
+                    .build(),
+            )
+            .unwrap();
+        let projection = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || block_on(db.retry_projection(id, "projection")))
+        };
+        entered.wait();
+        db.insert(
+            NodeBuilder::new(NodeKind::Fact)
+                .id(id)
+                .text("new content")
+                .embedding("projection-model", vec![0.0, 1.0])
+                .build(),
+        )
+        .unwrap();
+        release.wait();
+
+        let status = projection.join().unwrap().unwrap();
+        assert_eq!(status.state, ProjectionState::Failed);
+        assert!(status
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("content changed")));
+        let node = db.get(id).unwrap().unwrap();
+        assert!(matches!(&node.content, mmdb_core::Content::Text(text) if text == "new content"));
+        assert_eq!(node.embeddings[0].vector.as_slice(), &[0.0, 1.0]);
     }
 
     #[test]
@@ -1529,6 +2242,556 @@ mod agent_memory {
         historical_request.as_of_ms = 70;
         let historical_recall = block_on(db.recall(historical_request)).unwrap();
         assert_eq!(historical_recall.evidence[0].node.id, historical);
+    }
+
+    #[test]
+    fn derived_from_provenance_only_verifies_the_outgoing_derivative() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let source = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("rootfacttoken")
+                    .created_at(10)
+                    .build(),
+            )
+            .unwrap();
+        let derived = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("childfacttoken")
+                    .created_at(20)
+                    .build(),
+            )
+            .unwrap();
+        let mut derivation = edge(derived, source, "derived_from", 20);
+        derivation.evidence = vec![source];
+        db.add_edge(derivation).unwrap();
+
+        let mut source_request = RecallRequest::new("rootfacttoken");
+        source_request.graph_depth = 0;
+        let source_result = block_on(db.recall(source_request)).unwrap();
+        let source_evidence = source_result
+            .evidence
+            .iter()
+            .find(|evidence| evidence.node.id == source)
+            .unwrap();
+        assert!(source_evidence.provenance.is_empty());
+        assert!(!source_evidence.verified);
+
+        let mut derived_request = RecallRequest::new("childfacttoken");
+        derived_request.graph_depth = 0;
+        let derived_result = block_on(db.recall(derived_request)).unwrap();
+        let derived_evidence = derived_result
+            .evidence
+            .iter()
+            .find(|evidence| evidence.node.id == derived)
+            .unwrap();
+        assert_eq!(derived_evidence.provenance, vec![source]);
+        assert!(derived_evidence.verified);
+    }
+
+    #[test]
+    fn verified_filter_runs_before_candidate_budget_and_allows_owned_records() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let source = db
+            .insert(
+                NodeBuilder::new(NodeKind::Episode)
+                    .text("source episode")
+                    .build(),
+            )
+            .unwrap();
+        let verified = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text(format!("trustneedle {}", "padding ".repeat(200)))
+                    .build(),
+            )
+            .unwrap();
+        db.add_edge(edge(
+            verified,
+            source,
+            "derived_from",
+            crate::now_ms(),
+        ))
+        .unwrap();
+        for index in 0..30 {
+            db.insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text(format!("trustneedle decoy {index}"))
+                    .build(),
+            )
+            .unwrap();
+        }
+
+        let mut request = RecallRequest::new("trustneedle");
+        request.limit = 1;
+        request.candidate_limit = 1;
+        request.graph_depth = 0;
+        request.filter.require_verified = true;
+        let recalled = block_on(db.recall(request)).unwrap();
+        assert_eq!(recalled.evidence.len(), 1);
+        assert_eq!(recalled.evidence[0].node.id, verified);
+        assert!(recalled.evidence[0].verified);
+
+        let owned = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("owned-record-token")
+                    .metadata("miumiu_record", serde_json::json!(false))
+                    .build(),
+            )
+            .unwrap();
+        let mut request = RecallRequest::new("owned-record-token");
+        request.limit = 1;
+        request.candidate_limit = 1;
+        request.graph_depth = 0;
+        request.filter.require_verified = true;
+        request.filter.allow_unverified_metadata_keys = vec!["miumiu_record".into()];
+        let recalled = block_on(db.recall(request)).unwrap();
+        assert_eq!(recalled.evidence[0].node.id, owned);
+        assert!(!recalled.evidence[0].verified);
+    }
+
+    #[test]
+    fn derived_from_self_loop_is_rejected_and_cannot_self_verify() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let id = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("self-loop-token")
+                    .build(),
+            )
+            .unwrap();
+        let self_loop = edge(id, id, "derived_from", crate::now_ms());
+        assert!(db.add_edge(self_loop.clone()).is_err());
+
+        // Defensive read behavior also neutralizes legacy or corrupt raw edges.
+        db.graph_store.add_edge(0, self_loop).unwrap();
+        let mut request = RecallRequest::new("self-loop-token");
+        request.graph_depth = 0;
+        let recalled = block_on(db.recall(request)).unwrap();
+        assert_eq!(recalled.evidence[0].node.id, id);
+        assert!(!recalled.evidence[0].verified);
+        assert!(recalled.evidence[0].provenance.is_empty());
+    }
+
+    #[test]
+    fn recall_builds_snapshot_after_remote_query_embedding_without_blocking_writes() {
+        let dir = tempdir().unwrap();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let clients = ClientRegistry::new();
+        clients
+            .register_embedding(
+                "blocking-client",
+                Arc::new(BlockingEmbedding {
+                    vector: vec![1.0, 0.0],
+                    projection: None,
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                }),
+            )
+            .unwrap();
+        let profile = MemoryProfile {
+            version: 1,
+            revision: 1,
+            embedding_profiles: vec![embedding_profile(
+                "recall",
+                "blocking-client",
+                "recall-model",
+                2,
+            )],
+            dreamer: None,
+            lawyer: None,
+        };
+        let db = Arc::new(
+            Database::builder(dir.path())
+                .clients(clients)
+                .profile(profile)
+                .build()
+                .unwrap(),
+        );
+        let id = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("oldsnapshottoken")
+                    .embedding("recall-model", vec![1.0, 0.0])
+                    .build(),
+            )
+            .unwrap();
+        let recall = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || {
+                let mut request = RecallRequest::new("oldsnapshottoken");
+                request.graph_depth = 0;
+                request.min_vector_similarity = Some(0.99);
+                block_on(db.recall(request))
+            })
+        };
+        entered.wait();
+
+        let (updated, received) = std::sync::mpsc::channel();
+        let update = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || {
+                let result = db.insert(
+                    NodeBuilder::new(NodeKind::Fact)
+                        .id(id)
+                        .text("newsnapshottoken")
+                        .embedding("recall-model", vec![0.0, 1.0])
+                        .build(),
+                );
+                let _ = updated.send(result);
+            })
+        };
+        let update_before_release = received.recv_timeout(std::time::Duration::from_secs(2));
+        release.wait();
+        update.join().unwrap();
+        update_before_release
+            .expect("remote query embedding must not hold the node mutation lock")
+            .unwrap();
+
+        let recalled = recall.join().unwrap().unwrap();
+        assert!(recalled.evidence.is_empty());
+    }
+
+    #[test]
+    fn cjk_lexical_recall_works_without_embeddings() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let id = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("用户喜欢乌龙茶")
+                    .build(),
+            )
+            .unwrap();
+
+        let recalled = block_on(db.recall(RecallRequest::new("乌龙茶"))).unwrap();
+        assert_eq!(recalled.evidence[0].node.id, id);
+        assert!(!recalled.evidence[0].lexical_terms.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_filter_prevents_lexical_candidate_starvation_and_preserves_history() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let active = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("orchid active memory")
+                    .created_at(10)
+                    .build(),
+            )
+            .unwrap();
+        let mut retired = NodeBuilder::new(NodeKind::Fact)
+            .text("orchid ".repeat(24))
+            .created_at(20)
+            .build();
+        retired.state = MemoryState::Retracted;
+        retired.valid_to_ms = Some(100);
+        let retired = db.insert(retired).unwrap();
+
+        let mut current = RecallRequest::new("orchid");
+        current.as_of_ms = 200;
+        current.limit = 1;
+        current.candidate_limit = 1;
+        current.graph_depth = 0;
+        let current = block_on(db.recall(current)).unwrap();
+        assert_eq!(current.evidence[0].node.id, active);
+
+        let mut historical = RecallRequest::new("orchid");
+        historical.as_of_ms = 50;
+        historical.limit = 1;
+        historical.candidate_limit = 1;
+        historical.graph_depth = 0;
+        let historical = block_on(db.recall(historical)).unwrap();
+        assert_eq!(historical.evidence[0].node.id, retired);
+    }
+
+    #[test]
+    fn lexical_lifecycle_filter_propagates_node_storage_errors() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let id = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("corrupt lexical candidate")
+                    .build(),
+            )
+            .unwrap();
+        db.storage
+            .nodes
+            .insert(mmdb_storage::keys::node_key(0, id), b"{".as_slice())
+            .unwrap();
+
+        let error = block_on(db.recall(RecallRequest::new("corrupt lexical candidate")))
+            .unwrap_err();
+        assert!(error.to_string().contains("json error"));
+    }
+
+    #[test]
+    fn vector_lifecycle_filter_propagates_node_storage_errors() {
+        let dir = tempdir().unwrap();
+        let clients = ClientRegistry::new();
+        clients
+            .register_embedding(
+                "recall-client",
+                Arc::new(FixedEmbedding {
+                    vector: vec![1.0, 0.0],
+                    projection: None,
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                }),
+            )
+            .unwrap();
+        let profile = MemoryProfile {
+            version: 1,
+            revision: 1,
+            embedding_profiles: vec![embedding_profile(
+                "recall",
+                "recall-client",
+                "recall-model",
+                2,
+            )],
+            dreamer: None,
+            lawyer: None,
+        };
+        let db = Database::builder(dir.path())
+            .clients(clients)
+            .profile(profile)
+            .build()
+            .unwrap();
+        let id = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("corrupt vector candidate")
+                    .embedding("recall-model", vec![1.0, 0.0])
+                    .build(),
+            )
+            .unwrap();
+        db.storage
+            .nodes
+            .insert(mmdb_storage::keys::node_key(0, id), b"{".as_slice())
+            .unwrap();
+
+        let mut request = RecallRequest::new("vector query");
+        request.lexical = false;
+        request.graph_depth = 0;
+        let error = block_on(db.recall(request)).unwrap_err();
+        assert!(error.to_string().contains("json error"));
+    }
+
+    #[test]
+    fn vector_lifecycle_filter_and_similarity_threshold_apply_before_candidate_budget() {
+        let dir = tempdir().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let clients = ClientRegistry::new();
+        clients
+            .register_embedding(
+                "recall-client",
+                Arc::new(FixedEmbedding {
+                    vector: vec![1.0, 0.0],
+                    projection: None,
+                    calls,
+                }),
+            )
+            .unwrap();
+        let profile = MemoryProfile {
+            version: 1,
+            revision: 1,
+            embedding_profiles: vec![embedding_profile(
+                "recall",
+                "recall-client",
+                "recall-model",
+                2,
+            )],
+            dreamer: None,
+            lawyer: None,
+        };
+        let db = Database::builder(dir.path())
+            .clients(clients)
+            .profile(profile)
+            .build()
+            .unwrap();
+        let active = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("active vector memory")
+                    .embedding("recall-model", vec![0.8, 0.6])
+                    .created_at(10)
+                    .build(),
+            )
+            .unwrap();
+        let mut retired = NodeBuilder::new(NodeKind::Fact)
+            .text("retired vector memory")
+            .embedding("recall-model", vec![1.0, 0.0])
+            .created_at(20)
+            .build();
+        retired.state = MemoryState::Retracted;
+        retired.valid_to_ms = Some(100);
+        let retired = db.insert(retired).unwrap();
+
+        let mut current = RecallRequest::new("unmatched vector query");
+        current.as_of_ms = 200;
+        current.limit = 1;
+        current.candidate_limit = 1;
+        current.lexical = false;
+        current.graph_depth = 0;
+        let current_result = block_on(db.recall(current.clone())).unwrap();
+        assert_eq!(current_result.evidence[0].node.id, active);
+
+        let mut historical = current.clone();
+        historical.as_of_ms = 50;
+        let historical_result = block_on(db.recall(historical.clone())).unwrap();
+        assert_eq!(historical_result.evidence[0].node.id, retired);
+
+        current.min_vector_similarity = Some(0.95);
+        assert!(block_on(db.recall(current)).unwrap().evidence.is_empty());
+        let mut lexical = RecallRequest::new("active vector memory");
+        lexical.as_of_ms = 200;
+        lexical.min_vector_similarity = Some(0.95);
+        lexical.graph_depth = 0;
+        let lexical = block_on(db.recall(lexical)).unwrap();
+        assert_eq!(lexical.evidence[0].node.id, active);
+        assert!(lexical.evidence[0].vectors.is_empty());
+        historical.min_vector_similarity = Some(0.95);
+        assert_eq!(
+            block_on(db.recall(historical)).unwrap().evidence[0]
+                .node
+                .id,
+            retired
+        );
+
+        let mut invalid = RecallRequest::new("invalid threshold");
+        invalid.min_vector_similarity = Some(f32::NAN);
+        let error = block_on(db.recall(invalid)).unwrap_err();
+        assert!(error.to_string().contains("min_vector_similarity"));
+    }
+
+    #[test]
+    fn zero_norm_embeddings_are_rejected_for_nodes_and_recall_queries() {
+        let dir = tempdir().unwrap();
+        let clients = ClientRegistry::new();
+        clients
+            .register_embedding(
+                "zero-client",
+                Arc::new(FixedEmbedding {
+                    vector: vec![0.0, 0.0],
+                    projection: None,
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                }),
+            )
+            .unwrap();
+        let profile = MemoryProfile {
+            version: 1,
+            revision: 1,
+            embedding_profiles: vec![embedding_profile(
+                "zero-query",
+                "zero-client",
+                "recall-model",
+                2,
+            )],
+            dreamer: None,
+            lawyer: None,
+        };
+        let db = Database::builder(dir.path())
+            .clients(clients)
+            .profile(profile)
+            .build()
+            .unwrap();
+
+        let invalid = NodeBuilder::new(NodeKind::Fact)
+            .text("invalid zero vector")
+            .embedding("recall-model", vec![0.0, 0.0])
+            .build();
+        let invalid_id = invalid.id;
+        let error = db.insert(invalid).unwrap_err();
+        assert!(error.to_string().contains("non-zero L2 norm"));
+        assert!(db.get(invalid_id).unwrap().is_none());
+
+        db.insert(
+            NodeBuilder::new(NodeKind::Fact)
+                .text("valid vector")
+                .embedding("recall-model", vec![1.0, 0.0])
+                .build(),
+        )
+        .unwrap();
+        let mut request = RecallRequest::new("zero query");
+        request.lexical = false;
+        request.graph_depth = 0;
+        request.min_vector_similarity = Some(0.9);
+        let error = block_on(db.recall(request)).unwrap_err();
+        assert!(error.to_string().contains("non-zero L2 norm"));
+    }
+
+    #[test]
+    fn retract_is_revision_checked_idempotent_and_persistent() {
+        let dir = tempdir().unwrap();
+        let id;
+        let retracted_at;
+        let retracted_revision;
+        {
+            let db = Database::open(dir.path()).unwrap();
+            id = db
+                .insert(
+                    NodeBuilder::new(NodeKind::Fact)
+                        .text("temporary preference")
+                        .build(),
+                )
+                .unwrap();
+            let revision = db.get(id).unwrap().unwrap().revision;
+
+            let stale = db
+                .retract(id, Some(revision + 1), "stale request", Default::default())
+                .unwrap_err();
+            assert!(stale.to_string().contains("stale node revision"));
+            assert_eq!(db.get(id).unwrap().unwrap().state, MemoryState::Active);
+
+            let retracted = db
+                .retract(id, Some(revision), "user requested", Default::default())
+                .unwrap();
+            assert_eq!(retracted.state, MemoryState::Retracted);
+            retracted_at = retracted.valid_to_ms.unwrap();
+            retracted_revision = retracted.revision;
+            assert!(retracted_revision > revision);
+
+            let recalled = block_on(db.recall(RecallRequest::new("temporary preference"))).unwrap();
+            assert!(recalled.evidence.is_empty());
+
+            let repeated = db.retract(id, None, "retry", Default::default()).unwrap();
+            assert_eq!(repeated.revision, retracted_revision);
+            assert_eq!(repeated.valid_to_ms, Some(retracted_at));
+        }
+
+        let db = Database::open(dir.path()).unwrap();
+        let retracted = db.get(id).unwrap().unwrap();
+        assert_eq!(retracted.state, MemoryState::Retracted);
+        assert_eq!(retracted.valid_to_ms, Some(retracted_at));
+        assert_eq!(retracted.revision, retracted_revision);
+    }
+
+    #[test]
+    fn retracting_pending_memory_keeps_its_historical_interval_empty() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let mut pending = NodeBuilder::new(NodeKind::Fact)
+            .text("never published")
+            .created_at(10)
+            .build();
+        pending.state = MemoryState::Pending;
+        pending.valid_from_ms = Some(10);
+        let id = db.insert(pending).unwrap();
+
+        let retracted = db
+            .retract(id, None, "discard staging", Default::default())
+            .unwrap();
+        assert_eq!(retracted.state, MemoryState::Retracted);
+        assert_eq!(retracted.valid_from_ms, retracted.valid_to_ms);
+        assert!(!retracted.is_valid_at(10));
+        assert!(!retracted.is_valid_at(retracted.valid_to_ms.unwrap()));
     }
 
     #[test]
@@ -1623,6 +2886,260 @@ mod agent_memory {
         db.apply_proposal(fresh_proposal, Default::default())
             .unwrap();
         assert_eq!(db.get(id).unwrap().unwrap().state, MemoryState::Retracted);
+    }
+
+    #[test]
+    fn proposal_apply_and_reject_are_serializable() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::open(dir.path()).unwrap());
+        for index in 0..16 {
+            let node_id = db
+                .insert(
+                    NodeBuilder::new(NodeKind::Fact)
+                        .text(format!("proposal race {index}"))
+                        .build(),
+                )
+                .unwrap();
+            let revision = db.get(node_id).unwrap().unwrap().revision;
+            let proposal = pending_state_proposal(node_id, revision, MemoryState::Retracted);
+            let proposal_id = proposal.id;
+            db.runtime_store
+                .put_proposal(0, proposal_id, &proposal)
+                .unwrap();
+
+            let barrier = Arc::new(Barrier::new(3));
+            let apply = {
+                let db = Arc::clone(&db);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.apply_proposal(proposal_id, Default::default())
+                })
+            };
+            let reject = {
+                let db = Arc::clone(&db);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.reject_proposal(proposal_id, Default::default())
+                })
+            };
+            barrier.wait();
+            let apply = apply.join().unwrap();
+            let reject = reject.join().unwrap();
+            assert_ne!(apply.is_ok(), reject.is_ok());
+
+            let status = db.proposal(proposal_id).unwrap().unwrap().status;
+            let state = db.get(node_id).unwrap().unwrap().state;
+            match status {
+                ChangeProposalStatus::Applied => assert_eq!(state, MemoryState::Retracted),
+                ChangeProposalStatus::Rejected => assert_eq!(state, MemoryState::Active),
+                other => panic!("unexpected terminal proposal status: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn proposal_revision_validation_and_node_update_are_serializable() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::open(dir.path()).unwrap());
+        for index in 0..16 {
+            let node_id = db
+                .insert(
+                    NodeBuilder::new(NodeKind::Fact)
+                        .text(format!("before proposal race {index}"))
+                        .build(),
+                )
+                .unwrap();
+            let original = db.get(node_id).unwrap().unwrap();
+            let proposal =
+                pending_state_proposal(node_id, original.revision, MemoryState::Retracted);
+            let proposal_id = proposal.id;
+            db.runtime_store
+                .put_proposal(0, proposal_id, &proposal)
+                .unwrap();
+            let mut replacement = original;
+            replacement.content = mmdb_core::Content::Text(format!("after proposal race {index}"));
+
+            let barrier = Arc::new(Barrier::new(3));
+            let apply = {
+                let db = Arc::clone(&db);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.apply_proposal(proposal_id, Default::default())
+                })
+            };
+            let insert = {
+                let db = Arc::clone(&db);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.insert(replacement)
+                })
+            };
+            barrier.wait();
+            let _ = apply.join().unwrap();
+            insert.join().unwrap().unwrap();
+
+            let final_node = db.get(node_id).unwrap().unwrap();
+            assert!(matches!(
+                &final_node.content,
+                mmdb_core::Content::Text(text) if text == &format!("after proposal race {index}")
+            ));
+            assert_eq!(final_node.state, MemoryState::Active);
+            assert!(matches!(
+                db.proposal(proposal_id).unwrap().unwrap().status,
+                ChangeProposalStatus::Applied | ChangeProposalStatus::Stale
+            ));
+        }
+    }
+
+    #[test]
+    fn reopen_resumes_interrupted_multi_change_proposal_and_repairs_indexes() {
+        let dir = tempdir().unwrap();
+        let proposal_id = Ulid::new();
+        let first_id;
+        let second_id;
+        {
+            let db = Database::open(dir.path()).unwrap();
+            first_id = db
+                .insert(
+                    NodeBuilder::new(NodeKind::Fact)
+                        .text("first interrupted change")
+                        .embedding("proposal-model", vec![1.0, 0.0])
+                        .build(),
+                )
+                .unwrap();
+            second_id = db
+                .insert(
+                    NodeBuilder::new(NodeKind::Fact)
+                        .text("second interrupted change")
+                        .build(),
+                )
+                .unwrap();
+            let first_revision = db.get(first_id).unwrap().unwrap().revision;
+            let second_revision = db.get(second_id).unwrap().unwrap().revision;
+            let proposal = ChangeProposal {
+                id: proposal_id,
+                reason: "recover partial multi-change apply".into(),
+                changes: vec![
+                    ProposedChange::SetState {
+                        node_id: first_id,
+                        expected_revision: first_revision,
+                        state: MemoryState::Retracted,
+                    },
+                    ProposedChange::SetValidity {
+                        node_id: second_id,
+                        expected_revision: second_revision,
+                        valid_from_ms: Some(10),
+                        valid_to_ms: Some(20),
+                    },
+                ],
+                status: ChangeProposalStatus::Applying,
+                source_operation: None,
+                created_at_ms: crate::now_ms(),
+                applied_at_ms: None,
+                next_change: 0,
+            };
+            db.runtime_store
+                .put_proposal(0, proposal_id, &proposal)
+                .unwrap();
+
+            // Simulate a crash after the source node commit but before its
+            // vector reindex and before the proposal cursor checkpoint.
+            let mut first = db.get(first_id).unwrap().unwrap();
+            first.state = MemoryState::Retracted;
+            first.valid_to_ms = Some(crate::now_ms());
+            first.revision = first_revision + 1;
+            db.storage.put_node(&first).unwrap();
+            db.vector_store
+                .delete(0, "proposal-model", first_id)
+                .unwrap();
+            assert!(db
+                .vector_store
+                .search(0, "proposal-model", &[1.0, 0.0], 4)
+                .unwrap()
+                .is_empty());
+        }
+
+        let db = Database::open(dir.path()).unwrap();
+        let proposal = db.proposal(proposal_id).unwrap().unwrap();
+        assert_eq!(proposal.status, ChangeProposalStatus::Applied);
+        assert_eq!(proposal.next_change, 2);
+        assert!(proposal.applied_at_ms.is_some());
+        assert_eq!(db.get(first_id).unwrap().unwrap().state, MemoryState::Retracted);
+        let second = db.get(second_id).unwrap().unwrap();
+        assert_eq!(second.valid_from_ms, Some(10));
+        assert_eq!(second.valid_to_ms, Some(20));
+        assert!(db
+            .vector_store
+            .search(0, "proposal-model", &[1.0, 0.0], 4)
+            .unwrap()
+            .iter()
+            .any(|hit| hit.node_id == first_id));
+        assert!(db
+            .audit_records(AuditFilter {
+                action: Some(AuditAction::Repair),
+                ..AuditFilter::default()
+            })
+            .unwrap()
+            .iter()
+            .any(|record| record.name == "repair_proposal"));
+    }
+
+    #[test]
+    fn applying_proposal_revalidates_edge_endpoints_before_unapplied_edge() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let source = db
+            .insert(NodeBuilder::new(NodeKind::Fact).text("edge source").build())
+            .unwrap();
+        let destination = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("edge destination")
+                    .build(),
+            )
+            .unwrap();
+        let source_revision = db.get(source).unwrap().unwrap().revision;
+        let destination_revision = db.get(destination).unwrap().unwrap().revision;
+        let proposal_id = Ulid::new();
+        let proposal = ChangeProposal {
+            id: proposal_id,
+            reason: "resume an interrupted edge change".into(),
+            changes: vec![ProposedChange::AddEdge {
+                edge: edge(source, destination, "causes", crate::now_ms()),
+                expected_src_revision: source_revision,
+                expected_dst_revision: destination_revision,
+            }],
+            status: ChangeProposalStatus::Applying,
+            source_operation: None,
+            created_at_ms: crate::now_ms(),
+            applied_at_ms: None,
+            next_change: 0,
+        };
+        db.runtime_store
+            .put_proposal(0, proposal_id, &proposal)
+            .unwrap();
+
+        // Simulate an endpoint edit after a transient failure but before the
+        // edge was inserted and the Applying proposal was retried.
+        let mut changed_source = db.get(source).unwrap().unwrap();
+        changed_source.content = mmdb_core::Content::Text("changed edge source".into());
+        db.insert(changed_source).unwrap();
+
+        let error = db
+            .apply_proposal(proposal_id, Default::default())
+            .unwrap_err();
+        assert!(error.to_string().contains("edge source"));
+        assert!(db
+            .neighbours_out(source, Some("causes"))
+            .unwrap()
+            .is_empty());
+        let proposal = db.proposal(proposal_id).unwrap().unwrap();
+        assert_eq!(proposal.status, ChangeProposalStatus::Applying);
+        assert_eq!(proposal.next_change, 0);
     }
 
     #[test]
@@ -1777,6 +3294,378 @@ mod agent_memory {
     }
 
     #[test]
+    fn dream_revert_refuses_to_erase_an_edited_output_node() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let run_id = Ulid::new();
+        let created_id = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("dreamed fact")
+                    .metadata("dream_run_id", serde_json::json!(run_id))
+                    .build(),
+            )
+            .unwrap();
+        let created_revision = db.get(created_id).unwrap().unwrap().revision;
+        let run = DreamRun {
+            id: run_id,
+            profile_id: "test".into(),
+            profile_revision: "r1".into(),
+            source_hash: "edited-output".into(),
+            source_ids: Vec::new(),
+            created_ids: vec![created_id],
+            created_revisions: BTreeMap::from([(created_id, created_revision)]),
+            created_fingerprints: BTreeMap::new(),
+            added_edges: Vec::new(),
+            superseded: Vec::new(),
+            explanation: "edited output guard".into(),
+            status: DreamRunStatus::Completed,
+            created_at_ms: crate::now_ms(),
+            completed_at_ms: Some(crate::now_ms()),
+            error: None,
+        };
+        db.runtime_store.put_dream_run(0, run_id, &run).unwrap();
+
+        let mut edited = db.get(created_id).unwrap().unwrap();
+        edited.content = mmdb_core::Content::Text("human-edited fact".into());
+        db.insert(edited).unwrap();
+
+        let error = db.revert_dream(run_id, Default::default()).unwrap_err();
+        assert!(error.to_string().contains("changed after compaction"));
+        let preserved = db.get(created_id).unwrap().unwrap();
+        assert_eq!(preserved.state, MemoryState::Active);
+        assert!(matches!(
+            preserved.content,
+            mmdb_core::Content::Text(ref text) if text == "human-edited fact"
+        ));
+        assert_eq!(
+            db.dream_run(run_id).unwrap().unwrap().status,
+            DreamRunStatus::Completed
+        );
+    }
+
+    #[test]
+    fn dream_revert_refuses_to_remove_an_edited_edge() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let run_id = Ulid::new();
+        let source_id = db
+            .insert(NodeBuilder::new(NodeKind::Episode).text("source").build())
+            .unwrap();
+        let created_id = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("dreamed fact")
+                    .metadata("dream_run_id", serde_json::json!(run_id))
+                    .build(),
+            )
+            .unwrap();
+        db.add_edge(edge(created_id, source_id, "derived_from", crate::now_ms()))
+            .unwrap();
+        let dreamed_edge = db
+            .neighbours_out(created_id, Some("derived_from"))
+            .unwrap()
+            .pop()
+            .unwrap();
+        let run = DreamRun {
+            id: run_id,
+            profile_id: "test".into(),
+            profile_revision: "r1".into(),
+            source_hash: "edited-edge".into(),
+            source_ids: vec![source_id],
+            created_ids: vec![created_id],
+            created_revisions: BTreeMap::from([(
+                created_id,
+                db.get(created_id).unwrap().unwrap().revision,
+            )]),
+            created_fingerprints: BTreeMap::new(),
+            added_edges: vec![dreamed_edge.clone()],
+            superseded: Vec::new(),
+            explanation: "edited edge guard".into(),
+            status: DreamRunStatus::Completed,
+            created_at_ms: crate::now_ms(),
+            completed_at_ms: Some(crate::now_ms()),
+            error: None,
+        };
+        db.runtime_store.put_dream_run(0, run_id, &run).unwrap();
+
+        let mut edited_edge = dreamed_edge;
+        edited_edge.weight = 0.25;
+        db.add_edge(edited_edge).unwrap();
+
+        let error = db.revert_dream(run_id, Default::default()).unwrap_err();
+        assert!(error.to_string().contains("changed after compaction"));
+        let preserved = db
+            .neighbours_out(created_id, Some("derived_from"))
+            .unwrap();
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(preserved[0].weight, 0.25);
+        assert_eq!(preserved[0].revision, 2);
+        assert_eq!(
+            db.dream_run(run_id).unwrap().unwrap().status,
+            DreamRunStatus::Completed
+        );
+    }
+
+    #[test]
+    fn dream_outputs_remain_pending_through_projection_and_changed_staging_is_preserved() {
+        let dir = tempdir().unwrap();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let clients = ClientRegistry::new();
+        clients
+            .register_embedding(
+                "blocking-embedding",
+                Arc::new(BlockingEmbedding {
+                    vector: vec![1.0, 0.0],
+                    projection: None,
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                }),
+            )
+            .unwrap();
+        clients
+            .register_agent(
+                "dream-client",
+                Arc::new(DynamicAgent {
+                    handler: Arc::new(|request| {
+                        let source = request.payload["sources"][0]["id"].clone();
+                        serde_json::json!({
+                            "nodes": [{
+                                "temporary_id": "summary",
+                                "kind": "Fact",
+                                "content": {"Text": "staged summary"},
+                                "source_citations": [source],
+                                "metadata": {}
+                            }],
+                            "edges": [],
+                            "supersede": [],
+                            "explanation": "staging integrity"
+                        })
+                    }),
+                }),
+            )
+            .unwrap();
+        let profile = MemoryProfile {
+            version: 1,
+            revision: 1,
+            embedding_profiles: vec![embedding_profile(
+                "blocking-profile",
+                "blocking-embedding",
+                "blocking-model",
+                2,
+            )],
+            dreamer: Some(DreamProfile {
+                id: "nightly".into(),
+                revision: "r1".into(),
+                client_id: "dream-client".into(),
+                agent_id: "dream-agent".into(),
+                model_id: "dream-model".into(),
+                prompt_version: "v1".into(),
+                response_schema: serde_json::json!({"type": "object"}),
+                turn_end_threshold: 32,
+                max_nodes: 128,
+                max_input_bytes: 256 * 1024,
+            }),
+            lawyer: None,
+        };
+        let db = Arc::new(
+            Database::builder(dir.path())
+                .clients(clients)
+                .profile(profile)
+                .build()
+                .unwrap(),
+        );
+        let source_id = db
+            .insert(
+                NodeBuilder::new(NodeKind::Episode)
+                    .text("raw source remains available")
+                    .build(),
+            )
+            .unwrap();
+        let maintenance = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || {
+                block_on(db.maintain(MaintenanceTrigger::Manual, Default::default()))
+            })
+        };
+
+        entered.wait();
+        let staged_run = db.dream_runs().unwrap().pop().unwrap();
+        assert_eq!(staged_run.status, DreamRunStatus::Pending);
+        let staged_id = staged_run.created_ids[0];
+        assert_eq!(db.get(staged_id).unwrap().unwrap().state, MemoryState::Pending);
+        assert_eq!(db.get(source_id).unwrap().unwrap().state, MemoryState::Active);
+
+        let mut edited = db.get(staged_id).unwrap().unwrap();
+        edited.content = mmdb_core::Content::Text("external edit during projection".into());
+        db.insert(edited).unwrap();
+        release.wait();
+
+        let error = maintenance.join().unwrap().unwrap_err();
+        assert!(error.to_string().contains("changed during projection"));
+        let run = db.dream_run(staged_run.id).unwrap().unwrap();
+        assert_eq!(run.status, DreamRunStatus::Failed);
+        assert!(run
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("preserved changed staging")));
+        let preserved = db.get(staged_id).unwrap().unwrap();
+        assert_eq!(preserved.state, MemoryState::Pending);
+        assert!(matches!(
+            preserved.content,
+            mmdb_core::Content::Text(ref text) if text == "external edit during projection"
+        ));
+        assert_eq!(db.get(source_id).unwrap().unwrap().state, MemoryState::Active);
+    }
+
+    #[test]
+    fn concurrent_dream_maintenance_serializes_validation_apply_and_checkpoints() {
+        let dir = tempdir().unwrap();
+        let client_barrier = Arc::new(Barrier::new(2));
+        let clients = ClientRegistry::new();
+        clients
+            .register_agent(
+                "dream-client",
+                Arc::new(DynamicAgent {
+                    handler: Arc::new({
+                        let client_barrier = Arc::clone(&client_barrier);
+                        move |request| {
+                            let source = request.payload["sources"][0]["id"].clone();
+                            client_barrier.wait();
+                            serde_json::json!({
+                                "nodes": [{
+                                    "temporary_id": "summary",
+                                    "kind": "Fact",
+                                    "content": {"Text": "one serialized summary"},
+                                    "source_citations": [source],
+                                    "metadata": {}
+                                }],
+                                "edges": [],
+                                "supersede": [],
+                                "explanation": "concurrent maintenance"
+                            })
+                        }
+                    }),
+                }),
+            )
+            .unwrap();
+        let profile = MemoryProfile {
+            version: 1,
+            revision: 1,
+            embedding_profiles: Vec::new(),
+            dreamer: Some(DreamProfile {
+                id: "nightly".into(),
+                revision: "r1".into(),
+                client_id: "dream-client".into(),
+                agent_id: "dream-agent".into(),
+                model_id: "dream-model".into(),
+                prompt_version: "v1".into(),
+                response_schema: serde_json::json!({"type": "object"}),
+                turn_end_threshold: 32,
+                max_nodes: 128,
+                max_input_bytes: 256 * 1024,
+            }),
+            lawyer: None,
+        };
+        let db = Arc::new(
+            Database::builder(dir.path())
+                .clients(clients)
+                .profile(profile)
+                .build()
+                .unwrap(),
+        );
+        db.insert(
+            NodeBuilder::new(NodeKind::Episode)
+                .text("concurrent source")
+                .build(),
+        )
+        .unwrap();
+
+        let runs = (0..2)
+            .map(|_| {
+                let db = Arc::clone(&db);
+                std::thread::spawn(move || {
+                    block_on(db.maintain(MaintenanceTrigger::Manual, Default::default()))
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = runs
+            .into_iter()
+            .map(|run| run.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|run| run.is_some()).count(), 1);
+        let persisted = db.dream_runs().unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].status, DreamRunStatus::Completed);
+        assert_eq!(persisted[0].created_ids.len(), 1);
+    }
+
+    #[test]
+    fn concurrent_dream_reverts_have_one_terminal_winner() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::open(dir.path()).unwrap());
+        for index in 0..8 {
+            let run_id = Ulid::new();
+            let created_id = db
+                .insert(
+                    NodeBuilder::new(NodeKind::Fact)
+                        .text(format!("dream output {index}"))
+                        .metadata("dream_run_id", serde_json::json!(run_id))
+                        .build(),
+                )
+                .unwrap();
+            let run = DreamRun {
+                id: run_id,
+                profile_id: "test".into(),
+                profile_revision: "r1".into(),
+                source_hash: format!("revert-race-{index}"),
+                source_ids: Vec::new(),
+                created_ids: vec![created_id],
+                created_revisions: BTreeMap::from([(
+                    created_id,
+                    db.get(created_id).unwrap().unwrap().revision,
+                )]),
+                created_fingerprints: BTreeMap::new(),
+                added_edges: Vec::new(),
+                superseded: Vec::new(),
+                explanation: "revert race".into(),
+                status: DreamRunStatus::Completed,
+                created_at_ms: crate::now_ms(),
+                completed_at_ms: Some(crate::now_ms()),
+                error: None,
+            };
+            db.runtime_store.put_dream_run(0, run_id, &run).unwrap();
+
+            let barrier = Arc::new(Barrier::new(3));
+            let reverts = (0..2)
+                .map(|_| {
+                    let db = Arc::clone(&db);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        db.revert_dream(run_id, Default::default())
+                    })
+                })
+                .collect::<Vec<_>>();
+            barrier.wait();
+            let results = reverts
+                .into_iter()
+                .map(|revert| revert.join().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+            assert_eq!(
+                db.dream_run(run_id).unwrap().unwrap().status,
+                DreamRunStatus::Reverted
+            );
+            assert_eq!(
+                db.get(created_id).unwrap().unwrap().state,
+                MemoryState::Retracted
+            );
+        }
+    }
+
+    #[test]
     fn reopen_repairs_incomplete_dream_staging() {
         let dir = tempdir().unwrap();
         let run_id = Ulid::new();
@@ -1798,6 +3687,14 @@ mod agent_memory {
                 source_hash: "incomplete".into(),
                 source_ids: Vec::new(),
                 created_ids: vec![staged_id],
+                created_revisions: BTreeMap::new(),
+                created_fingerprints: BTreeMap::from([(
+                    staged_id,
+                    crate::dream::dream_output_fingerprint(
+                        &db.get(staged_id).unwrap().unwrap(),
+                    )
+                    .unwrap(),
+                )]),
                 added_edges: Vec::new(),
                 superseded: Vec::new(),
                 explanation: "simulate interrupted staging".into(),

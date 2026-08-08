@@ -1,5 +1,5 @@
 use super::keys::*;
-use super::{EXACT_SEARCH_MAX_ROWS, HitFilter, VectorStore};
+use super::{HitFilter, VectorStore, EXACT_SEARCH_MAX_ROWS, MAX_HNSW_EF, MAX_SEARCH_RESULTS};
 use crate::{IndexKey, ScoredHit, VectorIndex};
 use fjall::PersistMode;
 use mmdb_core::{Error, Result};
@@ -14,9 +14,7 @@ impl VectorStore {
     /// Validate that a vector can be inserted into this `(tenant, model)`
     /// space without mutating graph points or persisted meta.
     pub fn validate_insert(&self, tenant: u32, model: &str, vector: &[f32]) -> Result<()> {
-        if vector.is_empty() {
-            return Err(Error::InvalidArgument("empty vector".into()));
-        }
+        validate_vector_values(vector)?;
         let key = IndexKey::new(tenant, model);
         if let Some(idx) = self.resolve_index(&key) {
             if idx.dim as usize != vector.len() {
@@ -31,20 +29,13 @@ impl VectorStore {
     }
 
     /// Batched insert. All entries land in a single fjall batch + persist.
-    pub fn insert_batch(
-        &self,
-        tenant: u32,
-        model: &str,
-        items: &[(Ulid, Vec<f32>)],
-    ) -> Result<()> {
+    pub fn insert_batch(&self, tenant: u32, model: &str, items: &[(Ulid, Vec<f32>)]) -> Result<()> {
         if items.is_empty() {
             return Ok(());
         }
         let dim = items[0].1.len();
-        if dim == 0 {
-            return Err(Error::InvalidArgument("empty vector".into()));
-        }
         for (_, v) in items {
+            validate_vector_values(v)?;
             if v.len() != dim {
                 return Err(Error::InvalidArgument(
                     "vectors in a batch must share dim".into(),
@@ -112,6 +103,12 @@ impl VectorStore {
         k: usize,
         filter: Option<&HitFilter<'a>>,
     ) -> Result<Vec<ScoredHit>> {
+        validate_vector_values(query)?;
+        if k > MAX_SEARCH_RESULTS {
+            return Err(Error::InvalidArgument(format!(
+                "vector search k must not exceed {MAX_SEARCH_RESULTS}"
+            )));
+        }
         let key = IndexKey::new(tenant, model);
         let Some(idx) = self.resolve_index(&key) else {
             return Ok(Vec::new());
@@ -129,8 +126,8 @@ impl VectorStore {
         }
 
         let over_fetch = if filter.is_some() { 4 } else { 1 };
-        let widened = (k * over_fetch).max(k);
-        let ef = (widened * 4).max(32);
+        let widened = k.saturating_mul(over_fetch).min(MAX_SEARCH_RESULTS).max(k);
+        let ef = widened.saturating_mul(4).clamp(32, MAX_HNSW_EF);
         let raw = idx.search(query, widened, ef);
 
         let mut out = Vec::with_capacity(k);
@@ -147,6 +144,9 @@ impl VectorStore {
             let mut buf = [0u8; 16];
             buf.copy_from_slice(&v);
             let node_id = Ulid(u128::from_be_bytes(buf));
+            if !self.stored_vector_is_normalizable(tenant, model, node_id)? {
+                continue;
+            }
             if let Some(f) = filter {
                 if !f(node_id) {
                     continue;
@@ -285,7 +285,7 @@ impl VectorStore {
             let Some((internal_id, vector)) = decode_meta_value(&value) else {
                 continue;
             };
-            if vector.len() != query.len() {
+            if vector.len() != query.len() || validate_vector_values(&vector).is_err() {
                 continue;
             }
             let tomb_key = tomb_key_bytes(tenant, model, internal_id);
@@ -313,6 +313,25 @@ impl VectorStore {
         scored.truncate(k);
         Ok(scored)
     }
+
+    fn stored_vector_is_normalizable(
+        &self,
+        tenant: u32,
+        model: &str,
+        node_id: Ulid,
+    ) -> Result<bool> {
+        let Some(value) = self
+            .meta
+            .get(meta_key_bytes(tenant, model, node_id))
+            .map_err(|error| Error::Storage(error.to_string()))?
+        else {
+            return Ok(false);
+        };
+        let Some((_, vector)) = decode_meta_value(&value) else {
+            return Ok(false);
+        };
+        Ok(validate_vector_values(&vector).is_ok())
+    }
 }
 
 /// Helper: atomically allocate a fresh internal_id from the index's counter
@@ -338,7 +357,27 @@ fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
         nb += (*y as f64) * (*y as f64);
     }
     if na == 0.0 || nb == 0.0 {
-        return 0.0;
+        return 2.0;
     }
     (1.0 - dot / (na * nb).sqrt()).max(0.0) as f32
+}
+
+fn validate_vector_values(vector: &[f32]) -> Result<()> {
+    if vector.is_empty() {
+        return Err(Error::InvalidArgument("empty vector".into()));
+    }
+    if vector.iter().any(|value| !value.is_finite()) {
+        return Err(Error::InvalidArgument(
+            "vector values must all be finite".into(),
+        ));
+    }
+    let norm_squared = vector
+        .iter()
+        .fold(0.0_f32, |sum, value| sum + value * value);
+    if !norm_squared.is_finite() || norm_squared <= 0.0 {
+        return Err(Error::InvalidArgument(
+            "vector must have a finite, non-zero L2 norm".into(),
+        ));
+    }
+    Ok(())
 }

@@ -99,7 +99,13 @@ impl LexicalIndex {
         self.persist()
     }
 
-    pub(crate) fn search(&self, tenant: u32, query: &str, limit: usize) -> Result<Vec<LexicalHit>> {
+    pub(crate) fn search_with_filter(
+        &self,
+        tenant: u32,
+        query: &str,
+        limit: usize,
+        filter: impl Fn(Ulid) -> bool,
+    ) -> Result<Vec<LexicalHit>> {
         let query_terms: BTreeSet<String> = tokenize(query).into_iter().collect();
         if query_terms.is_empty() || limit == 0 {
             return Ok(Vec::new());
@@ -134,6 +140,7 @@ impl LexicalIndex {
         }
         let mut hits: Vec<_> = scores
             .into_iter()
+            .filter(|(node_id, _)| filter(*node_id))
             .map(|(node_id, (score, terms))| LexicalHit {
                 node_id,
                 score,
