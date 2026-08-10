@@ -54,11 +54,13 @@ mod db;
 mod dream;
 mod embedder;
 mod lexical;
+pub mod native_memory;
 mod query_impl;
 mod recall;
 mod runtime;
 mod search;
 mod state;
+pub mod store_format;
 #[cfg(test)]
 mod tests;
 
@@ -85,4 +87,5 @@ pub use runtime::{
     MemoryProfile, ProjectionState, ProjectionStatus, SupportedContent,
 };
 pub use search::{Hit, HybridOpts, VectorFilter};
-pub use state::{StateEntry, StateMutation, StateStore};
+pub use state::{NamespacedStateMutation, StateEntry, StateMutation, StateStore};
+pub use store_format::StoreFormatDescriptor;

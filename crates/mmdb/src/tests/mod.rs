@@ -1,6 +1,6 @@
 use crate::builder::{now_ms, NodeBuilder};
 use crate::db::Database;
-use crate::embedder::{DatabaseConfig, Embedder, DEFAULT_MODEL, DEFAULT_TENANT, EmbedFuture};
+use crate::embedder::{DatabaseConfig, EmbedFuture, Embedder, DEFAULT_MODEL, DEFAULT_TENANT};
 use crate::search::{Hit, HybridOpts, VectorFilter};
 use mmdb_core::{Content, Edge, NodeKind, Result};
 use mmdb_query::{
@@ -161,7 +161,11 @@ fn access_timestamp_is_monotonic_and_hard_delete_clears_stats() {
     let dir = tempdir().unwrap();
     let db = Database::open(dir.path()).unwrap();
     let id = db
-        .insert(NodeBuilder::new(NodeKind::Fact).text("accessed fact").build())
+        .insert(
+            NodeBuilder::new(NodeKind::Fact)
+                .text("accessed fact")
+                .build(),
+        )
         .unwrap();
     let future = now_ms() + 60_000;
 
@@ -293,12 +297,7 @@ fn concurrent_retract_and_delete_never_resurrect_a_node() {
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
                 barrier.wait();
-                db.retract(
-                    id,
-                    Some(revision),
-                    "concurrent delete",
-                    Default::default(),
-                )
+                db.retract(id, Some(revision), "concurrent delete", Default::default())
             })
         };
         let deletion = {
@@ -718,12 +717,9 @@ fn execute_query_embeds_text_vector_ref_with_configured_embedder() {
         tenant: DEFAULT_TENANT,
         default_model: "hash-32".into(),
     };
-    let db = Database::open_with_embedder(
-        dir.path(),
-        cfg,
-        Box::new(HashEmbedder::new("hash-32", 32)),
-    )
-    .unwrap();
+    let db =
+        Database::open_with_embedder(dir.path(), cfg, Box::new(HashEmbedder::new("hash-32", 32)))
+            .unwrap();
     let keep = db
         .insert_text(NodeKind::Fact, "quarterly revenue memo")
         .unwrap();
@@ -1228,12 +1224,9 @@ fn auto_embeds_text_on_insert() {
         tenant: DEFAULT_TENANT,
         default_model: "hash-32".into(),
     };
-    let db = Database::open_with_embedder(
-        dir.path(),
-        cfg,
-        Box::new(HashEmbedder::new("hash-32", 32)),
-    )
-    .unwrap();
+    let db =
+        Database::open_with_embedder(dir.path(), cfg, Box::new(HashEmbedder::new("hash-32", 32)))
+            .unwrap();
     assert!(db.has_embedder());
 
     let id = db
@@ -1257,12 +1250,9 @@ fn explicit_embedding_overrides_auto() {
         tenant: DEFAULT_TENANT,
         default_model: "hash-32".into(),
     };
-    let db = Database::open_with_embedder(
-        dir.path(),
-        cfg,
-        Box::new(HashEmbedder::new("hash-32", 32)),
-    )
-    .unwrap();
+    let db =
+        Database::open_with_embedder(dir.path(), cfg, Box::new(HashEmbedder::new("hash-32", 32)))
+            .unwrap();
     // Pre-attach an embedding under the embedder's model -> auto-embed skipped.
     let mut v = vec![0.0f32; 32];
     v[0] = 1.0;
@@ -1292,11 +1282,8 @@ fn open_with_embedder_rejects_model_mismatch() {
         default_model: "configured".into(),
     };
 
-    let result = Database::open_with_embedder(
-        dir.path(),
-        cfg,
-        Box::new(HashEmbedder::new("actual", 32)),
-    );
+    let result =
+        Database::open_with_embedder(dir.path(), cfg, Box::new(HashEmbedder::new("actual", 32)));
     let err = match result {
         Ok(_) => panic!("expected model mismatch to be rejected"),
         Err(err) => err,
@@ -1359,8 +1346,7 @@ fn async_text_paths_use_async_embedder() {
         tenant: DEFAULT_TENANT,
         default_model: "async-4".into(),
     };
-    let db =
-        Database::open_with_embedder(dir.path(), cfg, Box::new(AsyncOnlyEmbedder)).unwrap();
+    let db = Database::open_with_embedder(dir.path(), cfg, Box::new(AsyncOnlyEmbedder)).unwrap();
 
     let id = block_on(db.insert_text_async(NodeKind::Fact, "async memory")).unwrap();
     let got = db.get(id).unwrap().unwrap();
@@ -1509,7 +1495,13 @@ fn insert_blob_stores_artifact_and_reads_stream() {
         .unwrap();
 
     let node = db.get(id).unwrap().unwrap();
-    let Content::Blob { hash, size, mime, inline } = node.content else {
+    let Content::Blob {
+        hash,
+        size,
+        mime,
+        inline,
+    } = node.content
+    else {
         panic!("expected blob content");
     };
     assert_eq!(size, 12);
@@ -1538,11 +1530,10 @@ mod agent_memory {
     use super::{block_on, Database, NodeBuilder};
     use crate::{
         AgentClient, AgentRequest, AgentResponse, AuditAction, AuditFilter, ChangeProposal,
-        ChangeProposalStatus, ClientFuture, ClientRegistry, DreamProfile, DreamRun,
-        DreamRunStatus, EmbeddingClient, EmbeddingDistance, EmbeddingInput, EmbeddingOutput,
-        EmbeddingProfile, LawyerFailureMode, LawyerProfile, MaintenanceTrigger, MemoryProfile,
-        ProjectionState, ProjectionStatus, ProposedChange, RecallRequest, RecallStatus,
-        SupportedContent,
+        ChangeProposalStatus, ClientFuture, ClientRegistry, DreamProfile, DreamRun, DreamRunStatus,
+        EmbeddingClient, EmbeddingDistance, EmbeddingInput, EmbeddingOutput, EmbeddingProfile,
+        LawyerFailureMode, LawyerProfile, MaintenanceTrigger, MemoryProfile, ProjectionState,
+        ProjectionStatus, ProposedChange, RecallRequest, RecallStatus, SupportedContent,
     };
     use fjall::PersistMode;
     use mmdb_core::{Edge, MemoryState, NodeKind};
@@ -1970,7 +1961,8 @@ mod agent_memory {
         let active_profile = db.memory_profile().unwrap().embedding_profiles.remove(0);
         assert!(status.is_current_for(&active_profile, &node));
 
-        node.metadata.insert("touch".into(), serde_json::json!(true));
+        node.metadata
+            .insert("touch".into(), serde_json::json!(true));
         db.insert(node).unwrap();
         let node = db.get(report.node_id).unwrap().unwrap();
         assert_ne!(node.revision, status.node_revision);
@@ -2127,11 +2119,7 @@ mod agent_memory {
                 .unwrap(),
         );
         let id = db
-            .insert(
-                NodeBuilder::new(NodeKind::Fact)
-                    .text("old content")
-                    .build(),
-            )
+            .insert(NodeBuilder::new(NodeKind::Fact).text("old content").build())
             .unwrap();
         let projection = {
             let db = Arc::clone(&db);
@@ -2309,13 +2297,8 @@ mod agent_memory {
                     .build(),
             )
             .unwrap();
-        db.add_edge(edge(
-            verified,
-            source,
-            "derived_from",
-            crate::now_ms(),
-        ))
-        .unwrap();
+        db.add_edge(edge(verified, source, "derived_from", crate::now_ms()))
+            .unwrap();
         for index in 0..30 {
             db.insert(
                 NodeBuilder::new(NodeKind::Fact)
@@ -2528,8 +2511,8 @@ mod agent_memory {
             .insert(mmdb_storage::keys::node_key(0, id), b"{".as_slice())
             .unwrap();
 
-        let error = block_on(db.recall(RecallRequest::new("corrupt lexical candidate")))
-            .unwrap_err();
+        let error =
+            block_on(db.recall(RecallRequest::new("corrupt lexical candidate"))).unwrap_err();
         assert!(error.to_string().contains("json error"));
     }
 
@@ -2659,9 +2642,7 @@ mod agent_memory {
         assert!(lexical.evidence[0].vectors.is_empty());
         historical.min_vector_similarity = Some(0.95);
         assert_eq!(
-            block_on(db.recall(historical)).unwrap().evidence[0]
-                .node
-                .id,
+            block_on(db.recall(historical)).unwrap().evidence[0].node.id,
             retired
         );
 
@@ -3068,7 +3049,10 @@ mod agent_memory {
         assert_eq!(proposal.status, ChangeProposalStatus::Applied);
         assert_eq!(proposal.next_change, 2);
         assert!(proposal.applied_at_ms.is_some());
-        assert_eq!(db.get(first_id).unwrap().unwrap().state, MemoryState::Retracted);
+        assert_eq!(
+            db.get(first_id).unwrap().unwrap().state,
+            MemoryState::Retracted
+        );
         let second = db.get(second_id).unwrap().unwrap();
         assert_eq!(second.valid_from_ms, Some(10));
         assert_eq!(second.valid_to_ms, Some(20));
@@ -3395,9 +3379,7 @@ mod agent_memory {
 
         let error = db.revert_dream(run_id, Default::default()).unwrap_err();
         assert!(error.to_string().contains("changed after compaction"));
-        let preserved = db
-            .neighbours_out(created_id, Some("derived_from"))
-            .unwrap();
+        let preserved = db.neighbours_out(created_id, Some("derived_from")).unwrap();
         assert_eq!(preserved.len(), 1);
         assert_eq!(preserved[0].weight, 0.25);
         assert_eq!(preserved[0].revision, 2);
@@ -3494,8 +3476,14 @@ mod agent_memory {
         let staged_run = db.dream_runs().unwrap().pop().unwrap();
         assert_eq!(staged_run.status, DreamRunStatus::Pending);
         let staged_id = staged_run.created_ids[0];
-        assert_eq!(db.get(staged_id).unwrap().unwrap().state, MemoryState::Pending);
-        assert_eq!(db.get(source_id).unwrap().unwrap().state, MemoryState::Active);
+        assert_eq!(
+            db.get(staged_id).unwrap().unwrap().state,
+            MemoryState::Pending
+        );
+        assert_eq!(
+            db.get(source_id).unwrap().unwrap().state,
+            MemoryState::Active
+        );
 
         let mut edited = db.get(staged_id).unwrap().unwrap();
         edited.content = mmdb_core::Content::Text("external edit during projection".into());
@@ -3516,7 +3504,10 @@ mod agent_memory {
             preserved.content,
             mmdb_core::Content::Text(ref text) if text == "external edit during projection"
         ));
-        assert_eq!(db.get(source_id).unwrap().unwrap().state, MemoryState::Active);
+        assert_eq!(
+            db.get(source_id).unwrap().unwrap().state,
+            MemoryState::Active
+        );
     }
 
     #[test]
@@ -3690,10 +3681,8 @@ mod agent_memory {
                 created_revisions: BTreeMap::new(),
                 created_fingerprints: BTreeMap::from([(
                     staged_id,
-                    crate::dream::dream_output_fingerprint(
-                        &db.get(staged_id).unwrap().unwrap(),
-                    )
-                    .unwrap(),
+                    crate::dream::dream_output_fingerprint(&db.get(staged_id).unwrap().unwrap())
+                        .unwrap(),
                 )]),
                 added_edges: Vec::new(),
                 superseded: Vec::new(),
@@ -3810,7 +3799,9 @@ fn inserting_node_with_existing_blob_reference_increments_refcount() {
         )
         .unwrap();
     let (hash, size, mime) = match db.get(first).unwrap().unwrap().content {
-        Content::Blob { hash, size, mime, .. } => (hash, size, mime),
+        Content::Blob {
+            hash, size, mime, ..
+        } => (hash, size, mime),
         _ => panic!("expected blob content"),
     };
 
@@ -3842,11 +3833,20 @@ fn inlined_small_blob_refcount_works_uniformly_and_get_shortcircuits() {
     // A small (<=INLINE_THRESHOLD) payload — must be inlined into the node.
     let small = vec![7u8; 1024];
     let id = db
-        .insert_blob(NodeKind::Artifact, Cursor::new(small.clone()), "application/octet-stream")
+        .insert_blob(
+            NodeKind::Artifact,
+            Cursor::new(small.clone()),
+            "application/octet-stream",
+        )
         .unwrap();
     let node = db.get(id).unwrap().unwrap();
     match node.content {
-        Content::Blob { hash, size, inline: Some(bytes), .. } => {
+        Content::Blob {
+            hash,
+            size,
+            inline: Some(bytes),
+            ..
+        } => {
             assert_eq!(size as usize, small.len());
             assert_eq!(bytes, small);
             assert!(size as usize <= INLINE_THRESHOLD);
@@ -3867,7 +3867,11 @@ fn inlined_small_blob_refcount_works_uniformly_and_get_shortcircuits() {
     // A large (>INLINE_THRESHOLD) payload — must NOT be inlined.
     let big = vec![9u8; INLINE_THRESHOLD + 1];
     let id2 = db
-        .insert_blob(NodeKind::Artifact, Cursor::new(big.clone()), "application/octet-stream")
+        .insert_blob(
+            NodeKind::Artifact,
+            Cursor::new(big.clone()),
+            "application/octet-stream",
+        )
         .unwrap();
     let node2 = db.get(id2).unwrap().unwrap();
     match node2.content {

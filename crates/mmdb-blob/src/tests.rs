@@ -83,14 +83,8 @@ fn small_blob_put_stream_returns_inlined_small() {
 fn gc_clears_only_refcount_zero() {
     let dir = tempdir().unwrap();
     let store = BlobStore::open(dir.path()).unwrap();
-    let x = store
-        .put_stream(Cursor::new(b"x"))
-        .unwrap()
-        .into_ref();
-    let y = store
-        .put_stream(Cursor::new(b"y"))
-        .unwrap()
-        .into_ref();
+    let x = store.put_stream(Cursor::new(b"x")).unwrap().into_ref();
+    let y = store.put_stream(Cursor::new(b"y")).unwrap().into_ref();
     store.dec_ref(&x.hash).unwrap();
     assert_eq!(store.total_tracked().unwrap(), 2);
     let removed = store.gc().unwrap();

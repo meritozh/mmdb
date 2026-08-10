@@ -87,7 +87,12 @@ impl MetaStore {
     /// Insert a brand-new blob entry with refcount = 1.
     pub(crate) fn insert_new(&self, hash: &[u8; 32], size: u64, chunked: bool) -> Result<()> {
         let key = fs::hex_hash(hash);
-        let val = BlobMeta { refcount: 1, size, chunked }.encode();
+        let val = BlobMeta {
+            refcount: 1,
+            size,
+            chunked,
+        }
+        .encode();
         self.meta
             .insert(key, val.as_slice())
             .map_err(|e| Error::Storage(format!("insert meta: {e}")))?;
@@ -112,9 +117,8 @@ impl MetaStore {
             .get(&key)
             .map_err(|e| Error::Storage(format!("inc_ref get: {e}")))?
             .ok_or(Error::NotFound)?;
-        let mut m = BlobMeta::decode(&existing).ok_or_else(|| {
-            Error::Storage(format!("corrupt metadata for {key}"))
-        })?;
+        let mut m = BlobMeta::decode(&existing)
+            .ok_or_else(|| Error::Storage(format!("corrupt metadata for {key}")))?;
         m.refcount = m.refcount.saturating_add(1);
         self.meta
             .insert(key, m.encode().as_slice())
@@ -130,9 +134,8 @@ impl MetaStore {
             .get(&key)
             .map_err(|e| Error::Storage(format!("dec_ref get: {e}")))?
             .ok_or(Error::NotFound)?;
-        let mut m = BlobMeta::decode(&existing).ok_or_else(|| {
-            Error::Storage(format!("corrupt metadata for {key}"))
-        })?;
+        let mut m = BlobMeta::decode(&existing)
+            .ok_or_else(|| Error::Storage(format!("corrupt metadata for {key}")))?;
         m.refcount = m.refcount.saturating_sub(1);
         self.meta
             .insert(key, m.encode().as_slice())
@@ -193,7 +196,11 @@ mod tests {
 
     #[test]
     fn encode_decode_roundtrip() {
-        let m = BlobMeta { refcount: 42, size: 123_456_789, chunked: true };
+        let m = BlobMeta {
+            refcount: 42,
+            size: 123_456_789,
+            chunked: true,
+        };
         let enc = m.encode();
         assert_eq!(BlobMeta::decode(&enc), Some(m));
         assert_eq!(BlobMeta::decode(&[0; 16]), None);

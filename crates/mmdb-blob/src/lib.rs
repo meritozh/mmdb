@@ -70,10 +70,7 @@ pub enum PutOutcome {
     /// Payload is small enough to inline. Bytes are returned.
     /// A metadata entry (refcount = 1) is still created so refcount
     /// accounting is uniform regardless of where bytes live.
-    InlinedSmall {
-        r#ref: BlobRef,
-        bytes: Vec<u8>,
-    },
+    InlinedSmall { r#ref: BlobRef, bytes: Vec<u8> },
     /// Payload was written to the filesystem (possibly chunked).
     OnDisk(BlobRef),
 }
@@ -161,7 +158,10 @@ impl BlobStore {
         if let Some(existing) = self.meta.get(&hash)? {
             // Bump refcount; size on the record is authoritative.
             self.meta.inc_ref(&hash)?;
-            let r#ref = BlobRef { hash, size: existing.size };
+            let r#ref = BlobRef {
+                hash,
+                size: existing.size,
+            };
             return Ok(mk_outcome(r#ref, bytes));
         }
 
@@ -179,10 +179,7 @@ impl BlobStore {
     /// memory, but preserving the trait object keeps us forward-compatible
     /// with a future zero-copy mmap implementation.
     pub fn get_stream(&self, hash: &[u8; 32]) -> Result<Box<dyn Read + Send>> {
-        let BlobMeta { chunked, size, .. } = self
-            .meta
-            .get(hash)?
-            .ok_or(Error::NotFound)?;
+        let BlobMeta { chunked, size, .. } = self.meta.get(hash)?.ok_or(Error::NotFound)?;
         let data = fs::read_blob_bytes(&self.root, hash, chunked, size)?;
         Ok(Box::new(Cursor::new(data)))
     }

@@ -1096,4 +1096,3 @@ pub(crate) fn attach_actual_rows(
         attach_actual_rows(child, actual_rows, cursor);
     }
 }
-

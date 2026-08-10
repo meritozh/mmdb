@@ -128,4 +128,3 @@ pub(crate) fn explain_shape_with_estimate(
         estimated_rows,
     )
 }
-

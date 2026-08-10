@@ -446,10 +446,7 @@ fn executor_projects_requested_fields() {
     let expected_fields = BTreeMap::from([
         ("node_id".to_string(), Literal::String("a".to_string())),
         ("topic".to_string(), Literal::String("alpha".to_string())),
-        (
-            "score".to_string(),
-            Literal::F32(OrderedF32(0.75)),
-        ),
+        ("score".to_string(), Literal::F32(OrderedF32(0.75))),
     ]);
 
     let executor = Executor::new(&ctx);
@@ -847,9 +844,7 @@ impl QuerySource for RecordingSource {
             .iter()
             .filter(|record| {
                 filter
-                    .map(|pred| {
-                        crate::eval::predicate_matches(record, pred)
-                    })
+                    .map(|pred| crate::eval::predicate_matches(record, pred))
                     .unwrap_or(true)
             })
             .cloned()

@@ -307,9 +307,7 @@ pub(crate) fn collect_query_operator(
     Ok(rows)
 }
 
-pub(crate) fn query_stats_from_catalog(
-    stats: mmdb_catalog::TenantStats,
-) -> mmdb_query::Stats {
+pub(crate) fn query_stats_from_catalog(stats: mmdb_catalog::TenantStats) -> mmdb_query::Stats {
     let mut histograms = BTreeMap::new();
     histograms.insert(
         mmdb_query::FieldRef::Kind,

@@ -336,4 +336,3 @@ pub(crate) fn estimate_rows_by_selectivity(
 ) -> Option<usize> {
     base_rows.map(|rows| ((rows as f32) * selectivity.clamp(0.0, 1.0)).round() as usize)
 }
-

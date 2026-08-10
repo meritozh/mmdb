@@ -107,9 +107,7 @@ pub(crate) fn split_once_top_level(s: &str, needle: char) -> Option<(&str, &str)
         match ch {
             '(' => depth += 1,
             ')' => depth -= 1,
-            c if c == needle && depth == 0 => {
-                return Some((&s[..idx], &s[idx + ch.len_utf8()..]))
-            }
+            c if c == needle && depth == 0 => return Some((&s[..idx], &s[idx + ch.len_utf8()..])),
             _ => {}
         }
     }

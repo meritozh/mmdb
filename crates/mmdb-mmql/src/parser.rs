@@ -1,7 +1,5 @@
 use mmdb_core::{NodeKind, Result};
-use mmdb_query::{
-    AggregateExpr, FieldRef, JoinKey, Literal, Predicate, ScoreExpr, VectorRef,
-};
+use mmdb_query::{AggregateExpr, FieldRef, JoinKey, Literal, Predicate, ScoreExpr, VectorRef};
 
 use crate::ast::{
     AggregateClause, GraphClause, GraphSeed, JoinClause, RecallQuery, Resolver, UdfClause,
@@ -607,11 +605,7 @@ fn parse_join_clause_body(input: &str, rest: &str) -> std::result::Result<JoinCl
     })
 }
 
-fn parse_join_on(
-    input: &str,
-    alias: &str,
-    raw: &str,
-) -> std::result::Result<JoinKey, MmqlError> {
+fn parse_join_on(input: &str, alias: &str, raw: &str) -> std::result::Result<JoinKey, MmqlError> {
     if raw == "node_id" {
         return Ok(JoinKey::NodeId);
     }

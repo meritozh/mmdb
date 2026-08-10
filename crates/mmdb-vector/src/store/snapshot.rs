@@ -1,5 +1,7 @@
 use super::keys::*;
-use super::{RebuildGroup, SnapshotManifest, VectorStore, SNAPSHOT_DIR_NAME, SNAPSHOT_MANIFEST_VERSION};
+use super::{
+    RebuildGroup, SnapshotManifest, VectorStore, SNAPSHOT_DIR_NAME, SNAPSHOT_MANIFEST_VERSION,
+};
 use crate::{IndexKey, VectorIndex};
 use fjall::PartitionHandle;
 use mmdb_core::{Error, Result};
@@ -7,10 +9,7 @@ use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::{
-    atomic::Ordering,
-    Arc,
-};
+use std::sync::{atomic::Ordering, Arc};
 
 impl VectorStore {
     /// Scan persisted meta + tomb partitions and rebuild every (tenant, model)

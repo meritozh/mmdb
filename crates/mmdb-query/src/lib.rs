@@ -1,11 +1,11 @@
 //! LogicalPlan IR + recall builder + rule optimizer + batch physical executor.
 
-mod ir;
 mod builder;
-mod optimizer;
 mod eval;
 mod executor;
 mod explain;
+mod ir;
+mod optimizer;
 
 #[cfg(test)]
 mod tests;

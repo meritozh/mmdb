@@ -15,10 +15,7 @@ use fjall::{Keyspace, PartitionCreateOptions, PartitionHandle};
 use mmdb_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::{
-    atomic::AtomicUsize,
-    Arc,
-};
+use std::sync::{atomic::AtomicUsize, Arc};
 use ulid::Ulid;
 
 // ---- partition & tuning constants ----

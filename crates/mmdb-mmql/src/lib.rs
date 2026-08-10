@@ -2,9 +2,9 @@
 
 mod ast;
 mod parser;
-mod util;
 #[cfg(test)]
 mod tests;
+mod util;
 
 pub use ast::{
     AggregateClause, GraphClause, GraphSeed, JoinClause, RecallQuery, Resolver, UdfClause,

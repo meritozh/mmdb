@@ -1,6 +1,4 @@
-use crate::ir::{
-    FieldRef, Literal, LogicalPlan, ModelId, Predicate, SortKey, TableId, VectorRef,
-};
+use crate::ir::{FieldRef, Literal, LogicalPlan, ModelId, Predicate, SortKey, TableId, VectorRef};
 
 pub struct Query;
 
