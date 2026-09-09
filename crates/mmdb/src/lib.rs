@@ -55,6 +55,7 @@ mod dream;
 mod embedder;
 mod lexical;
 pub mod native_memory;
+pub use native_memory::context;
 mod query_impl;
 mod recall;
 mod runtime;

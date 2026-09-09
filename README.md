@@ -19,6 +19,37 @@ single engine.
 - **Auditable** — append-only records for queries, mutations, client calls, compaction, and repair
 - **MMQL/IR/executor** — MMQL and builder plans lower into shared `LogicalPlan`
 
+## Harness Context
+
+The new `mmdb::context` contract provides versioned object and relation types,
+source-backed records, ordered session history, and bounded lexical and graph
+recall on the native memory transaction kernel. An assistant can save validated
+context directly, with provenance and an explicit inference label.
+
+Create a fresh root with `native_memory::MemoryDatabase::create_context(path)`,
+reopen it with `open_context(path)`, and obtain a `ContextStore` using
+`context(ContextAccess::new(owner, actor))`. The default scope shares context
+across that owner's agents and sessions. The harness supplies trusted identity,
+scope and tool permissions.
+
+`TypeDefinition::note(scope)` is an optional starting schema registered through
+the same catalog as custom types. Complete raw events stream into checksummed
+chunks; history search uses bounded, resumable substring scans. Objects use
+lexical postings and explicit relation paths. This contract currently requires
+the fresh `mmdb-context-v1` format; ordinary opening never converts old data.
+One process holds the store lease at a time.
+
+```sh
+cargo run -p mmdb --example context_harness
+```
+
+The example saves research objects and a relation, reopens the store as a trading
+harness, and recalls an indirectly connected decision with its original source.
+The same contract now includes streamed message lifecycles, immutable checkpoints,
+current dependency validation, and business action definitions with harness-owned
+execution records. MiuMiu uses it for continuous windows and dynamic workflows.
+See the [implementation contract and limits](docs/CONTEXT-DESIGN.md).
+
 ## Quick Start
 
 ```rust
@@ -86,6 +117,8 @@ cargo run -p mmdb --example agent_memory  # run quickstart
 
 ## Documentation
 
+- [`docs/FEATURES.md`](docs/FEATURES.md): agent context ontology product baseline (Chinese)
+- [`docs/CONTEXT-DESIGN.md`](docs/CONTEXT-DESIGN.md): context implementation, public contract, limits and stage verification (Chinese)
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — durable system architecture
 - [`docs/crates/`](docs/crates/) — crate-level feature references
 

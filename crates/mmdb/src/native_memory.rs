@@ -19,6 +19,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use ulid::Ulid;
 
+#[path = "context/mod.rs"]
+pub mod context;
+
 /// Exact outer format recognized by both native opening and reset planning.
 pub const MEMORY_STORE_FORMAT_ID: &str = "mmdb-native-memory-v1";
 
@@ -1628,6 +1631,7 @@ struct ArtifactEvidenceInsert<'a> {
 
 pub struct MemoryDatabase {
     keyspace: Keyspace,
+    context: Option<context::ContextPartitions>,
     era_id: EraId,
     digest_key: [u8; 32],
     evidence: PartitionHandle,
@@ -1693,7 +1697,15 @@ impl MemoryDatabase {
     /// outer marker, and then open it through the same validation path as every
     /// later process.
     pub fn create(root: impl AsRef<Path>) -> MemoryResult<Self> {
-        let root = root.as_ref();
+        Self::create_format(root.as_ref(), MEMORY_STORE_FORMAT_ID)
+    }
+
+    /// Create a fresh context store. Existing roots are never adopted or reset.
+    pub fn create_context(root: impl AsRef<Path>) -> MemoryResult<Self> {
+        Self::create_format(root.as_ref(), context::CONTEXT_STORE_FORMAT_ID)
+    }
+
+    fn create_format(root: &Path, format_id: &str) -> MemoryResult<Self> {
         let lease = StoreLease::acquire(root)?;
         match fs::symlink_metadata(root) {
             Ok(_) => return Err(MemoryError::StoreAlreadyExists(root.to_path_buf())),
@@ -1702,25 +1714,34 @@ impl MemoryDatabase {
         }
         fs::create_dir(root)?;
         let store_era_id = StoreEraId::new();
-        OuterStoreManifest::new(MEMORY_STORE_FORMAT_ID, store_era_id)?.write_new(root)?;
-        Self::open_with_lease(root, lease, true)
+        OuterStoreManifest::new(format_id, store_era_id)?.write_new(root)?;
+        Self::open_with_lease(root, lease, true, format_id)
     }
 
     /// Open only an existing root with the exact clean-store marker and format.
     /// The outer check happens before fjall sees the path.
     pub fn open(root: impl AsRef<Path>) -> MemoryResult<Self> {
-        let root = root.as_ref();
+        Self::open_format(root.as_ref(), MEMORY_STORE_FORMAT_ID)
+    }
+
+    /// Open the context format without converting or modifying an older format.
+    pub fn open_context(root: impl AsRef<Path>) -> MemoryResult<Self> {
+        Self::open_format(root.as_ref(), context::CONTEXT_STORE_FORMAT_ID)
+    }
+
+    fn open_format(root: &Path, format_id: &str) -> MemoryResult<Self> {
         let lease = StoreLease::acquire(root)?;
         let allow_metadata_initialization = root_contains_only_outer_manifest(root)?;
-        Self::open_with_lease(root, lease, allow_metadata_initialization)
+        Self::open_with_lease(root, lease, allow_metadata_initialization, format_id)
     }
 
     fn open_with_lease(
         root: &Path,
         lease: StoreLease,
         allow_metadata_initialization: bool,
+        format_id: &str,
     ) -> MemoryResult<Self> {
-        let managed = require_managed_store(root, MEMORY_STORE_FORMAT_ID)?;
+        let managed = require_managed_store(root, format_id)?;
         let outer_store_era_id = managed.manifest().store_era_id().as_str().to_owned();
         let era_ulid = outer_store_era_id.parse::<Ulid>().map_err(|error| {
             MemoryError::Corrupt(format!("outer store era is not a ULID: {error}"))
@@ -1742,6 +1763,9 @@ impl MemoryDatabase {
             });
         }
         Ok(Self {
+            context: (format_id == context::CONTEXT_STORE_FORMAT_ID)
+                .then(|| context::ContextPartitions::open(&keyspace))
+                .transpose()?,
             evidence: open_partition(&keyspace, PART_EVIDENCE)?,
             evidence_availability: open_partition(&keyspace, PART_EVIDENCE_AVAILABILITY)?,
             evidence_heads: open_partition(&keyspace, PART_EVIDENCE_HEADS)?,
