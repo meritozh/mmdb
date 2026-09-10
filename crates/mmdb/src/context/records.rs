@@ -266,7 +266,10 @@ impl ContextStore<'_> {
         header.provenance = self.provenance();
         header.recorded_at_ms = super::super::now_ms();
         let mut batch = self.db.durable_batch();
-        self.advance_availability_epoch(&mut batch)?;
+        let epoch = self.advance_availability_epoch(&mut batch)?;
+        if state == RecordState::Purged || header.history.is_some() {
+            self.invalidate_checkpoint_payloads(&mut batch, epoch)?;
+        }
         if let Some(history) = &header.history {
             self.invalidate_message(&mut batch, history)?;
         }

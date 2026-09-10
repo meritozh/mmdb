@@ -1,6 +1,6 @@
 # mmdb 上下文内核：技术方案
 
-状态：实现说明 v0.5，2026-09-08。S1 内核及 S2 至 S4 所需的流式历史、检查点、当前依赖验证和业务动作已实现，深度 review 与隔离验证完成。旧数据不迁移，从新格式目录开始。产品依据见 [Feature Doc v1.0](FEATURES.md)。
+状态：实现说明 v0.6，2026-09-09。S1 内核及 S2 至 S4 所需的流式历史、检查点、当前依赖验证和业务动作已实现；首轮真实任务驱动的 checkpoint 生命周期修正见下文及 [MiuMiu 质量验收](../../miumiu/docs/CONTEXT-ACCEPTANCE.md)。旧数据不迁移，从新格式目录开始。产品依据见 [Feature Doc v1.0](FEATURES.md)。
 
 ## 推荐方向
 
@@ -184,8 +184,14 @@ git diff --check
 
 ## S2 至 S4 的内核边界
 
-检查点保存不可变载荷、父检查点、session/run、历史位置和来源引用。生成开始前捕获的可用性 epoch 必须在提交时仍有效。来源发生修订、撤回或清除会推进 owner 的 epoch；旧检查点不能恢复内容。assistant 的任一片段不可用时，聚合消息和其他片段读取也不可用，避免复制的终止消息重新暴露原文。
+检查点保存不可变载荷、父检查点、session/run、历史位置和来源引用。生成开始前捕获的可用性 epoch 必须在提交时仍有效。修订、撤回或清除会推进 owner 的可用性 epoch；旧检查点不能用于当前恢复。
+
+历史读取另外检查载荷脱敏 epoch：普通修订允许旧检查点及其派生原文继续按 pin 审计，避免已经发生的工具调用因源版本变化而无法保存完成结果。任意记录清除、任意历史事件撤回都会推进脱敏 epoch，较早检查点的历史载荷不可再读，包含未单独列出的摘要输入。marker 同时记录对应的可用性 epoch；marker 缺失或与当前 epoch 不一致时，按旧 writer 可能已执行清除处理，保守采用当前 epoch，不复活旧摘要。这两个 epoch 在同一持久批次更新。
+
+`latest_checkpoint` 返回定位用 header，不保证该检查点当前有效。harness 恢复前必须使用 `validate_current`；`current_state` 只表示记录自身的 head 状态，不能替代传递依赖校验。assistant 的任一片段不可用时，聚合消息和其他片段读取也不可用，避免复制的终止消息重新暴露原文。
 
 动作描述使用有界输入属性与 `exists`、`equals` 前置条件，`equals` 值必须匹配对象属性类型。准备动作检查当前动作、目标对象、有效时间、传递来源及参数；同一身份并发准备只有一个调用方取得首次调度权。执行状态包括 Prepared、Succeeded、RejectedBeforeDispatch、FailedNoEffect 和 EffectUnknown。实际执行事实要求 System/Operator 身份，普通 agent 不能伪造或撤回执行事实。
 
-S2 至 S4 的应用验收、CLI/HTTP 入口与运行恢复见 [MiuMiu 实现说明](../../miumiu/docs/CONTEXT-DESIGN.md)。测试证明接口、恢复和运行约束，不代表真实领域任务的召回及规划质量评测。
+S2 至 S4 的应用入口与运行恢复见 [MiuMiu 实现说明](../../miumiu/docs/CONTEXT-DESIGN.md)。2026-09-09 独立原生程序实际打开 MiuMiu 的公开任务数据库：`inspect_context_quality` 检查历史、工具配对、载荷、来源和 checkpoint 链；`verify_context_lifecycle` 在副本上核对关系命中、动作事实、作用域、预算、修订和清除后重开。完整报告见[真实任务质量验收](../../miumiu/docs/CONTEXT-ACCEPTANCE.md)。
+
+本轮隔离 `cargo test --workspace --offline --locked` 通过，包括 189 项 mmdb 库测试、31 项 context 契约测试及其余 workspace 测试；fmt 和严格 workspace all-targets Clippy 通过。确定性边界测试与实际领域样本分别记录，不外推为一般召回准确率或规划质量保证。

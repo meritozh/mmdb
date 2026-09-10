@@ -1372,6 +1372,173 @@ fn checkpoint_parent_and_epoch_are_compared_atomically_and_survive_reopen() {
 }
 
 #[test]
+fn live_revision_keeps_checkpoint_derived_originals_and_pairs_the_completed_tool() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("context");
+    let db = MemoryDatabase::create_context(&path).unwrap();
+    let store = db.context(access("owner")).unwrap();
+    let raw = source(&store, "original", "SQLite source text");
+    let kind = store
+        .define_type(OperationId::new(), definition("note"))
+        .unwrap()
+        .pin;
+    let note = store
+        .save_object(
+            OperationId::new(),
+            object(&kind, &raw, "initial conclusion"),
+        )
+        .unwrap()
+        .pin;
+    let checkpoint = store
+        .save_checkpoint(
+            OperationId::new(),
+            CheckpointInput {
+                scope: CheckpointScope::Session,
+                session: "session-a".into(),
+                run: "run".into(),
+                history_sequence: 1,
+                expected_previous: None,
+                expected_availability_epoch: store.availability_epoch().unwrap(),
+                sources: vec![raw.clone(), note.clone()],
+                payload: json!({"goal":"continue the study"}),
+            },
+        )
+        .unwrap()
+        .pin;
+    let derived = store
+        .save_object(
+            OperationId::new(),
+            object(&kind, &checkpoint, "checkpoint-derived detail"),
+        )
+        .unwrap()
+        .pin;
+    let mut call_input = history_input("session-a", "revise-call");
+    call_input.kind = HistoryKind::ToolCall {
+        call_id: "revise-call".into(),
+        tool_name: "context".into(),
+        message_id: None,
+    };
+    call_input.sources = vec![derived.clone()];
+    let call = store
+        .append_history(
+            OperationId::new(),
+            call_input,
+            b"revise the original note".as_slice(),
+        )
+        .unwrap()
+        .pin;
+    let changed = store
+        .revise_object(
+            OperationId::new(),
+            note.clone(),
+            object(&kind, &raw, "revised conclusion"),
+        )
+        .unwrap()
+        .pin;
+    assert!(
+        store
+            .validate_current(std::slice::from_ref(&checkpoint), None)
+            .is_err(),
+        "old checkpoint cannot be current recovery state"
+    );
+    assert!(
+        store
+            .validate_current(std::slice::from_ref(&derived), None)
+            .is_err(),
+        "derived knowledge must be revalidated before current recall"
+    );
+    assert!(
+        store.read(&checkpoint).is_ok(),
+        "a correction must preserve the exact historical snapshot"
+    );
+    assert!(
+        store.read(&derived).is_ok(),
+        "a correction must preserve derived original payloads"
+    );
+    assert!(
+        store.read(&call).is_ok(),
+        "the already dispatched call must remain readable"
+    );
+    let mut result_input = history_input("session-a", "revise-result");
+    result_input.kind = HistoryKind::ToolResult {
+        call_id: "revise-call".into(),
+        outcome: ToolOutcome::Succeeded,
+    };
+    result_input.sources = vec![changed.clone()];
+    let result = store
+        .append_history(
+            OperationId::new(),
+            result_input,
+            b"revision 2 committed".as_slice(),
+        )
+        .unwrap()
+        .pin;
+    assert_eq!(
+        store
+            .tool_history("session-a", "revise-call")
+            .unwrap()
+            .1
+            .unwrap()
+            .pin,
+        result
+    );
+    drop(store);
+    drop(db);
+    let db = MemoryDatabase::open_context(&path).unwrap();
+    let store = db.context(access("owner")).unwrap();
+    for pin in [&checkpoint, &derived, &call, &result] {
+        assert!(store.read(pin).is_ok());
+    }
+    db.context(ContextAccess::new("owner", Actor::User))
+        .unwrap()
+        .purge(OperationId::new(), raw)
+        .unwrap();
+    for pin in [&checkpoint, &derived, &call, &result] {
+        assert!(
+            matches!(store.read(pin), Err(ContextError::Unavailable(_))),
+            "purge must still hide every copied original"
+        );
+    }
+}
+
+#[test]
+fn checkpoint_history_redaction_remains_conservative_for_unlisted_summary_input() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = MemoryDatabase::create_context(tmp.path().join("context")).unwrap();
+    let store = db.context(access("owner")).unwrap();
+    let omitted = source(
+        &store,
+        "earlier",
+        "detail summarized but not individually pinned",
+    );
+    let anchor = source(&store, "anchor", "last event");
+    let checkpoint = store
+        .save_checkpoint(
+            OperationId::new(),
+            CheckpointInput {
+                scope: CheckpointScope::Session,
+                session: "session-a".into(),
+                run: "run".into(),
+                history_sequence: 2,
+                expected_previous: None,
+                expected_availability_epoch: store.availability_epoch().unwrap(),
+                sources: vec![anchor],
+                payload: json!({"summary":"detail summarized but not individually pinned"}),
+            },
+        )
+        .unwrap()
+        .pin;
+    db.context(ContextAccess::new("owner", Actor::User))
+        .unwrap()
+        .retract(OperationId::new(), omitted)
+        .unwrap();
+    assert!(matches!(
+        store.read(&checkpoint),
+        Err(ContextError::Unavailable(_))
+    ));
+}
+
+#[test]
 fn session_and_child_run_checkpoints_keep_independent_cas_chains_across_reopen() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("context");

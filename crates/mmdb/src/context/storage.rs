@@ -198,8 +198,13 @@ impl ContextStore<'_> {
             .checkpoint
             .as_ref()
             .map(|checkpoint| {
-                self.availability_epoch_locked()
-                    .map(|epoch| epoch != checkpoint.availability_epoch)
+                if active {
+                    self.availability_epoch_locked()
+                        .map(|epoch| epoch != checkpoint.availability_epoch)
+                } else {
+                    self.checkpoint_redaction_epoch_locked()
+                        .map(|epoch| checkpoint.availability_epoch < epoch)
+                }
             })
             .transpose()?
             .unwrap_or(false)
