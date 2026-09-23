@@ -1,6 +1,7 @@
 use super::super::{Actor, OperationId, RecordState, Scope};
 use super::storage::*;
 use super::*;
+use ulid::Ulid;
 
 impl ContextStore<'_> {
     /// Validate a bounded planning/dispatch snapshot against current heads,
@@ -216,6 +217,71 @@ impl ContextStore<'_> {
         Ok(())
     }
 
+    /// Return the records that are currently "live" at wall-clock time:
+    /// `state == Active` **and** their valid-time window covers `now`.
+    ///
+    /// This is the working-context equivalent of recalling only facts that both
+    /// survived retraction and have not expired. Records filtered by `type_filter`
+    /// (exact type pin) and/or `scope`. At most `limit` records are returned.
+    pub fn query_current_valid(
+        &self,
+        type_filter: Option<&RecordPin>,
+        scope: Option<&Scope>,
+        limit: usize,
+    ) -> ContextResult<Vec<ContextRecord>> {
+        if limit == 0 || limit > 1000 {
+            return Err(ContextError::InvalidInput(
+                "current-valid query limit must be 1..=1000".into(),
+            ));
+        }
+        let _guard = self.db.write_lock.lock();
+        let now = crate::now_ms();
+        let mut out = Vec::new();
+        for kind in [RecordKind::Object, RecordKind::Relation] {
+            let mut start = owner_key(&self.access.owner);
+            start.push(kind_byte(kind));
+            for entry in self.parts.heads.range(start.clone()..) {
+                let (key, revision) = entry?;
+                if !key.starts_with(&start) {
+                    break;
+                }
+                if out.len() >= limit || key.len() != start.len() + 16 || revision.len() != 8 {
+                    break;
+                }
+                let id = u128::from_be_bytes(
+                    key[start.len()..]
+                        .try_into()
+                        .map_err(|_| ContextError::Corrupt("invalid record cursor".into()))?,
+                );
+                let reference = ContextRef {
+                    era: self.db.era_id,
+                    owner: self.access.owner.clone(),
+                    kind,
+                    id: Ulid(id),
+                };
+                let header = match self.head_locked(&reference) {
+                    Ok(header) => header,
+                    Err(ContextError::AccessDenied) => continue,
+                    Err(error) => return Err(error),
+                };
+                if !header.is_valid_at(now) {
+                    continue;
+                }
+                if scope.is_some_and(|expected| header.scope != *expected) {
+                    continue;
+                }
+                if type_filter.is_some_and(|expected| header.type_pin.as_ref() != Some(expected)) {
+                    continue;
+                }
+                out.push(self.read_locked(&header.pin)?);
+            }
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     pub fn retract(
         &self,
         operation: OperationId,
@@ -260,6 +326,17 @@ impl ContextStore<'_> {
             return Ok(receipt);
         }
         let (previous, pin) = self.next_revision(&expected)?;
+        // `validate_sources` already forbids non-User/Operator actors from
+        // *creating or revising* `Instruction` records. Retraction must be
+        // symmetric: an Assistant must not be able to retract an Instruction
+        // that it could not have authored. (Purple is already guarded above;
+        // ordinary retractions of non-Instruction records stay allowed.)
+        if state == RecordState::Retracted
+            && previous.information == InformationKind::Instruction
+            && !matches!(self.access.actor, Actor::User | Actor::Operator)
+        {
+            return Err(ContextError::AccessDenied);
+        }
         let mut header = previous.clone();
         header.pin = pin.clone();
         header.state = state;

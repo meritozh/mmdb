@@ -4,7 +4,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::collections::BTreeSet;
 use ulid::Ulid;
 
-pub(super) fn validate_name(value: &str, label: &str) -> ContextResult<()> {
+pub(crate) fn validate_name(value: &str, label: &str) -> ContextResult<()> {
     if value.trim().is_empty()
         || value.len() > MAX_CONTEXT_NAME_BYTES
         || value.chars().any(char::is_control)
@@ -16,18 +16,18 @@ pub(super) fn validate_name(value: &str, label: &str) -> ContextResult<()> {
     Ok(())
 }
 
-pub(super) fn segment(key: &mut Vec<u8>, value: &[u8]) {
+pub(crate) fn segment(key: &mut Vec<u8>, value: &[u8]) {
     key.extend_from_slice(&(value.len() as u32).to_be_bytes());
     key.extend_from_slice(value);
 }
 
-pub(super) fn owner_key(owner: &str) -> Vec<u8> {
+pub(crate) fn owner_key(owner: &str) -> Vec<u8> {
     let mut key = Vec::new();
     segment(&mut key, owner.as_bytes());
     key
 }
 
-pub(super) fn kind_byte(kind: RecordKind) -> u8 {
+pub(crate) fn kind_byte(kind: RecordKind) -> u8 {
     match kind {
         RecordKind::Type => 0,
         RecordKind::Object => 1,
@@ -39,62 +39,62 @@ pub(super) fn kind_byte(kind: RecordKind) -> u8 {
     }
 }
 
-pub(super) fn record_key(record: &ContextRef) -> Vec<u8> {
+pub(crate) fn record_key(record: &ContextRef) -> Vec<u8> {
     let mut key = owner_key(&record.owner);
     key.push(kind_byte(record.kind));
     key.extend_from_slice(&record.id.0.to_be_bytes());
     key
 }
 
-pub(super) fn revision_key(pin: &RecordPin) -> Vec<u8> {
+pub(crate) fn revision_key(pin: &RecordPin) -> Vec<u8> {
     let mut key = record_key(&pin.record);
     key.extend_from_slice(&pin.revision.to_be_bytes());
     key
 }
 
-pub(super) fn payload_key(pin: &RecordPin, chunk: u64) -> Vec<u8> {
+pub(crate) fn payload_key(pin: &RecordPin, chunk: u64) -> Vec<u8> {
     let mut key = revision_key(pin);
     key.extend_from_slice(&chunk.to_be_bytes());
     key
 }
 
-pub(super) fn operation_key(owner: &str, operation: OperationId) -> Vec<u8> {
+pub(crate) fn operation_key(owner: &str, operation: OperationId) -> Vec<u8> {
     let mut key = owner_key(owner);
     key.extend_from_slice(&operation.0 .0.to_be_bytes());
     key
 }
 
-pub(super) fn session_key(owner: &str, session: &str) -> Vec<u8> {
+pub(crate) fn session_key(owner: &str, session: &str) -> Vec<u8> {
     let mut key = owner_key(owner);
     segment(&mut key, session.as_bytes());
     key
 }
 
-pub(super) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> ContextResult<T> {
+pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> ContextResult<T> {
     serde_json::from_slice(bytes)
         .map_err(|_| ContextError::Corrupt("invalid persisted record".into()))
 }
 
-pub(super) fn encode<T: Serialize>(value: &T) -> ContextResult<Vec<u8>> {
+pub(crate) fn encode<T: Serialize>(value: &T) -> ContextResult<Vec<u8>> {
     Ok(serde_json::to_vec(value)?)
 }
 
 impl ContextStore<'_> {
-    pub(super) fn check_scope(&self, scope: &Scope) -> ContextResult<()> {
+    pub(crate) fn check_scope(&self, scope: &Scope) -> ContextResult<()> {
         if !self.access.scopes.contains(scope) {
             return Err(ContextError::AccessDenied);
         }
         Ok(())
     }
 
-    pub(super) fn check_ref(&self, record: &ContextRef) -> ContextResult<()> {
+    pub(crate) fn check_ref(&self, record: &ContextRef) -> ContextResult<()> {
         if record.owner != self.access.owner || record.era != self.db.era_id {
             return Err(ContextError::AccessDenied);
         }
         Ok(())
     }
 
-    pub(super) fn fresh_pin(&self, kind: RecordKind) -> RecordPin {
+    pub(crate) fn fresh_pin(&self, kind: RecordKind) -> RecordPin {
         RecordPin {
             record: ContextRef {
                 era: self.db.era_id,
@@ -106,7 +106,7 @@ impl ContextStore<'_> {
         }
     }
 
-    pub(super) fn provenance(&self) -> Provenance {
+    pub(crate) fn provenance(&self) -> Provenance {
         Provenance {
             actor: self.access.actor,
             agent: self.access.agent.clone(),
@@ -116,7 +116,7 @@ impl ContextStore<'_> {
         }
     }
 
-    pub(super) fn head_locked(&self, record: &ContextRef) -> ContextResult<RecordHeader> {
+    pub(crate) fn head_locked(&self, record: &ContextRef) -> ContextResult<RecordHeader> {
         self.check_ref(record)?;
         let revision = self
             .parts
@@ -133,7 +133,7 @@ impl ContextStore<'_> {
         })
     }
 
-    pub(super) fn header_locked(&self, pin: &RecordPin) -> ContextResult<RecordHeader> {
+    pub(crate) fn header_locked(&self, pin: &RecordPin) -> ContextResult<RecordHeader> {
         self.check_ref(&pin.record)?;
         if pin.revision == 0 {
             return Err(ContextError::InvalidInput(
@@ -165,7 +165,7 @@ impl ContextStore<'_> {
         self.header_locked(pin)
     }
 
-    pub(super) fn available_locked(&self, pin: &RecordPin, active: bool) -> ContextResult<bool> {
+    pub(crate) fn available_locked(&self, pin: &RecordPin, active: bool) -> ContextResult<bool> {
         self.available_walk(pin, active, None, 0, &mut 0, &mut BTreeSet::new())
     }
 
@@ -238,7 +238,7 @@ impl ContextStore<'_> {
         Ok(true)
     }
 
-    pub(super) fn validate_sources(
+    pub(crate) fn validate_sources(
         &self,
         scope: &Scope,
         sources: &[RecordPin],
@@ -280,7 +280,7 @@ impl ContextStore<'_> {
 
     /// Original snapshots may copy a historical version or a type descriptor.
     /// They retain its exact pin; purge still invalidates every copied payload.
-    pub(super) fn validate_history_sources(
+    pub(crate) fn validate_history_sources(
         &self,
         scope: &Scope,
         sources: &[RecordPin],
@@ -305,7 +305,7 @@ impl ContextStore<'_> {
         Ok(())
     }
 
-    pub(super) fn digest<T: Serialize>(&self, domain: &str, input: &T) -> ContextResult<[u8; 32]> {
+    pub(crate) fn digest<T: Serialize>(&self, domain: &str, input: &T) -> ContextResult<[u8; 32]> {
         let mut h = blake3::Hasher::new_keyed(&self.db.digest_key);
         h.update(b"mmdb-context-v1\0");
         h.update(domain.as_bytes());
@@ -313,11 +313,11 @@ impl ContextStore<'_> {
         Ok(*h.finalize().as_bytes())
     }
 
-    pub(super) fn content_digest(&self, bytes: &[u8]) -> [u8; 32] {
+    pub(crate) fn content_digest(&self, bytes: &[u8]) -> [u8; 32] {
         *blake3::keyed_hash(&self.db.digest_key, bytes).as_bytes()
     }
 
-    pub(super) fn stored_operation(
+    pub(crate) fn stored_operation(
         &self,
         operation: OperationId,
     ) -> ContextResult<Option<StoredOperation>> {
@@ -337,7 +337,7 @@ impl ContextStore<'_> {
         Ok(stored.map(|stored| stored.receipt))
     }
 
-    pub(super) fn replay(
+    pub(crate) fn replay(
         &self,
         operation: OperationId,
         digest: [u8; 32],
@@ -352,7 +352,7 @@ impl ContextStore<'_> {
         Ok(Some(stored.receipt))
     }
 
-    pub(super) fn commit_operation(
+    pub(crate) fn commit_operation(
         &self,
         mut batch: fjall::Batch,
         operation: OperationId,
@@ -381,7 +381,7 @@ impl ContextStore<'_> {
         Ok(receipt)
     }
 
-    pub(super) fn put_header(
+    pub(crate) fn put_header(
         &self,
         batch: &mut fjall::Batch,
         header: &RecordHeader,
@@ -399,7 +399,7 @@ impl ContextStore<'_> {
         Ok(())
     }
 
-    pub(super) fn put_payload(&self, batch: &mut fjall::Batch, pin: &RecordPin, bytes: &[u8]) {
+    pub(crate) fn put_payload(&self, batch: &mut fjall::Batch, pin: &RecordPin, bytes: &[u8]) {
         for (chunk, bytes) in bytes.chunks(PAYLOAD_CHUNK_BYTES).enumerate() {
             let mut value = Vec::with_capacity(32 + bytes.len());
             value.extend_from_slice(&self.content_digest(bytes));
@@ -408,7 +408,7 @@ impl ContextStore<'_> {
         }
     }
 
-    pub(super) fn payload_slice_locked(
+    pub(crate) fn payload_slice_locked(
         &self,
         header: &RecordHeader,
         offset: u64,
@@ -474,7 +474,7 @@ impl ContextStore<'_> {
         self.payload_slice_locked(&header, offset, limit)
     }
 
-    pub(super) fn small_payload_locked(&self, header: &RecordHeader) -> ContextResult<Vec<u8>> {
+    pub(crate) fn small_payload_locked(&self, header: &RecordHeader) -> ContextResult<Vec<u8>> {
         if header.payload.bytes > MAX_RECORD_BYTES as u64 {
             return Err(ContextError::Corrupt("oversize structured payload".into()));
         }
@@ -487,7 +487,7 @@ impl ContextStore<'_> {
         Ok(page.bytes)
     }
 
-    pub(super) fn read_locked(&self, pin: &RecordPin) -> ContextResult<ContextRecord> {
+    pub(crate) fn read_locked(&self, pin: &RecordPin) -> ContextResult<ContextRecord> {
         let header = self.header_locked(pin)?;
         if !self.available_locked(pin, false)? {
             return Err(ContextError::Unavailable(pin.record.clone()));
@@ -525,7 +525,7 @@ impl ContextStore<'_> {
         self.read_locked(pin)
     }
 
-    pub(super) fn next_revision(
+    pub(crate) fn next_revision(
         &self,
         expected: &RecordPin,
     ) -> ContextResult<(RecordHeader, RecordPin)> {

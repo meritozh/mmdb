@@ -3,6 +3,8 @@ use crate::runtime::{
     AgentRequest, AgentRole, EmbeddingInput, EmbeddingProfile, LawyerFailureMode, LawyerProfile,
 };
 use crate::{Database, MemoryProfile};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use mmdb_core::{Edge, Error, MemoryNode, MemoryState, NodeKind, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -42,6 +44,14 @@ pub struct RecallRequest {
     pub filter: RecallFilter,
     #[serde(default)]
     pub audit: AuditContext,
+    /// Opaque pagination cursor returned by a prior recall. When present,
+    /// results resume after the encoded position, never repeating nodes.
+    #[serde(default)]
+    pub continuation: Option<String>,
+    /// Caller-supplied query digest (blake3, 32 bytes). When absent, the
+    /// server computes blake3 over the query string.
+    #[serde(default)]
+    pub query_digest: Option<[u8; 32]>,
 }
 
 impl RecallRequest {
@@ -58,6 +68,8 @@ impl RecallRequest {
             lawyer_profile: None,
             filter: RecallFilter::default(),
             audit: AuditContext::default(),
+            continuation: None,
+            query_digest: None,
         }
     }
 }
@@ -105,6 +117,28 @@ pub struct AdjudicatedRecall {
     pub evidence: Vec<RecallEvidence>,
     pub verdict: Option<LawyerVerdict>,
     pub status: RecallStatus,
+    /// True when the candidate pool was truncated because it exceeded
+    /// `candidate_limit`.
+    #[serde(default)]
+    pub truncated: bool,
+    /// Human-readable reason when truncation occurred.
+    #[serde(default)]
+    pub truncated_reason: Option<String>,
+    /// Opaque cursor to fetch the next page, or `None` when no more results
+    /// are available.
+    #[serde(default)]
+    pub next_continuation: Option<String>,
+    /// The query digest actually used (caller-supplied or server-computed).
+    #[serde(default)]
+    pub query_digest: [u8; 32],
+    /// Deterministic digest over the returned evidence set (sorted by node.id,
+    /// blake3 of node.id + revision + score per entry).
+    #[serde(default)]
+    pub content_digest: [u8; 32],
+    /// Data version watermark (max revision of candidate nodes and their graph-path edges) so that
+    /// results can be compared across data changes.
+    #[serde(default)]
+    pub watermark: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,6 +235,57 @@ struct EvidenceBuilder {
     graph_paths: Vec<GraphPath>,
 }
 
+/// Internal snapshot returned by `deterministic_recall` carrying the
+/// (possibly truncated) evidence plus metadata needed for protocol fields.
+struct RecallSnapshot {
+    evidence: Vec<RecallEvidence>,
+    /// Number of unique candidate nodes before `candidate_limit` truncation.
+    total_candidates: usize,
+    /// Maximum node revision across all surviving candidates (watermark).
+    watermark: i64,
+}
+
+/// Opaque pagination cursor encoding the last returned (node_id, score).
+/// Serialised as base64url of a compact binary blob.
+struct RecallCursor {
+    node_id: Ulid,
+    score_bits: u32,
+}
+
+impl RecallCursor {
+    fn encode(&self) -> String {
+        let mut bytes = Vec::with_capacity(20);
+        bytes.extend_from_slice(&self.node_id.to_bytes());
+        bytes.extend_from_slice(&self.score_bits.to_be_bytes());
+        URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    fn decode(s: &str) -> Option<Self> {
+        let bytes = URL_SAFE_NO_PAD.decode(s).ok()?;
+        if bytes.len() != 20 {
+            return None;
+        }
+        let mut id_buf = [0u8; 16];
+        id_buf.copy_from_slice(&bytes[0..16]);
+        let node_id = Ulid::from_bytes(id_buf);
+        let mut score_buf = [0u8; 4];
+        score_buf.copy_from_slice(&bytes[16..20]);
+        let score_bits = u32::from_be_bytes(score_buf);
+        Some(Self {
+            node_id,
+            score_bits,
+        })
+    }
+
+    /// Returns true if `(score, node_id)` sorts *after* this cursor's
+    /// `(score_bits, node_id)` under the deterministic ordering
+    /// (score descending, node_id ascending).
+    fn is_after(&self, score: f32, node_id: Ulid) -> bool {
+        let cursor_score = f32::from_bits(self.score_bits);
+        score < cursor_score || (score == cursor_score && node_id > self.node_id)
+    }
+}
+
 struct PreparedVectorQuery {
     profile: EmbeddingProfile,
     profile_fingerprint: String,
@@ -243,13 +328,21 @@ impl Database {
             ));
         }
         if request.limit == 0 || request.candidate_limit == 0 {
+            let query_digest = resolve_query_digest(request);
             return Ok(AdjudicatedRecall {
                 operation_id,
                 evidence: Vec::new(),
                 verdict: None,
                 status: RecallStatus::Deterministic,
+                truncated: false,
+                truncated_reason: None,
+                next_continuation: None,
+                query_digest,
+                content_digest: [0u8; 32],
+                watermark: 0,
             });
         }
+        let query_digest = resolve_query_digest(request);
         let initial_profile = self.memory_profile()?;
         let selected_profiles = select_vector_profiles(&initial_profile, &request.vector_profiles)?
             .into_iter()
@@ -274,7 +367,7 @@ impl Database {
                 vector: query_vector,
             });
         }
-        let (profile, deterministic) = {
+        let (profile, snapshot) = {
             let _guard = self.node_mutation_lock.lock();
             let profile = self.memory_profile()?;
             prepared.retain(|query| {
@@ -292,15 +385,29 @@ impl Database {
                 }
                 current
             });
-            let evidence = self.deterministic_recall(request, &prepared)?;
-            (profile, evidence)
+            let snapshot = self.deterministic_recall(request, &prepared)?;
+            (profile, snapshot)
+        };
+        let candidate_limit = request.candidate_limit.max(request.limit);
+        let truncated = snapshot.total_candidates > candidate_limit;
+        let truncated_reason = if truncated {
+            Some(format!(
+                "candidate_limit_exceeded: {} candidates, kept {}",
+                snapshot.total_candidates, candidate_limit
+            ))
+        } else {
+            None
         };
         let Some(lawyer_id) = request.lawyer_profile.as_deref() else {
-            let mut evidence = deterministic;
-            evidence.truncate(request.limit);
+            let (page, next_continuation) = paginate_evidence(
+                snapshot.evidence,
+                request.continuation.as_deref(),
+                request.limit,
+            );
+            let content_digest = compute_content_digest(&page);
             return Ok(AdjudicatedRecall {
                 operation_id,
-                evidence,
+                evidence: page,
                 verdict: None,
                 status: if degraded.is_empty() {
                     RecallStatus::Deterministic
@@ -309,29 +416,56 @@ impl Database {
                         reason: degraded.join("; "),
                     }
                 },
+                truncated,
+                truncated_reason,
+                next_continuation,
+                query_digest,
+                content_digest,
+                watermark: snapshot.watermark,
             });
         };
         let lawyer = resolve_lawyer(&profile, lawyer_id)?;
         match self
-            .adjudicate(operation_id, &request.query, &deterministic, lawyer)
+            .adjudicate(operation_id, &request.query, &snapshot.evidence, lawyer)
             .await
         {
-            Ok((evidence, verdict)) => Ok(AdjudicatedRecall {
-                operation_id,
-                evidence: evidence.into_iter().take(request.limit).collect(),
-                verdict: Some(verdict),
-                status: RecallStatus::Adjudicated,
-            }),
-            Err(error) if lawyer.failure_mode == LawyerFailureMode::ReturnDeterministic => {
-                let mut evidence = deterministic;
-                evidence.truncate(request.limit);
+            Ok((evidence, verdict)) => {
+                let (page, next_continuation) =
+                    paginate_evidence(evidence, request.continuation.as_deref(), request.limit);
+                let content_digest = compute_content_digest(&page);
                 Ok(AdjudicatedRecall {
                     operation_id,
-                    evidence,
+                    evidence: page,
+                    verdict: Some(verdict),
+                    status: RecallStatus::Adjudicated,
+                    truncated,
+                    truncated_reason,
+                    next_continuation,
+                    query_digest,
+                    content_digest,
+                    watermark: snapshot.watermark,
+                })
+            }
+            Err(error) if lawyer.failure_mode == LawyerFailureMode::ReturnDeterministic => {
+                let (page, next_continuation) = paginate_evidence(
+                    snapshot.evidence,
+                    request.continuation.as_deref(),
+                    request.limit,
+                );
+                let content_digest = compute_content_digest(&page);
+                Ok(AdjudicatedRecall {
+                    operation_id,
+                    evidence: page,
                     verdict: None,
                     status: RecallStatus::Degraded {
                         reason: error.to_string(),
                     },
+                    truncated,
+                    truncated_reason,
+                    next_continuation,
+                    query_digest,
+                    content_digest,
+                    watermark: snapshot.watermark,
                 })
             }
             Err(error) => Err(error),
@@ -345,7 +479,7 @@ impl Database {
         &self,
         request: &RecallRequest,
         prepared: &[PreparedVectorQuery],
-    ) -> Result<Vec<RecallEvidence>> {
+    ) -> Result<RecallSnapshot> {
         let candidate_limit = request.candidate_limit.max(request.limit);
         let mut builders: BTreeMap<Ulid, EvidenceBuilder> = BTreeMap::new();
         let candidate_error = parking_lot::Mutex::new(None);
@@ -436,7 +570,13 @@ impl Database {
             .map(|(id, evidence)| (*id, evidence.score))
             .collect();
         seeds.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        seeds.truncate(candidate_limit);
+        // Expand the graph over *every* surviving seed before any output
+        // truncation. Builders are already bounded by the per-modality
+        // `candidate_limit` caps (lexical ∪ vector), so this stays bounded
+        // (~= 2 * candidate_limit). Truncating seeds here would permanently
+        // drop graph neighbours of seeds ranked just outside
+        // `candidate_limit`; the single output budget is enforced below by
+        // `evidence.truncate(candidate_limit)`.
         if request.graph_depth > 0 {
             for (seed, seed_score) in seeds {
                 for path in self.graph_paths(seed, request.as_of_ms, request.graph_depth)? {
@@ -480,8 +620,24 @@ impl Database {
                 .total_cmp(&a.score)
                 .then_with(|| a.node.id.cmp(&b.node.id))
         });
+        let total_candidates = evidence.len();
+        let watermark = evidence
+            .iter()
+            .flat_map(|e| {
+                std::iter::once(e.node.revision as i64).chain(
+                    e.graph_paths
+                        .iter()
+                        .flat_map(|p| p.edges.iter().map(|edge| edge.revision as i64)),
+                )
+            })
+            .max()
+            .unwrap_or(0);
         evidence.truncate(candidate_limit);
-        Ok(evidence)
+        Ok(RecallSnapshot {
+            evidence,
+            total_candidates,
+            watermark,
+        })
     }
 
     fn recall_candidate_matches(
@@ -1466,4 +1622,55 @@ fn is_causal(label: &str) -> bool {
 
 fn valid_from(node: &MemoryNode) -> i64 {
     node.valid_from_ms.unwrap_or(node.created_at_ms)
+}
+
+/// Returns the query digest: caller-supplied if present, otherwise blake3 of
+/// the query string.
+fn resolve_query_digest(request: &RecallRequest) -> [u8; 32] {
+    request
+        .query_digest
+        .unwrap_or_else(|| *blake3::hash(request.query.as_bytes()).as_bytes())
+}
+
+/// Applies cursor-based pagination to a deterministically sorted evidence
+/// list. Returns `(page, next_continuation)`.
+fn paginate_evidence(
+    mut evidence: Vec<RecallEvidence>,
+    continuation: Option<&str>,
+    limit: usize,
+) -> (Vec<RecallEvidence>, Option<String>) {
+    if let Some(cursor_str) = continuation {
+        if let Some(cursor) = RecallCursor::decode(cursor_str) {
+            evidence.retain(|e| cursor.is_after(e.score, e.node.id));
+        }
+    }
+    // Take limit+1 to detect whether a next page exists.
+    let has_more = evidence.len() > limit;
+    let page: Vec<_> = evidence.drain(..limit.min(evidence.len())).collect();
+    let next_continuation = if has_more {
+        page.last().map(|last| {
+            RecallCursor {
+                node_id: last.node.id,
+                score_bits: last.score.to_bits(),
+            }
+            .encode()
+        })
+    } else {
+        None
+    };
+    (page, next_continuation)
+}
+
+/// Computes a deterministic content digest over the returned evidence set:
+/// sort by node.id, then blake3 of (node.id + revision + score) per entry.
+fn compute_content_digest(evidence: &[RecallEvidence]) -> [u8; 32] {
+    let mut sorted: Vec<&RecallEvidence> = evidence.iter().collect();
+    sorted.sort_by_key(|e| e.node.id);
+    let mut hasher = blake3::Hasher::new();
+    for e in sorted {
+        hasher.update(&e.node.id.to_bytes());
+        hasher.update(&e.node.revision.to_be_bytes());
+        hasher.update(&e.score.to_bits().to_be_bytes());
+    }
+    *hasher.finalize().as_bytes()
 }

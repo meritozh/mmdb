@@ -10,7 +10,7 @@ mod checkpoints;
 mod history;
 mod records;
 mod search;
-mod storage;
+pub(crate) mod storage;
 mod types;
 
 #[cfg(test)]
@@ -94,27 +94,37 @@ impl From<fjall::Error> for ContextError {
 
 pub type ContextResult<T> = Result<T, ContextError>;
 
-pub(super) struct ContextPartitions {
-    headers: PartitionHandle,
-    heads: PartitionHandle,
-    payloads: PartitionHandle,
-    names: PartitionHandle,
-    action_names: PartitionHandle,
-    operations: PartitionHandle,
-    history_order: PartitionHandle,
-    history_heads: PartitionHandle,
-    events: PartitionHandle,
-    calls: PartitionHandle,
-    results: PartitionHandle,
-    postings: PartitionHandle,
-    record_terms: PartitionHandle,
-    adjacency: PartitionHandle,
-    pending: PartitionHandle,
-    messages: PartitionHandle,
-    checkpoints: PartitionHandle,
-    lifecycle: PartitionHandle,
+pub(crate) struct ContextPartitions {
+    pub(crate) headers: PartitionHandle,
+    pub(crate) heads: PartitionHandle,
+    pub(crate) payloads: PartitionHandle,
+    pub(crate) names: PartitionHandle,
+    pub(crate) action_names: PartitionHandle,
+    pub(crate) operations: PartitionHandle,
+    pub(crate) history_order: PartitionHandle,
+    pub(crate) history_heads: PartitionHandle,
+    pub(crate) events: PartitionHandle,
+    pub(crate) calls: PartitionHandle,
+    pub(crate) results: PartitionHandle,
+    pub(crate) postings: PartitionHandle,
+    pub(crate) record_terms: PartitionHandle,
+    pub(crate) adjacency: PartitionHandle,
+    pub(crate) pending: PartitionHandle,
+    pub(crate) messages: PartitionHandle,
+    pub(crate) checkpoints: PartitionHandle,
+    pub(crate) lifecycle: PartitionHandle,
+    /// Entity identity MVP (A2): secondary index mapping the globally-unique
+    /// `(namespace, entity_type, external_key)` triple (and its aliases) to a
+    /// context record id. Mirrors the `names` / `action_names` secondary
+    /// indexes but is dedicated to entity identity resolution.
+    pub(crate) entity_identity: PartitionHandle,
+    /// Extraction transactions (A3): persisted `ExtractionReceipt` keyed by the
+    /// caller-supplied operation id, plus an `Incomplete` crash-marker set
+    /// before the durable batch commits.
+    pub(crate) extraction_receipts: PartitionHandle,
+    pub(crate) extraction_incomplete: PartitionHandle,
     #[cfg(test)]
-    fail_commit_ack: std::sync::atomic::AtomicBool,
+    pub(crate) fail_commit_ack: std::sync::atomic::AtomicBool,
 }
 
 impl ContextPartitions {
@@ -139,6 +149,9 @@ impl ContextPartitions {
             messages: p("context_messages_v1")?,
             checkpoints: p("context_checkpoints_v1")?,
             lifecycle: p("context_lifecycle_v1")?,
+            entity_identity: p("context_entity_identity_v1")?,
+            extraction_receipts: p("context_extraction_receipts_v1")?,
+            extraction_incomplete: p("context_extraction_incomplete_v1")?,
             #[cfg(test)]
             fail_commit_ack: std::sync::atomic::AtomicBool::new(false),
         })
@@ -146,9 +159,9 @@ impl ContextPartitions {
 }
 
 pub struct ContextStore<'a> {
-    db: &'a MemoryDatabase,
-    parts: &'a ContextPartitions,
-    access: ContextAccess,
+    pub(crate) db: &'a MemoryDatabase,
+    pub(crate) parts: &'a ContextPartitions,
+    pub(crate) access: ContextAccess,
 }
 
 impl MemoryDatabase {

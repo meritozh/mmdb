@@ -323,6 +323,16 @@ pub struct CheckpointInput {
     pub payload: Value,
 }
 
+impl RecordHeader {
+    /// Whether this record is currently "live" for recall at `at_ms`: it must be
+    /// in the [`RecordState::Active`] lifecycle state **and** its
+    /// [`TemporalFacts::is_valid_at`] window must cover `at_ms`. This mirrors
+    /// `MemoryNode::is_valid_at` at the working-context layer.
+    pub fn is_valid_at(&self, at_ms: i64) -> bool {
+        self.state == RecordState::Active && self.temporal.is_valid_at(at_ms)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextRecord {
     pub header: RecordHeader,

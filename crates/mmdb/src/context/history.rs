@@ -397,7 +397,7 @@ impl ContextStore<'_> {
             .transpose()
     }
 
-    pub(super) fn history_anchor_locked(
+    pub(crate) fn history_anchor_locked(
         &self,
         session: &str,
         sequence: u64,
@@ -410,7 +410,7 @@ impl ContextStore<'_> {
         self.head_locked(&decode(&record)?)
     }
 
-    pub(super) fn message_available_locked(&self, history: &HistoryEntry) -> ContextResult<bool> {
+    pub(crate) fn message_available_locked(&self, history: &HistoryEntry) -> ContextResult<bool> {
         let id = match &history.kind {
             HistoryKind::AssistantStarted { message_id }
             | HistoryKind::AssistantFragment { message_id, .. }
@@ -431,7 +431,7 @@ impl ContextStore<'_> {
         Ok(!state.unavailable)
     }
 
-    pub(super) fn invalidate_message(
+    pub(crate) fn invalidate_message(
         &self,
         batch: &mut fjall::Batch,
         history: &HistoryEntry,

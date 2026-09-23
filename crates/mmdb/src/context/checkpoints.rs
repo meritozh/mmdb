@@ -13,7 +13,7 @@ impl ContextStore<'_> {
         let _guard = self.db.write_lock.lock();
         self.availability_epoch_locked()
     }
-    pub(super) fn availability_epoch_locked(&self) -> ContextResult<u64> {
+    pub(crate) fn availability_epoch_locked(&self) -> ContextResult<u64> {
         self.parts
             .lifecycle
             .get(owner_key(&self.access.owner))?
@@ -31,7 +31,7 @@ impl ContextStore<'_> {
     /// Old stores did not distinguish corrections from erasure. Their current
     /// epoch is the conservative baseline: never revive an older summary whose
     /// unlisted input may already have been purged by an older writer.
-    pub(super) fn checkpoint_redaction_epoch_locked(&self) -> ContextResult<u64> {
+    pub(crate) fn checkpoint_redaction_epoch_locked(&self) -> ContextResult<u64> {
         let current = self.availability_epoch_locked()?;
         let tracked = self
             .parts
@@ -55,7 +55,7 @@ impl ContextStore<'_> {
         }
     }
 
-    pub(super) fn advance_availability_epoch(
+    pub(crate) fn advance_availability_epoch(
         &self,
         batch: &mut fjall::Batch,
     ) -> ContextResult<u64> {
@@ -78,7 +78,7 @@ impl ContextStore<'_> {
         Ok(next)
     }
 
-    pub(super) fn invalidate_checkpoint_payloads(
+    pub(crate) fn invalidate_checkpoint_payloads(
         &self,
         batch: &mut fjall::Batch,
         epoch: u64,
