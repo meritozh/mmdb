@@ -30,9 +30,12 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use ulid::Ulid;
 
+mod index_repair;
+
 /// High-level handle. See the crate-level docs for a quickstart.
 pub struct Database {
     pub(crate) storage: Arc<Storage>,
+    index_repairs: index_repair::IndexRepairs,
     pub(crate) vector_store: Arc<VectorStore>,
     pub(crate) graph_store: Arc<GraphStore>,
     pub(crate) blob_store: Arc<BlobStore>,
@@ -154,6 +157,7 @@ impl Database {
         validate_profile(&profile)?;
         runtime_store.put_profile(config.tenant, &profile)?;
         let db = Self {
+            index_repairs: index_repair::IndexRepairs::open(&storage, config.tenant)?,
             storage,
             vector_store,
             graph_store,
@@ -171,6 +175,7 @@ impl Database {
             clients,
             profile: RwLock::new(profile),
         };
+        db.recover_node_indexes()?;
         if requested_profile.is_some() {
             db.append_audit(
                 Ulid::new(),
@@ -352,6 +357,7 @@ impl Database {
         }
 
         let id = node.id;
+        self.recover_node_indexes()?;
         let previous = self.storage.get_node(self.config.tenant, id)?;
         if previous.is_some() {
             node.updated_at_ms = crate::now_ms();
@@ -366,6 +372,8 @@ impl Database {
 
         let previous_blob_hash = previous.as_ref().and_then(|node| blob_hash(&node.content));
         let next_blob_hash = blob_hash(&node.content);
+        self.index_repairs
+            .begin(id, previous.as_ref(), Some(&node))?;
         let acquired_next_blob =
             if !blob_ref_already_acquired && next_blob_hash != previous_blob_hash {
                 if let Some(hash) = next_blob_hash {
@@ -379,7 +387,11 @@ impl Database {
             };
 
         if let Err(err) = self.storage.put_node(&node) {
-            if acquired_next_blob {
+            // SyncAll may fail after the base batch became visible. Keep its
+            // blob reservation unless we know the new reference was not installed.
+            if acquired_next_blob
+                && matches!(self.get(id), Ok(ref found) if found.as_ref().and_then(|n|blob_hash(&n.content)) != next_blob_hash)
+            {
                 if let Some(hash) = next_blob_hash {
                     let _ = self.blob_store.dec_ref(&hash);
                 }
@@ -435,6 +447,7 @@ impl Database {
             json!({"before": previous_snapshot, "after": node_snapshot(&node)}),
             None,
         )?;
+        self.index_repairs.finish()?;
         Ok(id)
     }
 
@@ -546,13 +559,9 @@ impl Database {
         key: &str,
         value: &serde_json::Value,
     ) -> Result<Vec<MemoryNode>> {
-        let ids = self
+        let mut nodes = self
             .storage
-            .node_ids_by_metadata(self.config.tenant, key, value)?;
-        let mut nodes = ids
-            .into_iter()
-            .filter_map(|id| self.storage.get_node(self.config.tenant, id).transpose())
-            .collect::<Result<Vec<_>>>()?;
+            .nodes_by_metadata(self.config.tenant, key, value)?;
         nodes.sort_by(|left, right| {
             left.created_at_ms
                 .cmp(&right.created_at_ms)
@@ -634,14 +643,17 @@ impl Database {
     /// Hard-delete a node and all of its embeddings from every index.
     pub fn delete(&self, id: Ulid) -> Result<()> {
         let _guard = self.node_mutation_lock.lock();
+        self.recover_node_indexes()?;
         let operation_id = Ulid::new();
         if let Some(node) = self.storage.get_node(self.config.tenant, id)? {
+            self.index_repairs.begin(id, Some(&node), None)?;
+            // Commit removal of the owning record before releasing its reference.
+            self.storage.delete_node(self.config.tenant, id)?;
             for emb in &node.embeddings {
                 self.vector_store
                     .delete(self.config.tenant, &emb.model, id)?;
             }
             self.release_blob_ref(&node.content)?;
-            self.storage.delete_node(self.config.tenant, id)?;
             self.lexical_index.delete(self.config.tenant, id)?;
             self.access_store.delete(self.config.tenant, id)?;
             self.catalog
@@ -655,6 +667,7 @@ impl Database {
                 json!({"before": node_snapshot(&node)}),
                 None,
             )?;
+            self.index_repairs.finish()?;
             Ok(())
         } else {
             self.storage.delete_node(self.config.tenant, id)?;
@@ -694,10 +707,15 @@ impl Database {
                 .build(),
         };
         let hash = blob_hash(&node.content).expect("blob content always has a hash");
-        match self.insert_inner(node, true, true) {
+        let id = node.id;
+        let _guard = self.node_mutation_lock.lock();
+        match self.insert_inner_unlocked(node, true, true) {
             Ok(id) => Ok(id),
             Err(err) => {
-                let _ = self.blob_store.dec_ref(&hash);
+                // A failure after the node commit must not release its live content.
+                if matches!(self.get(id), Ok(None)) {
+                    let _ = self.blob_store.dec_ref(&hash);
+                }
                 Err(err)
             }
         }

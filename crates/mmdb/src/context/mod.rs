@@ -41,6 +41,7 @@ pub enum ContextError {
     NotFound(ContextRef),
     Unavailable(ContextRef),
     RevisionConflict { expected: u64, actual: u64 },
+    AvailabilityConflict { expected: u64, actual: u64 },
     HistoryConflict { expected: u64, actual: u64 },
     TypeConflict(String),
     IdempotencyConflict,
@@ -61,6 +62,7 @@ impl fmt::Display for ContextError {
             Self::NotFound(r) => write!(f, "context record not found: {}", r.id),
             Self::Unavailable(r) => write!(f, "context record or its source is unavailable: {}", r.id),
             Self::RevisionConflict { expected, actual } => write!(f, "context revision conflict: expected {expected}, actual {actual}"),
+            Self::AvailabilityConflict { expected, actual } => write!(f, "context availability conflict: expected {expected}, actual {actual}"),
             Self::HistoryConflict { expected, actual } => write!(f, "history position conflict: expected {expected}, actual {actual}"),
             Self::TypeConflict(name) => write!(f, "context type already has a different definition: {name}"),
             Self::IdempotencyConflict => write!(f, "operation or event identity was reused with different content"),
@@ -149,6 +151,24 @@ pub struct ContextStore<'a> {
     db: &'a MemoryDatabase,
     parts: &'a ContextPartitions,
     access: ContextAccess,
+}
+
+/// Keeps validated source heads and availability stable until dropped.
+///
+/// This guard holds the context database's write lock. Only perform bounded,
+/// synchronous work while holding it; do not call back into this database,
+/// await, or run external effects. When coordinating with a separate state
+/// store, always acquire this guard before that store's write lock.
+#[must_use = "source validity is protected only while the guard is held"]
+pub struct CurrentSourcesGuard<'a> {
+    _lock: parking_lot::MutexGuard<'a, ()>,
+    availability_epoch: u64,
+}
+
+impl CurrentSourcesGuard<'_> {
+    pub fn availability_epoch(&self) -> u64 {
+        self.availability_epoch
+    }
 }
 
 impl MemoryDatabase {

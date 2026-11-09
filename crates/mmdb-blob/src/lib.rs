@@ -100,6 +100,7 @@ impl PutOutcome {
 
 /// Public API of the blob store.
 pub struct BlobStore {
+    mutation: parking_lot::RwLock<()>,
     root: PathBuf,
     meta: Arc<MetaStore>,
 }
@@ -131,7 +132,11 @@ impl BlobStore {
         let root = path.as_ref().to_path_buf();
         fs::ensure_layout(&root)?;
         let meta = Arc::new(MetaStore::open(&root)?);
-        let store = Self { root, meta };
+        let store = Self {
+            root,
+            meta,
+            mutation: Default::default(),
+        };
         store.reconcile_on_open(repair)?;
         Ok(store)
     }
@@ -154,6 +159,7 @@ impl BlobStore {
         let (hash, bytes) = fs::hash_and_read(&mut reader)?;
         let size = bytes.len() as u64;
 
+        let _guard = self.mutation.write();
         // Fast path: already tracked?
         if let Some(existing) = self.meta.get(&hash)? {
             // Bump refcount; size on the record is authoritative.
@@ -179,22 +185,26 @@ impl BlobStore {
     /// memory, but preserving the trait object keeps us forward-compatible
     /// with a future zero-copy mmap implementation.
     pub fn get_stream(&self, hash: &[u8; 32]) -> Result<Box<dyn Read + Send>> {
+        let _guard = self.mutation.read();
         let BlobMeta { chunked, size, .. } = self.meta.get(hash)?.ok_or(Error::NotFound)?;
         let data = fs::read_blob_bytes(&self.root, hash, chunked, size)?;
         Ok(Box::new(Cursor::new(data)))
     }
 
     pub fn inc_ref(&self, hash: &[u8; 32]) -> Result<()> {
+        let _guard = self.mutation.write();
         self.meta.inc_ref(hash)
     }
 
     pub fn dec_ref(&self, hash: &[u8; 32]) -> Result<()> {
+        let _guard = self.mutation.write();
         self.meta.dec_ref(hash)
     }
 
     /// Remove all on-disk blobs whose refcount is 0. Returns the count
     /// of removed blobs.
     pub fn gc(&self) -> Result<usize> {
+        let _guard = self.mutation.write();
         let garbage: Vec<[u8; 32]> = self
             .meta
             .iter_all()?

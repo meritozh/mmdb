@@ -96,11 +96,19 @@ impl Storage {
     ) -> Result<Vec<MemoryNode>> {
         let (lo, hi) = keys::time_range(tenant, from_ms, to_ms);
         let mut out = Vec::new();
-        for kv in self.nodes_by_time.range(lo..hi) {
+        if limit == 0 {
+            return Ok(out);
+        }
+        let index = self.nodes_by_time.snapshot_at(self.keyspace.instant());
+        let nodes = self.nodes.snapshot_at(index.seqno);
+        for kv in index.range(lo..hi) {
             let (k, _) = kv.map_err(|e| Error::Storage(e.to_string()))?;
             if let Some(id) = keys::id_from_time_key(&k) {
-                if let Some(n) = self.get_node(tenant, id)? {
-                    out.push(n);
+                if let Some(n) = nodes
+                    .get(keys::node_key(tenant, id))
+                    .map_err(|e| Error::Storage(e.to_string()))?
+                {
+                    out.push(codec::decode_node(&n)?);
                     if out.len() >= limit {
                         break;
                     }
@@ -192,18 +200,56 @@ impl Storage {
         field: &str,
         value: &serde_json::Value,
     ) -> Result<HashSet<Ulid>> {
+        self.metadata_matches(
+            tenant,
+            field,
+            value,
+            &self.meta_index.snapshot_at(self.keyspace.instant()),
+        )
+        .map(|ids| ids.into_iter().collect())
+    }
+
+    fn metadata_matches(
+        &self,
+        tenant: u32,
+        field: &str,
+        value: &serde_json::Value,
+        index: &fjall::Snapshot,
+    ) -> Result<Vec<Ulid>> {
         let (lo, hi) = meta_index_range(tenant, field, value)?;
-        let mut out = HashSet::new();
-        for kv in self.meta_index.range(lo..hi) {
+        let mut out = Vec::new();
+        for kv in index.range(lo..hi) {
             let (k, v) = kv.map_err(|e| Error::Storage(e.to_string()))?;
             if !meta_index_value_matches(&v, field, value) {
                 continue;
             }
             if let Some(id) = id_from_meta_index_key(&k) {
-                out.insert(id);
+                out.push(id);
             }
         }
         Ok(out)
+    }
+    /// Both halves of the index join observe the same committed batch.
+    pub fn nodes_by_metadata(
+        &self,
+        tenant: u32,
+        field: &str,
+        value: &serde_json::Value,
+    ) -> Result<Vec<MemoryNode>> {
+        let index = self.meta_index.snapshot_at(self.keyspace.instant());
+        let nodes = self.nodes.snapshot_at(index.seqno);
+        self.metadata_matches(tenant, field, value, &index)?
+            .into_iter()
+            .map(|id| {
+                let bytes = nodes
+                    .get(keys::node_key(tenant, id))
+                    .map_err(|e| Error::Storage(e.to_string()))?
+                    .ok_or_else(|| {
+                        Error::Storage(format!("metadata index refers to missing node {id}"))
+                    })?;
+                codec::decode_node(&bytes)
+            })
+            .collect()
     }
 }
 

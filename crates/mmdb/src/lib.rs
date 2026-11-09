@@ -88,5 +88,5 @@ pub use runtime::{
     MemoryProfile, ProjectionState, ProjectionStatus, SupportedContent,
 };
 pub use search::{Hit, HybridOpts, VectorFilter};
-pub use state::{NamespacedStateMutation, StateEntry, StateMutation, StateStore};
+pub use state::{NamespacedStateMutation, StateEntry, StateMutation, StatePage, StateStore};
 pub use store_format::StoreFormatDescriptor;

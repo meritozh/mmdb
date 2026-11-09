@@ -1,7 +1,7 @@
 use super::super::{Actor, OperationId, RecordState, Scope};
 use super::*;
 use serde::{de::DeserializeOwned, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use ulid::Ulid;
 
 pub(super) fn validate_name(value: &str, label: &str) -> ContextResult<()> {
@@ -166,7 +166,16 @@ impl ContextStore<'_> {
     }
 
     pub(super) fn available_locked(&self, pin: &RecordPin, active: bool) -> ContextResult<bool> {
-        self.available_walk(pin, active, None, 0, &mut 0, &mut BTreeSet::new())
+        self.available_memoized(pin, active, &mut BTreeMap::new())
+    }
+
+    pub(super) fn available_memoized(
+        &self,
+        pin: &RecordPin,
+        active: bool,
+        memo: &mut BTreeMap<(RecordPin, usize), usize>,
+    ) -> ContextResult<bool> {
+        self.available_walk(pin, active, None, 0, &mut 0, &mut BTreeSet::new(), memo)
     }
 
     fn available_walk(
@@ -177,13 +186,26 @@ impl ContextStore<'_> {
         depth: usize,
         count: &mut usize,
         path: &mut BTreeSet<RecordPin>,
+        memo: &mut BTreeMap<(RecordPin, usize), usize>,
     ) -> ContextResult<bool> {
+        let prior = *count;
         *count += 1;
         if depth > 32 || *count > 4096 {
             return Err(ContextError::BudgetExceeded);
         }
         if excluded == Some(&pin.record) || !path.insert(pin.clone()) {
             return Ok(false);
+        }
+        // Only cache successful, acyclic walks at the same remaining depth.
+        // Charge their original cost so reuse cannot widen the traversal budget.
+        if let Some(cost) = memo.get(&(pin.clone(), depth)) {
+            *count = prior + cost;
+            path.remove(pin);
+            return if *count > 4096 {
+                Err(ContextError::BudgetExceeded)
+            } else {
+                Ok(true)
+            };
         }
         let header = match self.header_locked(pin) {
             Ok(header) => header,
@@ -229,12 +251,15 @@ impl ContextStore<'_> {
             return Ok(false);
         }
         for source in &header.sources {
-            if !self.available_walk(source, active, excluded, depth + 1, count, path)? {
+            if !self.available_walk(source, active, excluded, depth + 1, count, path, memo)? {
                 path.remove(pin);
                 return Ok(false);
             }
         }
         path.remove(pin);
+        if memo.len() < 4096 {
+            memo.insert((pin.clone(), depth), *count - prior);
+        }
         Ok(true)
     }
 
@@ -258,6 +283,7 @@ impl ContextStore<'_> {
         }
         let mut count = 1;
         let mut path = BTreeSet::new();
+        let mut memo = BTreeMap::new();
         for source in sources {
             if source.record.kind == RecordKind::Type {
                 return Err(ContextError::InvalidInput(
@@ -268,7 +294,7 @@ impl ContextStore<'_> {
             if header.scope != *scope && header.scope != Scope::Personal {
                 return Err(ContextError::AccessDenied);
             }
-            if !self.available_walk(source, true, revising, 1, &mut count, &mut path)? {
+            if !self.available_walk(source, true, revising, 1, &mut count, &mut path, &mut memo)? {
                 if revising.is_some() {
                     return Err(ContextError::InvalidInput("revision sources must be available and cannot depend on the revised record".into()));
                 }
@@ -293,12 +319,13 @@ impl ContextStore<'_> {
         }
         let mut count = 1;
         let mut path = BTreeSet::new();
+        let mut memo = BTreeMap::new();
         for source in sources {
             let header = self.header_locked(source)?;
             if header.scope != *scope && header.scope != Scope::Personal {
                 return Err(ContextError::AccessDenied);
             }
-            if !self.available_walk(source, false, None, 1, &mut count, &mut path)? {
+            if !self.available_walk(source, false, None, 1, &mut count, &mut path, &mut memo)? {
                 return Err(ContextError::Unavailable(source.record.clone()));
             }
         }

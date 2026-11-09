@@ -3,6 +3,125 @@ use super::*;
 use std::sync::atomic::Ordering;
 
 #[test]
+fn current_sources_guard_keeps_retraction_after_the_protected_commit() {
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(MemoryDatabase::create_context(dir.path().join("context")).unwrap());
+    let access = ContextAccess::new("owner", Actor::User);
+    let context = db.context(access.clone()).unwrap();
+    let pin = context
+        .append_history(
+            OperationId::new(),
+            HistoryInput {
+                sources: vec![],
+                session: "session".into(),
+                event_id: "request".into(),
+                scope: Scope::Personal,
+                kind: HistoryKind::UserMessage,
+                media_type: "text/plain".into(),
+                occurred_at_ms: 1,
+                expected_sequence: None,
+            },
+            b"source".as_slice(),
+        )
+        .unwrap()
+        .pin;
+    let guard = context
+        .validate_current_guard(std::slice::from_ref(&pin), None, Some(0))
+        .unwrap();
+    assert_eq!(guard.availability_epoch(), 0);
+
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let other_db = db.clone();
+    let other_pin = pin.clone();
+    let thread = std::thread::spawn(move || {
+        let context = other_db.context(access).unwrap();
+        started_tx.send(()).unwrap();
+        let result = context.retract(OperationId::new(), other_pin);
+        done_tx.send(result).unwrap();
+    });
+    started_rx.recv().unwrap();
+    assert!(matches!(
+        done_rx.recv_timeout(Duration::from_millis(50)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+
+    // A real commit in a separate state root can complete under the guard.
+    let state = crate::StateStore::open_path(
+        dir.path().join("state"),
+        0,
+        &crate::StoreFormatDescriptor::new("guard-test-v1").unwrap(),
+    )
+    .unwrap();
+    state
+        .put("approval", "accepted", serde_json::json!({ "source": pin }))
+        .unwrap();
+    drop(guard);
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    thread.join().unwrap();
+    assert!(state.get("approval", "accepted").unwrap().is_some());
+    assert!(matches!(
+        context.validate_current_guard(std::slice::from_ref(&pin), None, None),
+        Err(ContextError::Unavailable(_))
+    ));
+    assert!(matches!(
+        context.validate_current_guard(&[], None, Some(0)),
+        Err(ContextError::AvailabilityConflict {
+            expected: 0,
+            actual: 1
+        })
+    ));
+}
+
+#[test]
+fn current_sources_guard_rejects_stale_and_out_of_scope_sources_without_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = MemoryDatabase::create_context(dir.path().join("context")).unwrap();
+    let context = db
+        .context(ContextAccess::new("owner", Actor::User))
+        .unwrap();
+    let pin = context
+        .append_history(
+            OperationId::new(),
+            HistoryInput {
+                sources: vec![],
+                session: "session".into(),
+                event_id: "request".into(),
+                scope: Scope::Personal,
+                kind: HistoryKind::UserMessage,
+                media_type: "text/plain".into(),
+                occurred_at_ms: 1,
+                expected_sequence: None,
+            },
+            b"source".as_slice(),
+        )
+        .unwrap()
+        .pin;
+    let other = db
+        .context(ContextAccess::new("another-owner", Actor::System))
+        .unwrap();
+    assert!(matches!(
+        other.validate_current_guard(std::slice::from_ref(&pin), None, None),
+        Err(ContextError::AccessDenied)
+    ));
+    context.retract(OperationId::new(), pin.clone()).unwrap();
+    assert!(matches!(
+        context.validate_current_guard(std::slice::from_ref(&pin), None, None),
+        Err(ContextError::Unavailable(_))
+    ));
+    assert!(matches!(
+        context.validate_current_guard(&vec![pin; MAX_CONTEXT_SOURCES + 1], None, None),
+        Err(ContextError::BudgetExceeded)
+    ));
+}
+
+#[test]
 fn committed_history_survives_a_lost_acknowledgement_without_duplication() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("context");

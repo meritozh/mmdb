@@ -67,7 +67,14 @@ deletion primitive.
 
 When inserting over an existing id, the facade removes old vector entries,
 releases replaced blob references, updates storage indexes, and adjusts catalog
-stats for kind changes.
+stats for kind changes. The facade persists the affected model names before
+changing a node and reconciles unfinished vector updates against the base node
+on reopen. A crash can leave a conservative extra blob reference; the recovery
+contract does not provide transaction isolation across concurrent vector reads.
+
+`scan_by_time` and `nodes_by_metadata` select index entries and fetch nodes at
+the same published storage version. This applies to these individual reads,
+not to a sequence of separate API calls.
 
 ## Embedding Behavior
 

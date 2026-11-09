@@ -6,7 +6,7 @@ use mmdb_core::{Error, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -19,6 +19,15 @@ pub struct StateEntry {
     pub value: Value,
     pub revision: u64,
     pub updated_at_ms: i64,
+}
+
+/// A bounded physical scan. An empty page with a cursor still made progress
+/// through deleted records and must not be interpreted as the end of a scan.
+#[derive(Debug, Clone)]
+pub struct StatePage {
+    pub entries: Vec<StateEntry>,
+    pub next_after: Option<Vec<u8>>,
+    pub examined: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -71,11 +80,20 @@ struct StoredValue {
     deleted: bool,
 }
 
+/// Only namespaces explicitly used as sparse queues acquire a directory.
+#[derive(Default)]
+struct LiveDirectory {
+    keys: BTreeSet<Vec<u8>>,
+    after: Option<Vec<u8>>,
+    ready: bool,
+}
+type Directories = HashMap<String, LiveDirectory>;
+
 pub struct StateStore {
     tenant: u32,
     keyspace: Keyspace,
     partition: PartitionHandle,
-    write_lock: Mutex<()>,
+    write_lock: Mutex<Directories>,
     _lease: Option<StoreLease>,
 }
 
@@ -133,7 +151,7 @@ impl StateStore {
             tenant,
             keyspace,
             partition,
-            write_lock: Mutex::new(()),
+            write_lock: Mutex::default(),
             _lease: lease,
         })
     }
@@ -153,7 +171,7 @@ impl StateStore {
     }
 
     pub fn put(&self, namespace: &str, key: impl AsRef<[u8]>, value: Value) -> Result<u64> {
-        let _guard = self.write_lock.lock();
+        let mut directories = self.write_lock.lock();
         let storage_key = state_key(self.tenant, namespace, key.as_ref())?;
         let revision = self
             .get_stored(&storage_key)?
@@ -169,15 +187,20 @@ impl StateStore {
                 deleted: false,
             })?,
         );
-        batch
-            .commit()
-            .map_err(|error| Error::Storage(error.to_string()))?;
+        if let Err(error) = batch.commit() {
+            directories.clear(); // Commit visibility may be uncertain; rebuild from storage.
+            return Err(Error::Storage(error.to_string()));
+        }
+        if let Some(dir) = directories.get_mut(namespace) {
+            dir.keys.insert(key.as_ref().to_vec());
+        }
         Ok(revision)
     }
 
     pub fn apply(&self, namespace: &str, mutations: Vec<StateMutation>) -> Result<()> {
-        let _guard = self.write_lock.lock();
+        let mut directories = self.write_lock.lock();
         self.apply_namespaced_locked(
+            &mut directories,
             mutations
                 .into_iter()
                 .map(|mutation| NamespacedStateMutation::new(namespace, mutation))
@@ -190,8 +213,18 @@ impl StateStore {
     /// Every compare-and-swap precondition is checked before the batch is
     /// written. A conflict in any namespace leaves the entire batch unchanged.
     pub fn apply_namespaced(&self, mutations: Vec<NamespacedStateMutation>) -> Result<()> {
+        let mut directories = self.write_lock.lock();
+        self.apply_namespaced_locked(&mut directories, mutations)
+    }
+
+    /// Establish durability before acknowledging a receipt recovered after an
+    /// uncertain commit. Reading a visible value alone is not a durability
+    /// acknowledgement following an I/O error.
+    pub fn confirm_durable(&self) -> Result<()> {
         let _guard = self.write_lock.lock();
-        self.apply_namespaced_locked(mutations)
+        self.keyspace
+            .persist(PersistMode::SyncAll)
+            .map_err(|error| Error::Storage(error.to_string()))
     }
 
     pub fn scan_prefix(
@@ -241,6 +274,27 @@ impl StateStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        self.scan_page_after(namespace, prefix, after_exclusive, limit, usize::MAX)
+            .map(|page| page.entries)
+    }
+
+    /// Scan at most `max_examined` records after the cursor, including deleted
+    /// records, and return at most `limit` live entries. The cursor advances
+    /// past the last examined record when either budget is reached; one final
+    /// empty page may be needed to establish exhaustion.
+    pub fn scan_page_after(
+        &self,
+        namespace: &str,
+        prefix: impl AsRef<[u8]>,
+        after_exclusive: Option<&[u8]>,
+        limit: usize,
+        max_examined: usize,
+    ) -> Result<StatePage> {
+        if limit == 0 || max_examined == 0 {
+            return Err(Error::InvalidArgument(
+                "state page budgets must be positive".into(),
+            ));
+        }
         let prefix = prefix.as_ref();
         if after_exclusive.is_some_and(|cursor| !cursor.starts_with(prefix)) {
             return Err(Error::InvalidArgument(
@@ -257,7 +311,11 @@ impl StateStore {
             .cloned()
             .unwrap_or_else(|| storage_prefix.clone());
 
-        let mut entries = Vec::new();
+        let mut page = StatePage {
+            entries: Vec::new(),
+            next_after: None,
+            examined: 0,
+        };
         for item in self.partition.range(start..) {
             let (key, value) = item.map_err(|error| Error::Storage(error.to_string()))?;
             if !key.starts_with(&storage_prefix) {
@@ -269,21 +327,68 @@ impl StateStore {
             {
                 continue;
             }
+            page.examined += 1;
             let stored: StoredValue = serde_json::from_slice(&value)?;
-            if stored.deleted {
-                continue;
+            let logical_key = key[namespace_prefix.len()..].to_vec();
+            if !stored.deleted {
+                page.entries.push(StateEntry {
+                    key: logical_key.clone(),
+                    value: stored.value,
+                    revision: stored.revision,
+                    updated_at_ms: stored.updated_at_ms,
+                });
             }
-            entries.push(StateEntry {
-                key: key[namespace_prefix.len()..].to_vec(),
-                value: stored.value,
-                revision: stored.revision,
-                updated_at_ms: stored.updated_at_ms,
-            });
-            if entries.len() >= limit {
+            if page.entries.len() >= limit || page.examined >= max_examined {
+                page.next_after = Some(logical_key);
                 break;
             }
         }
-        Ok(entries)
+        Ok(page)
+    }
+
+    /// Read the first live entries in a sparse queue without repeatedly traversing
+    /// old revision tombstones. On first use after open, each call inspects at
+    /// most `budget` physical entries. None means call again to finish building
+    /// the directory. Writes behind its cursor are registered under the same lock.
+    /// Memory is proportional to live keys in this opt-in namespace.
+    pub fn sparse_queue_head(
+        &self,
+        namespace: &str,
+        limit: usize,
+        budget: usize,
+    ) -> Result<Option<StatePage>> {
+        if limit == 0 || budget == 0 {
+            return Err(Error::InvalidArgument(
+                "queue budgets must be positive".into(),
+            ));
+        }
+        let mut dirs = self.write_lock.lock();
+        let dir = dirs.entry(namespace.to_owned()).or_default();
+        let mut examined = 0;
+        if !dir.ready {
+            let page = self.scan_page_after(namespace, [], dir.after.as_deref(), budget, budget)?;
+            examined = page.examined;
+            dir.keys.extend(page.entries.into_iter().map(|e| e.key));
+            dir.after = page.next_after;
+            if dir.after.is_some() {
+                return Ok(None);
+            }
+            dir.ready = true;
+        }
+        let entries = dir
+            .keys
+            .iter()
+            .take(limit)
+            .map(|key| {
+                self.get(namespace, key)?
+                    .ok_or_else(|| Error::Storage("live state directory is inconsistent".into()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(StatePage {
+            examined: examined + entries.len(),
+            entries,
+            next_after: None,
+        }))
     }
 
     pub fn replace_prefix(
@@ -306,7 +411,7 @@ impl StateStore {
                 ));
             }
         }
-        let _guard = self.write_lock.lock();
+        let mut directories = self.write_lock.lock();
         let existing = self.scan_prefix(namespace, prefix, usize::MAX)?;
         let mut mutations = existing
             .into_iter()
@@ -322,6 +427,7 @@ impl StateStore {
             expected_revision: None,
         }));
         self.apply_namespaced_locked(
+            &mut directories,
             mutations
                 .into_iter()
                 .map(|mutation| NamespacedStateMutation::new(namespace, mutation))
@@ -329,7 +435,11 @@ impl StateStore {
         )
     }
 
-    fn apply_namespaced_locked(&self, mutations: Vec<NamespacedStateMutation>) -> Result<()> {
+    fn apply_namespaced_locked(
+        &self,
+        directories: &mut Directories,
+        mutations: Vec<NamespacedStateMutation>,
+    ) -> Result<()> {
         let mut prepared = Vec::with_capacity(mutations.len());
         let mut seen = HashSet::with_capacity(mutations.len());
         for NamespacedStateMutation {
@@ -358,17 +468,28 @@ impl StateStore {
             if let Some(expected) = expected_revision {
                 let actual = current.as_ref().map(|entry| entry.revision).unwrap_or(0);
                 if actual != *expected {
-                    return Err(Error::InvalidArgument(format!(
-                        "state revision conflict: expected {expected}, found {actual}"
-                    )));
+                    return Err(Error::StateRevisionConflict {
+                        namespace,
+                        key: key.clone(),
+                        expected: *expected,
+                        actual,
+                    });
                 }
             }
-            prepared.push((storage_key, current, mutation));
+            prepared.push((namespace, storage_key, current, mutation));
         }
 
         let now = crate::now_ms();
         let mut batch = self.keyspace.batch().durability(Some(PersistMode::SyncAll));
-        for (storage_key, current, mutation) in prepared {
+        let mut delta = Vec::new();
+        for (namespace, storage_key, current, mutation) in prepared {
+            if directories.contains_key(&namespace) {
+                let (key, present) = match &mutation {
+                    StateMutation::Put { key, .. } => (key, true),
+                    StateMutation::Delete { key, .. } => (key, false),
+                };
+                delta.push((namespace, key.clone(), present));
+            }
             match mutation {
                 StateMutation::Put { value, .. } => {
                     let revision = current.map_or(1, |entry| entry.revision.saturating_add(1));
@@ -398,9 +519,21 @@ impl StateStore {
                 }
             }
         }
-        batch
-            .commit()
-            .map_err(|error| Error::Storage(error.to_string()))
+        if let Err(error) = batch.commit() {
+            directories.clear();
+            return Err(Error::Storage(error.to_string()));
+        }
+        for (namespace, key, present) in delta {
+            let dir = directories
+                .get_mut(&namespace)
+                .expect("under the writer lock");
+            if present {
+                dir.keys.insert(key);
+            } else {
+                dir.keys.remove(&key);
+            }
+        }
+        Ok(())
     }
 
     fn get_stored(&self, key: &[u8]) -> Result<Option<StoredValue>> {
@@ -455,6 +588,57 @@ mod tests {
     };
     use serde_json::json;
 
+    #[test]
+    fn sparse_queue_rebuild_keeps_new_keys_behind_the_cursor_and_skips_old_tombstones() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("queue");
+        let format = StoreFormatDescriptor::new("test.queue-v1").unwrap();
+        let state = StateStore::open_path(&root, 0, &format).unwrap();
+        state
+            .apply(
+                "q",
+                (0..1024)
+                    .map(|i| StateMutation::Delete {
+                        key: format!("item/{i:04}").into_bytes(),
+                        expected_revision: None,
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        state.put("q", "z", json!(1)).unwrap();
+        assert!(state.sparse_queue_head("q", 64, 32).unwrap().is_none());
+        state.put("q", "a", json!(2)).unwrap();
+        while state.sparse_queue_head("q", 64, 32).unwrap().is_none() {}
+        for _ in 0..3 {
+            let page = state.sparse_queue_head("q", 64, 32).unwrap().unwrap();
+            assert_eq!(page.examined, 2);
+            assert_eq!(
+                page.entries
+                    .iter()
+                    .map(|e| e.key.clone())
+                    .collect::<Vec<_>>(),
+                [b"a".to_vec(), b"z".to_vec()]
+            );
+        }
+        state
+            .apply(
+                "q",
+                vec![StateMutation::Delete {
+                    key: b"a".to_vec(),
+                    expected_revision: Some(1),
+                }],
+            )
+            .unwrap();
+        drop(state);
+        let state = StateStore::open_path(root, 0, &format).unwrap();
+        let page = loop {
+            if let Some(p) = state.sparse_queue_head("q", 64, 64).unwrap() {
+                break p;
+            }
+        };
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].key, b"z");
+    }
     #[test]
     fn standalone_state_store_reopens_without_semantic_database() {
         let container = tempfile::tempdir().unwrap();
@@ -688,12 +872,69 @@ mod tests {
                 ],
             )
             .unwrap_err();
-        assert!(error.to_string().contains("revision conflict"));
+        assert!(matches!(
+            error,
+            Error::StateRevisionConflict { namespace, key, expected: 9, actual: 1 }
+                if namespace == "workflow" && key == b"run/1"
+        ));
         assert_eq!(
             state.get("workflow", b"run/1").unwrap().unwrap().value,
             json!("running")
         );
         assert!(state.get("workflow", b"run/2").unwrap().is_none());
+    }
+
+    #[test]
+    fn physical_page_budget_advances_across_deleted_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateStore::open_path(
+            dir.path().join("state"),
+            0,
+            &StoreFormatDescriptor::new("state-page-test-v1").unwrap(),
+        )
+        .unwrap();
+        let writes = (0..12)
+            .map(|n| StateMutation::Put {
+                key: format!("job/{n:02}").into_bytes(),
+                value: json!(n),
+                expected_revision: Some(0),
+            })
+            .collect();
+        state.apply("queue", writes).unwrap();
+        state
+            .apply(
+                "queue",
+                (0..10)
+                    .map(|n| StateMutation::Delete {
+                        key: format!("job/{n:02}").into_bytes(),
+                        expected_revision: Some(1),
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        let first = state.scan_page_after("queue", "job/", None, 2, 3).unwrap();
+        assert!(first.entries.is_empty());
+        assert_eq!(first.examined, 3);
+        assert_eq!(first.next_after, Some(b"job/02".to_vec()));
+        let mut cursor = first.next_after;
+        let mut values = Vec::new();
+        loop {
+            let page = state
+                .scan_page_after("queue", "job/", cursor.as_deref(), 2, 3)
+                .unwrap();
+            assert!(page.examined <= 3);
+            values.extend(page.entries.into_iter().map(|entry| entry.value));
+            cursor = page.next_after;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(values, vec![json!(10), json!(11)]);
+        assert!(state
+            .scan_prefix_after("queue", "job/", None, 0)
+            .unwrap()
+            .is_empty());
+        assert!(state.scan_page_after("queue", "job/", None, 2, 0).is_err());
     }
 
     #[test]

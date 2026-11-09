@@ -163,6 +163,7 @@ impl ContextStore<'_> {
         &self,
         pin: &RecordPin,
         at: Option<i64>,
+        memo: &mut BTreeMap<(RecordPin, usize), usize>,
     ) -> ContextResult<Option<RecordHeader>> {
         let header = match self.header_locked(pin) {
             Ok(header) => header,
@@ -170,7 +171,7 @@ impl ContextStore<'_> {
             Err(e) => return Err(e),
         };
         if at.is_some_and(|at| !header.temporal.contains_valid_time(at))
-            || !self.available_locked(pin, true)?
+            || !self.available_memoized(pin, true, memo)?
         {
             return Ok(None);
         }
@@ -182,7 +183,7 @@ impl ContextStore<'_> {
                     Err(error) => return Err(error),
                 };
                 if at.is_some_and(|at| !endpoint.temporal.contains_valid_time(at))
-                    || !self.available_locked(&endpoint.pin, true)?
+                    || !self.available_memoized(&endpoint.pin, true, memo)?
                 {
                     return Ok(None);
                 }
@@ -199,10 +200,11 @@ impl ContextStore<'_> {
                 "invalid bounded relation query".into(),
             ));
         }
+        let mut memo = BTreeMap::new();
         let _guard = self.db.write_lock.lock();
         let endpoint = self.head_locked(&query.endpoint)?;
         if self
-            .current_candidate(&endpoint.pin, query.valid_at_ms)?
+            .current_candidate(&endpoint.pin, query.valid_at_ms, &mut memo)?
             .is_none()
         {
             return Err(ContextError::Unavailable(query.endpoint));
@@ -261,7 +263,7 @@ impl ContextStore<'_> {
             }
             page.edges_examined += 1;
             let pin: RecordPin = decode(&bytes)?;
-            let Some(header) = self.current_candidate(&pin, query.valid_at_ms)? else {
+            let Some(header) = self.current_candidate(&pin, query.valid_at_ms, &mut memo)? else {
                 continue;
             };
             let endpoints = header.endpoints.as_ref().ok_or_else(|| {
@@ -303,6 +305,7 @@ impl ContextStore<'_> {
                 "invalid bounded context query".into(),
             ));
         }
+        let mut memo = BTreeMap::new();
         let _guard = self.db.write_lock.lock();
         let mut candidates: BTreeMap<ContextRef, (RecordPin, usize, Vec<RecordPin>)> =
             BTreeMap::new();
@@ -318,7 +321,7 @@ impl ContextStore<'_> {
             let head = self.head_locked(reference)?;
             candidates_examined += 1;
             if self
-                .current_candidate(&head.pin, query.valid_at_ms)?
+                .current_candidate(&head.pin, query.valid_at_ms, &mut memo)?
                 .is_some()
             {
                 candidates.insert(reference.clone(), (head.pin, 0, Vec::new()));
@@ -338,7 +341,10 @@ impl ContextStore<'_> {
                     let (_, value) = item?;
                     let pin: RecordPin = decode(&value)?;
                     candidates_examined += 1;
-                    if self.current_candidate(&pin, query.valid_at_ms)?.is_none() {
+                    if self
+                        .current_candidate(&pin, query.valid_at_ms, &mut memo)?
+                        .is_none()
+                    {
                         continue;
                     }
                     let entry =
@@ -371,7 +377,9 @@ impl ContextStore<'_> {
                 let (_, bytes) = item?;
                 edges_examined += 1;
                 let edge: RecordPin = decode(&bytes)?;
-                let Some(edge_header) = self.current_candidate(&edge, query.valid_at_ms)? else {
+                let Some(edge_header) =
+                    self.current_candidate(&edge, query.valid_at_ms, &mut memo)?
+                else {
                     continue;
                 };
                 let endpoints = edge_header.endpoints.ok_or_else(|| {
@@ -394,7 +402,7 @@ impl ContextStore<'_> {
                 candidates_examined += 1;
                 let head = self.head_locked(&other)?;
                 if self
-                    .current_candidate(&head.pin, query.valid_at_ms)?
+                    .current_candidate(&head.pin, query.valid_at_ms, &mut memo)?
                     .is_none()
                 {
                     continue;

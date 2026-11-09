@@ -10,6 +10,20 @@ fn action_name_key(owner: &str, scope: &Scope, name: &str) -> ContextResult<Vec<
     Ok(key)
 }
 
+/// Shared discovery/preparation check. Seeing both scopes does not make
+/// an action from one private scope applicable in another.
+fn applicable_target(definition: &ActionDefinition, target: &RecordHeader) -> ContextResult<()> {
+    if target.type_pin.as_ref() != Some(&definition.target_type) {
+        return Err(ContextError::InvalidInput(
+            "action target type version does not match".into(),
+        ));
+    }
+    if definition.scope != Scope::Personal && definition.scope != target.scope {
+        return Err(ContextError::AccessDenied);
+    }
+    Ok(())
+}
+
 impl ContextStore<'_> {
     pub fn define_action(
         &self,
@@ -234,7 +248,7 @@ impl ContextStore<'_> {
                 continue;
             }
             let definition = self.action_locked(&header.pin)?;
-            if target_record.header.type_pin.as_ref() != Some(&definition.target_type) {
+            if applicable_target(&definition, &target_record.header).is_err() {
                 continue;
             }
             let preconditions_met = conditions_match(&definition.preconditions, &properties);
@@ -283,14 +297,7 @@ impl ContextStore<'_> {
             return Err(ContextError::InvalidInput("action version changed".into()));
         }
         let target = self.current_action_target(&invocation.target)?;
-        if target.header.type_pin.as_ref() != Some(&definition.target_type) {
-            return Err(ContextError::InvalidInput(
-                "action target type version does not match".into(),
-            ));
-        }
-        if definition.scope != Scope::Personal && definition.scope != target.header.scope {
-            return Err(ContextError::AccessDenied);
-        }
+        applicable_target(&definition, &target.header)?;
         let RecordBody::Object(properties) = target.body else {
             return Err(ContextError::InvalidInput(
                 "action target is not an object".into(),

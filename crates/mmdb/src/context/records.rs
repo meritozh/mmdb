@@ -10,20 +10,47 @@ impl ContextStore<'_> {
         pins: &[RecordPin],
         valid_at_ms: Option<i64>,
     ) -> ContextResult<()> {
+        let _guard = self.validate_current_guard(pins, valid_at_ms, None)?;
+        Ok(())
+    }
+
+    /// Validate sources and retain their validity through a short synchronous
+    /// commit in another store. See [`CurrentSourcesGuard`] for lock ordering.
+    /// `expected_epoch` additionally protects observations made before this
+    /// call, including a set of dependencies discovered by a prior query.
+    pub fn validate_current_guard(
+        &self,
+        pins: &[RecordPin],
+        valid_at_ms: Option<i64>,
+        expected_epoch: Option<u64>,
+    ) -> ContextResult<CurrentSourcesGuard<'_>> {
         if pins.len() > MAX_CONTEXT_SOURCES {
             return Err(ContextError::BudgetExceeded);
         }
-        let _guard = self.db.write_lock.lock();
+        let guard = self.db.write_lock.lock();
+        let availability_epoch = self.availability_epoch_locked()?;
+        if let Some(expected) = expected_epoch {
+            if expected != availability_epoch {
+                return Err(ContextError::AvailabilityConflict {
+                    expected,
+                    actual: availability_epoch,
+                });
+            }
+        }
+        let mut memo = std::collections::BTreeMap::new();
         for pin in pins {
             let head = self.head_locked(&pin.record)?;
             if head.pin != *pin
-                || !self.available_locked(pin, true)?
+                || !self.available_memoized(pin, true, &mut memo)?
                 || valid_at_ms.is_some_and(|at| !head.temporal.contains_valid_time(at))
             {
                 return Err(ContextError::Unavailable(pin.record.clone()));
             }
         }
-        Ok(())
+        Ok(CurrentSourcesGuard {
+            _lock: guard,
+            availability_epoch,
+        })
     }
 
     pub fn save_object(

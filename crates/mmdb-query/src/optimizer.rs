@@ -92,19 +92,8 @@ impl Optimizer {
                         filter: Some(combine_optional_filter(filter, pred)),
                         model,
                     },
-                    LogicalPlan::GraphExpand {
-                        from,
-                        relation,
-                        depth,
-                    } if self.stats.estimate_selectivity(&pred) <= 0.5 => {
-                        LogicalPlan::GraphExpand {
-                            from: Box::new(
-                                self.optimize(LogicalPlan::Filter { input: from, pred }),
-                            ),
-                            relation,
-                            depth,
-                        }
-                    }
+                    // Expansion adds neighbors; selectivity cannot prove that
+                    // filtering the starting set is equivalent to filtering its output.
                     other => LogicalPlan::Filter {
                         input: Box::new(other),
                         pred,

@@ -10,6 +10,13 @@ pub enum Error {
     NotFound,
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    #[error("state revision conflict in {namespace}: expected {expected}, found {actual}")]
+    StateRevisionConflict {
+        namespace: String,
+        key: Vec<u8>,
+        expected: u64,
+        actual: u64,
+    },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]

@@ -1045,6 +1045,61 @@ fn source_validation_reserves_the_new_root_depth_and_aggregate_budget() {
 }
 
 #[test]
+fn action_discovery_and_preparation_share_the_same_target_scope() {
+    let d = tempfile::tempdir().unwrap();
+    let db = MemoryDatabase::create_context(d.path().join("db")).unwrap();
+    let a = Scope::Session(ulid::Ulid::new());
+    let b = Scope::Session(ulid::Ulid::new());
+    let mut access = access("owner");
+    access.scopes.extend([a.clone(), b.clone()]);
+    let host = db.context(access.clone()).unwrap();
+    let other = db.context(access).unwrap();
+    let raw = source(&host, "scope-evidence", "bounded");
+    let t = host
+        .define_type(OperationId::new(), definition("example.task"))
+        .unwrap()
+        .pin;
+    let mut target = object(&t, &raw, "target");
+    target.scope = b.clone();
+    let target = host.save_object(OperationId::new(), target).unwrap().pin;
+    for scope in [a, b.clone(), Scope::Personal] {
+        let allowed = scope == b || scope == Scope::Personal;
+        let pin = host
+            .define_action(
+                OperationId::new(),
+                ActionDefinition {
+                    name: "example.apply".into(),
+                    description: "Apply the change".into(),
+                    scope,
+                    target_type: t.clone(),
+                    inputs: BTreeMap::new(),
+                    preconditions: vec![],
+                    sources: vec![raw.clone()],
+                },
+            )
+            .unwrap()
+            .pin;
+        let offered = other
+            .actions_for(&target, 100, None)
+            .unwrap()
+            .actions
+            .iter()
+            .any(|v| v.pin == pin);
+        let prepared = other.prepare_action(
+            OperationId::new(),
+            ActionInvocation {
+                action: pin,
+                target: target.clone(),
+                inputs: BTreeMap::new(),
+                sources: vec![],
+            },
+        );
+        assert_eq!(offered, allowed);
+        assert_eq!(prepared.is_ok(), allowed);
+    }
+}
+
+#[test]
 fn action_contract_enforces_authority_versions_conditions_and_one_preparation() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Arc::new(MemoryDatabase::create_context(tmp.path().join("context")).unwrap());

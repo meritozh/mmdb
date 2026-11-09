@@ -113,40 +113,6 @@ fn executor_expands_graph_scores_with_udf_and_topks() {
 }
 
 #[test]
-fn cost_optimizer_places_selective_filter_before_graph_expand() {
-    let plan = LogicalPlan::Filter {
-        input: Box::new(LogicalPlan::GraphExpand {
-            from: Box::new(LogicalPlan::Scan {
-                table: TableId::Nodes,
-                filter: None,
-            }),
-            relation: Some("related".to_string()),
-            depth: 1,
-        }),
-        pred: Predicate::eq(FieldRef::Tenant, Literal::U32(1)),
-    };
-
-    let optimized = Optimizer::with_stats(Stats {
-        node_rows: 1_000,
-        estimated_filter_selectivity: 0.01,
-        ..Default::default()
-    })
-    .optimize(plan);
-
-    assert_eq!(
-        optimized,
-        LogicalPlan::GraphExpand {
-            from: Box::new(LogicalPlan::Scan {
-                table: TableId::Nodes,
-                filter: Some(Predicate::eq(FieldRef::Tenant, Literal::U32(1))),
-            }),
-            relation: Some("related".to_string()),
-            depth: 1,
-        }
-    );
-}
-
-#[test]
 fn histograms_estimate_filter_selectivity() {
     let histogram = FieldHistogram::from_counts([
         (Literal::NodeKind(NodeKind::Fact), 10),
@@ -166,39 +132,43 @@ fn histograms_estimate_filter_selectivity() {
 }
 
 #[test]
-fn histogram_optimizer_pushes_selective_filter_before_graph_expand() {
-    let plan = LogicalPlan::Filter {
-        input: Box::new(LogicalPlan::GraphExpand {
-            from: Box::new(LogicalPlan::Scan {
-                table: TableId::Nodes,
-                filter: None,
-            }),
-            relation: Some("related".to_string()),
-            depth: 1,
-        }),
-        pred: Predicate::kind_eq(NodeKind::Fact),
+fn graph_filter_keeps_its_output_semantics_after_optimization() {
+    let ctx = ExecutionContext {
+        nodes: vec![
+            Record::new("a", 1, NodeKind::Episode, 0),
+            Record::new("b", 1, NodeKind::Fact, 1),
+            Record::new("c", 1, NodeKind::Episode, 2),
+        ],
+        edges: vec![
+            EdgeRecord::new("a", "b", "next"),
+            EdgeRecord::new("b", "c", "next"),
+        ],
+        ..Default::default()
     };
-
-    let optimized = Optimizer::with_stats(Stats::default().with_histogram(
-        FieldRef::Kind,
-        FieldHistogram::from_counts([
-            (Literal::NodeKind(NodeKind::Fact), 10),
-            (Literal::NodeKind(NodeKind::Episode), 90),
-        ]),
-    ))
-    .optimize(plan);
-
-    assert_eq!(
-        optimized,
-        LogicalPlan::GraphExpand {
-            from: Box::new(LogicalPlan::Scan {
-                table: TableId::Nodes,
-                filter: Some(Predicate::kind_eq(NodeKind::Fact)),
-            }),
-            relation: Some("related".to_string()),
-            depth: 1,
+    let optimizer = Optimizer::with_stats(Stats {
+        estimated_filter_selectivity: 0.01,
+        ..Default::default()
+    });
+    for depth in [1, 2] {
+        for kind in [NodeKind::Episode, NodeKind::Fact, NodeKind::Entity] {
+            let plan = LogicalPlan::Filter {
+                input: Box::new(LogicalPlan::GraphExpand {
+                    from: Box::new(LogicalPlan::Scan {
+                        table: TableId::Nodes,
+                        filter: None,
+                    }),
+                    relation: Some("next".into()),
+                    depth,
+                }),
+                pred: Predicate::kind_eq(kind),
+            };
+            let rows = Executor::new(&ctx).execute(&plan).unwrap();
+            let optimized = Executor::new(&ctx)
+                .execute(&optimizer.optimize(plan))
+                .unwrap();
+            assert_eq!(rows, optimized);
         }
-    );
+    }
 }
 
 #[test]
