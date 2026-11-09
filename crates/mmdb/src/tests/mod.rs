@@ -1535,6 +1535,7 @@ mod agent_memory {
         LawyerFailureMode, LawyerProfile, MaintenanceTrigger, MemoryProfile, ProjectionState,
         ProjectionStatus, ProposedChange, RecallRequest, RecallStatus, SupportedContent,
     };
+    use blake3;
     use fjall::PersistMode;
     use mmdb_core::{Edge, MemoryState, NodeKind};
     use std::collections::BTreeMap;
@@ -2230,6 +2231,117 @@ mod agent_memory {
         historical_request.as_of_ms = 70;
         let historical_recall = block_on(db.recall(historical_request)).unwrap();
         assert_eq!(historical_recall.evidence[0].node.id, historical);
+    }
+
+    #[test]
+    fn graph_expansion_reaches_neighbours_of_seeds_beyond_candidate_limit() {
+        let dir = tempdir().unwrap();
+        let clients = ClientRegistry::new();
+        clients
+            .register_embedding(
+                "fixed-client",
+                Arc::new(FixedEmbedding {
+                    vector: vec![1.0, 0.0],
+                    projection: None,
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                }),
+            )
+            .unwrap();
+        let profile = MemoryProfile {
+            version: 1,
+            revision: 1,
+            embedding_profiles: vec![embedding_profile("p", "fixed-client", "m", 2)],
+            dreamer: None,
+            lawyer: None,
+        };
+        let db = Database::builder(dir.path())
+            .clients(clients)
+            .profile(profile)
+            .build()
+            .unwrap();
+
+        // Query vector is fixed at [1, 0]. Four vector seeds are inserted with
+        // controllable cosine similarity: the top two are exact matches and
+        // occupy ranks 1-2; the lower two rank 3 and 4.
+        let _v1 = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("vector seed one")
+                    .embedding("m", vec![1.0, 0.0])
+                    .build(),
+            )
+            .unwrap();
+        let _v2 = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("vector seed two")
+                    .embedding("m", vec![1.0, 0.0])
+                    .build(),
+            )
+            .unwrap();
+        // v3 (the graph neighbour) and v4 (the low-ranked seed) sit at vector
+        // ranks 3 and 4, i.e. just outside the candidate_limit = 4 budget once
+        // the lexical hits are also scored.
+        let v3 = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("vector seed three")
+                    .embedding("m", vec![0.9, 0.1])
+                    .build(),
+            )
+            .unwrap();
+        let v4 = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("vector seed four")
+                    .embedding("m", vec![0.7, 0.7])
+                    .build(),
+            )
+            .unwrap();
+
+        // Two lexical hits (unique token) fill ranks 1-2 alongside the exact
+        // vector seeds, so the seed budget of 4 is consumed by v1/v2 and the
+        // two lexical hits.
+        let id_a = Ulid::new();
+        let id_b = Ulid::new();
+        let (lex_hi, lex_lo) = if id_a < id_b {
+            (id_a, id_b)
+        } else {
+            (id_b, id_a)
+        };
+        let _lex_hi = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .id(lex_hi)
+                    .text("uniquetoken token")
+                    .build(),
+            )
+            .unwrap();
+        let _lex_lo = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .id(lex_lo)
+                    .text("uniquetoken token")
+                    .build(),
+            )
+            .unwrap();
+
+        // The low-ranked seed v4 points at v3. v3 is itself a (weaker) vector
+        // seed that sits just below the output budget; without graph expansion
+        // from v4 it is truncated, but the graph bump lifts it into the result.
+        let link = edge(v4, v3, "related", 0);
+        db.add_edge(link).unwrap();
+
+        let mut request = RecallRequest::new("uniquetoken");
+        request.candidate_limit = 4;
+        request.limit = 4;
+        request.graph_depth = 1;
+        let recalled = block_on(db.recall(request)).unwrap();
+        let ids: Vec<_> = recalled.evidence.iter().map(|item| item.node.id).collect();
+        assert!(
+            ids.contains(&v3),
+            "graph neighbour of an out-of-candidate-limit seed must be recalled, got {ids:?}"
+        );
     }
 
     #[test]
@@ -3757,6 +3869,238 @@ mod agent_memory {
         let raw = db.storage.nodes.get(key).unwrap().unwrap();
         let raw: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         assert!(raw.get("revision").is_none());
+    }
+
+    fn recall_test_db(dir: &std::path::Path) -> Database {
+        let clients = ClientRegistry::new();
+        clients
+            .register_embedding(
+                "recall-client",
+                Arc::new(FixedEmbedding {
+                    vector: vec![1.0, 0.0],
+                    projection: None,
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                }),
+            )
+            .unwrap();
+        let profile = MemoryProfile {
+            version: 1,
+            revision: 1,
+            embedding_profiles: vec![embedding_profile(
+                "recall",
+                "recall-client",
+                "recall-model",
+                2,
+            )],
+            dreamer: None,
+            lawyer: None,
+        };
+        Database::builder(dir)
+            .clients(clients)
+            .profile(profile)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn recall_truncation_sets_reason_and_continuation() {
+        let dir = tempdir().unwrap();
+        let db = recall_test_db(dir.path());
+        // 5 lexical seed nodes, each connected to 4 neighbours.
+        // graph_depth=1 expands the pool beyond candidate_limit=5.
+        let mut seed_ids = Vec::new();
+        for i in 0..5 {
+            let id = db
+                .insert(
+                    NodeBuilder::new(NodeKind::Fact)
+                        .text(format!("trunctoken seed{i}"))
+                        .embedding("recall-model", vec![1.0, 0.0])
+                        .build(),
+                )
+                .unwrap();
+            seed_ids.push(id);
+        }
+        for &seed in &seed_ids {
+            for j in 0..4 {
+                let neighbor = db
+                    .insert(
+                        NodeBuilder::new(NodeKind::Fact)
+                            .text(format!("neighbour content {seed:?} {j}"))
+                            .embedding("recall-model", vec![0.9, 0.1])
+                            .build(),
+                    )
+                    .unwrap();
+                db.add_edge(edge(seed, neighbor, "related", 10)).unwrap();
+            }
+        }
+        let mut request = RecallRequest::new("trunctoken");
+        request.candidate_limit = 5;
+        request.limit = 3;
+        request.graph_depth = 1;
+        let recalled = block_on(db.recall(request)).unwrap();
+        assert!(
+            recalled.truncated,
+            "expected truncation when candidates exceed candidate_limit, got {} evidence",
+            recalled.evidence.len()
+        );
+        let reason = recalled
+            .truncated_reason
+            .expect("truncated_reason must be set");
+        assert!(reason.contains("candidate_limit_exceeded"));
+        assert!(recalled.next_continuation.is_some());
+        assert_eq!(recalled.evidence.len(), 3);
+    }
+
+    #[test]
+    fn recall_continuation_covers_all_candidates() {
+        let dir = tempdir().unwrap();
+        let db = recall_test_db(dir.path());
+        for i in 0..20 {
+            db.insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text(format!("pageabletoken node{i}"))
+                    .embedding("recall-model", vec![1.0, 0.0])
+                    .build(),
+            )
+            .unwrap();
+        }
+        let mut all_ids: Vec<ulid::Ulid> = Vec::new();
+        let mut continuation = None;
+        loop {
+            let mut req = RecallRequest::new("pageabletoken");
+            req.candidate_limit = 50;
+            req.limit = 7;
+            req.graph_depth = 0;
+            req.continuation = continuation;
+            let recalled = block_on(db.recall(req)).unwrap();
+            for e in &recalled.evidence {
+                assert!(
+                    !all_ids.contains(&e.node.id),
+                    "duplicate node {} across pages",
+                    e.node.id
+                );
+                all_ids.push(e.node.id);
+            }
+            continuation = recalled.next_continuation;
+            if continuation.is_none() {
+                break;
+            }
+        }
+        assert_eq!(all_ids.len(), 20, "expected all 20 nodes across pages");
+    }
+
+    #[test]
+    fn recall_continuation_deterministic() {
+        let dir = tempdir().unwrap();
+        let db = recall_test_db(dir.path());
+        for i in 0..15 {
+            db.insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text(format!("determtoken node{i}"))
+                    .embedding("recall-model", vec![1.0, 0.0])
+                    .build(),
+            )
+            .unwrap();
+        }
+        fn collect_all(db: &Database) -> Vec<ulid::Ulid> {
+            let mut ids = Vec::new();
+            let mut continuation = None;
+            loop {
+                let mut req = RecallRequest::new("determtoken");
+                req.candidate_limit = 50;
+                req.limit = 4;
+                req.graph_depth = 0;
+                req.continuation = continuation;
+                let recalled = block_on(db.recall(req)).unwrap();
+                for e in &recalled.evidence {
+                    ids.push(e.node.id);
+                }
+                continuation = recalled.next_continuation;
+                if continuation.is_none() {
+                    break;
+                }
+            }
+            ids
+        }
+        let first = collect_all(&db);
+        let second = collect_all(&db);
+        assert_eq!(
+            first, second,
+            "two pagination runs must produce identical order"
+        );
+        assert_eq!(first.len(), 15);
+    }
+
+    #[test]
+    fn recall_digests_distinguish_graph_changes() {
+        let dir = tempdir().unwrap();
+        let db = recall_test_db(dir.path());
+        let node1 = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("digestbasetoken alpha")
+                    .embedding("recall-model", vec![1.0, 0.0])
+                    .build(),
+            )
+            .unwrap();
+        let node2 = db
+            .insert(
+                NodeBuilder::new(NodeKind::Fact)
+                    .text("digestbasetoken beta")
+                    .embedding("recall-model", vec![1.0, 0.0])
+                    .build(),
+            )
+            .unwrap();
+        let mut request = RecallRequest::new("digestbasetoken");
+        request.candidate_limit = 5;
+        request.limit = 5;
+        request.graph_depth = 1;
+        let before = block_on(db.recall(request.clone())).unwrap();
+        let content_before = before.content_digest;
+        let watermark_before = before.watermark;
+
+        // Add an edge — with graph_depth=1 this edge is traversed and its
+        // revision contributes to the recall watermark.
+        db.add_edge(edge(node1, node2, "related", 10)).unwrap();
+        let after = block_on(db.recall(request)).unwrap();
+        assert!(
+            after.content_digest != content_before || after.watermark != watermark_before,
+            "watermark or content_digest must change after graph data changes"
+        );
+    }
+
+    #[test]
+    fn recall_query_digest_matches_input() {
+        let dir = tempdir().unwrap();
+        let db = recall_test_db(dir.path());
+        db.insert(
+            NodeBuilder::new(NodeKind::Fact)
+                .text("querydigesttoken")
+                .embedding("recall-model", vec![1.0, 0.0])
+                .build(),
+        )
+        .unwrap();
+
+        let supplied: [u8; 32] = blake3::hash(b"my-custom-query").into();
+        let mut request = RecallRequest::new("querydigesttoken");
+        request.candidate_limit = 10;
+        request.limit = 5;
+        request.graph_depth = 0;
+        request.query_digest = Some(supplied);
+        let recalled = block_on(db.recall(request)).unwrap();
+        assert_eq!(recalled.query_digest, supplied);
+
+        let mut req2 = RecallRequest::new("querydigesttoken");
+        req2.candidate_limit = 10;
+        req2.limit = 5;
+        req2.graph_depth = 0;
+        let r2 = block_on(db.recall(req2.clone())).unwrap();
+        let r3 = block_on(db.recall(req2)).unwrap();
+        assert_eq!(r2.query_digest, r3.query_digest);
+        assert_eq!(
+            r2.query_digest,
+            *blake3::hash(b"querydigesttoken").as_bytes()
+        );
     }
 }
 

@@ -20,6 +20,7 @@ serde_json.workspace = true
 fjall.workspace = true
 blake3.workspace = true
 parking_lot.workspace = true
+base64 = "0.21"
 
 [dev-dependencies]
 tempfile = "3"

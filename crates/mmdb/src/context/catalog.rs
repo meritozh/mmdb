@@ -2,6 +2,7 @@ use super::super::{OperationId, RecordState, Scope, TemporalFacts};
 use super::storage::*;
 use super::*;
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 fn name_key(owner: &str, scope: &Scope, name: &str) -> ContextResult<Vec<u8>> {
     let mut key = owner_key(owner);
@@ -46,6 +47,34 @@ impl ContextStore<'_> {
             self.fresh_pin(RecordKind::Type),
             definition,
         )
+    }
+
+    /// Look up a type by name under the already-held write lock, creating a
+    /// minimal one when absent. Callers (`crate::entity`, `crate::extraction`)
+    /// already hold `write_lock`, so this must not re-acquire it.
+    pub(crate) fn ensure_type_locked(
+        &self,
+        name: &str,
+        kind: TypeKind,
+    ) -> ContextResult<RecordPin> {
+        let key = name_key(&self.access.owner, &Scope::Personal, name)?;
+        if let Some(reference) = self.parts.names.get(&key)? {
+            let record: ContextRef = decode(&reference)?;
+            return self.head_locked(&record).map(|header| header.pin);
+        }
+        let definition = TypeDefinition {
+            name: name.to_string(),
+            scope: Scope::Personal,
+            kind,
+            properties: BTreeMap::new(),
+        };
+        let receipt = self.write_type_locked(
+            OperationId::new(),
+            self.digest("define-type", &definition)?,
+            self.fresh_pin(RecordKind::Type),
+            definition,
+        )?;
+        Ok(receipt.pin)
     }
 
     pub fn revise_type(
@@ -209,7 +238,7 @@ impl ContextStore<'_> {
         })
     }
 
-    pub(super) fn type_definition_locked(&self, pin: &RecordPin) -> ContextResult<TypeDefinition> {
+    pub(crate) fn type_definition_locked(&self, pin: &RecordPin) -> ContextResult<TypeDefinition> {
         if pin.record.kind != RecordKind::Type {
             return Err(ContextError::InvalidInput(
                 "expected a type reference".into(),
@@ -222,7 +251,7 @@ impl ContextStore<'_> {
         decode(&self.small_payload_locked(&header)?)
     }
 
-    pub(super) fn validate_definition(&self, definition: &TypeDefinition) -> ContextResult<()> {
+    pub(crate) fn validate_definition(&self, definition: &TypeDefinition) -> ContextResult<()> {
         self.check_scope(&definition.scope)?;
         validate_name(&definition.name, "type name")?;
         if definition.properties.len() > 128 || encode(definition)?.len() > MAX_RECORD_BYTES {
@@ -279,7 +308,7 @@ impl ContextStore<'_> {
         Ok(())
     }
 
-    pub(super) fn validate_properties(
+    pub(crate) fn validate_properties(
         &self,
         definition: &TypeDefinition,
         properties: &Properties,
@@ -310,7 +339,7 @@ impl ContextStore<'_> {
         Ok(())
     }
 
-    pub(super) fn validate_value(
+    pub(crate) fn validate_value(
         &self,
         kind: &PropertyType,
         value: &Value,

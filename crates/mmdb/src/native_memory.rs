@@ -363,6 +363,17 @@ impl TemporalFacts {
         self.valid_from_ms.is_none_or(|from| at_ms >= from)
             && self.valid_to_ms.is_none_or(|to| at_ms < to)
     }
+
+    /// Whether `at_ms` falls inside the record's explicit valid-time window.
+    ///
+    /// This deliberately only reasons about *valid time* (when the fact holds in
+    /// the world). It is distinct from `observed_at_ms`, which records when the
+    /// observation was captured, and from `recorded_at_ms` on the header, which
+    /// is when the row was written to the store. The three concepts are kept on
+    /// separate fields so they can never be conflated.
+    pub fn is_valid_at(&self, at_ms: i64) -> bool {
+        self.contains_valid_time(at_ms)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -6363,8 +6374,15 @@ impl MemoryDatabase {
         Ok(())
     }
 
-    fn durable_batch(&self) -> fjall::Batch {
+    pub(crate) fn durable_batch(&self) -> fjall::Batch {
         self.keyspace.batch().durability(Some(PersistMode::SyncAll))
+    }
+
+    /// Acquire the single context write mutex. New facade modules
+    /// (`crate::entity`, `crate::extraction`) hold this guard across read-modify
+    /// -write sequences exactly like the built-in context writers.
+    pub(crate) fn lock_write(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.write_lock.lock()
     }
 
     fn new_audit_event(

@@ -94,7 +94,7 @@ fn find_bytes(haystack: &[u8], needle: &[u8], table: &[usize]) -> Option<usize> 
 }
 
 impl ContextStore<'_> {
-    pub(super) fn replace_postings(
+    pub(crate) fn replace_postings(
         &self,
         batch: &mut fjall::Batch,
         header: &RecordHeader,
@@ -129,7 +129,7 @@ impl ContextStore<'_> {
         Ok(())
     }
 
-    pub(super) fn replace_adjacency(
+    pub(crate) fn replace_adjacency(
         &self,
         batch: &mut fjall::Batch,
         previous: Option<&RecordHeader>,

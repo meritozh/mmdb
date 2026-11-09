@@ -53,6 +53,8 @@ mod convert;
 mod db;
 mod dream;
 mod embedder;
+pub mod entity;
+mod extraction;
 mod lexical;
 pub mod native_memory;
 pub use native_memory::context;
