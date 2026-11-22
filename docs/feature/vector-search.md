@@ -1,4 +1,6 @@
-# mmdb-vector Features
+# Model-specific vector and hybrid search
+
+Status: shipped
 
 `mmdb-vector` owns per-tenant, per-model vector indexing and vector persistence.
 It wraps HNSW search while keeping a fjall-backed source of truth for rebuilds.
@@ -70,11 +72,29 @@ trusted for reload.
 - `VectorStore::flush_snapshots`
 - `VectorStore::validate_insert`
 
+## Facade search
+
+Vector APIs:
+
+- `vector_search`
+- `vector_search_with_model`
+- `vector_search_filtered`
+- `search_text`
+- `search_text_async`
+
+`VectorFilter` supports kind, created-time bounds, and exact metadata equality.
+Metadata equality first uses `mmdb-storage`'s `meta_index` to build a candidate
+set, then combines it with the fast `nodes_meta` kind/time path.
+
+`hybrid_search` starts with vector seeds, expands graph neighbors with BFS, and
+blends vector score with graph-neighbor contribution using `HybridOpts`.
+
+The default HNSW index uses M = 16 and construction ef = 200. At up to 1,024 stored rows the search scores vectors directly. On the HNSW path a filter widens the candidate pool up to fourfold, capped at 100,000. If too few hits survive, the store scores the persisted vectors directly. Use [evidence recall](evidence-recall.md) when the caller needs provenance and time-aware graph paths.
+
 ## Source Files
 
-- `crates/mmdb-vector/src/store/mod.rs`: store facade and persistence layout.
-- `crates/mmdb-vector/src/store/ops.rs`: insert/search/delete operations.
-- `crates/mmdb-vector/src/store/snapshot.rs`: HNSW snapshot manifests.
-- `crates/mmdb-vector/src/index.rs`: HNSW wrapper and tombstone-aware index.
-- `crates/mmdb-vector/src/hit.rs`: scored hit type.
-
+- [crates/mmdb-vector/src/store/mod.rs](../../crates/mmdb-vector/src/store/mod.rs): store facade and persistence layout.
+- [crates/mmdb-vector/src/store/ops.rs](../../crates/mmdb-vector/src/store/ops.rs): insert/search/delete operations.
+- [crates/mmdb-vector/src/store/snapshot.rs](../../crates/mmdb-vector/src/store/snapshot.rs): HNSW snapshot manifests.
+- [crates/mmdb-vector/src/index.rs](../../crates/mmdb-vector/src/index.rs): HNSW wrapper and tombstone-aware index.
+- [crates/mmdb-vector/src/hit.rs](../../crates/mmdb-vector/src/hit.rs): scored hit type.

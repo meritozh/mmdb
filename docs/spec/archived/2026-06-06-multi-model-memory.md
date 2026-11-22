@@ -1,5 +1,7 @@
 # mmdb — Multi-Model Database for Agent Memory
 
+> This is the original multi-model implementation design and its delivery notes. The roadmap, open questions, benchmark and proposed interfaces below describe that design at the recorded revision. Only the outcomes documented in the delivery sections (19–24) are reported there as implemented. [Source revision](https://github.com/meritozh/mmdb/blob/2acdd73fa5e889ad4bd4c51fedb50c98b5a91246/docs/IMPLEMENTATION.md).
+
 > A Rust-native, embedded multi-model database purpose-built as the unified
 > persistence layer for AI agent memory. Stores text, vectors, graphs, and
 > blobs in a single engine with a hybrid retrieval query language.

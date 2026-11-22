@@ -1,4 +1,6 @@
-# mmdb-graph Features
+# Directed edges and graph traversal
+
+Status: shipped
 
 `mmdb-graph` stores labeled edges and provides neighbor scans plus BFS traversal.
 It shares the facade's fjall keyspace but owns its own partitions.
@@ -54,8 +56,35 @@ small namespace of observed labels.
 - `GraphStore::bfs`
 - `GraphStore::labels`
 
+## Edge records and facade calls
+
+`Edge` stores graph relationships between nodes:
+
+- `src`
+- `dst`
+- `label`
+- `weight`
+- `created_at_ms`
+- `metadata`
+- `revision`
+- `valid_from_ms`
+- `valid_to_ms`
+- `evidence`
+
+Graph facade methods:
+
+- `add_edge`
+- `remove_edge`
+- `neighbours_out`
+- `neighbours_in`
+- `edge_labels`
+
+These methods delegate to `mmdb-graph` while sharing the same fjall keyspace as
+node storage.
+
+The graph store accepts caller labels. Agent-produced relations in the evidence and dream APIs use the reserved labels `contains`, `derived_from`, `causes`, `enables`, `prevents`, `contradicts`, and `supersedes`.
+
 ## Source Files
 
-- `crates/mmdb-graph/src/lib.rs`: graph store, key encoding, traversal, and
+- [crates/mmdb-graph/src/lib.rs](../../crates/mmdb-graph/src/lib.rs): graph store, key encoding, traversal, and
   label dictionary.
-

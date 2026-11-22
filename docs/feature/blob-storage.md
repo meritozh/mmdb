@@ -1,4 +1,6 @@
-# mmdb-blob Features
+# Content-addressed blob storage
+
+Status: shipped
 
 `mmdb-blob` stores binary payloads by BLAKE3 content hash. It deliberately keeps
 large bytes outside the node LSM while preserving refcounted lifecycle
@@ -58,9 +60,24 @@ reached zero.
 - `BlobStore::is_chunked`
 - `BlobStore::total_tracked`
 
+## Blob-backed nodes
+
+Blob facade methods:
+
+- `insert_blob`
+- `get_blob_stream`
+- `get_blob_stream_for`
+- `blob_refcount`
+- `gc_blobs`
+
+Small blobs can be inlined into `Content::Blob` for direct node reads. The blob
+store still tracks a refcount so small and large blob lifecycles share the same
+accounting.
+
+The stream-shaped API materializes the full payload in memory on both put and get. Disk chunking sets the file layout. It does not bound the working memory of one operation.
+
 ## Source Files
 
-- `crates/mmdb-blob/src/lib.rs`: public API and lifecycle.
-- `crates/mmdb-blob/src/fs.rs`: filesystem layout, hashing, chunk IO.
-- `crates/mmdb-blob/src/metadata.rs`: metadata/refcount store.
-
+- [crates/mmdb-blob/src/lib.rs](../../crates/mmdb-blob/src/lib.rs): public API and lifecycle.
+- [crates/mmdb-blob/src/fs.rs](../../crates/mmdb-blob/src/fs.rs): filesystem layout, hashing, chunk IO.
+- [crates/mmdb-blob/src/metadata.rs](../../crates/mmdb-blob/src/metadata.rs): metadata/refcount store.

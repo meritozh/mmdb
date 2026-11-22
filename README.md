@@ -1,8 +1,8 @@
 # mmdb — Multi-Model Database for AI Agent Memory
 
-A Rust-native, embedded multi-model database purpose-built as the unified persistence
-layer for AI agent memory. Stores text, vectors, graphs, and blobs (images) in a
-single engine.
+MMDB is an embedded Rust data layer for agents. It persists operational state,
+memories, and session history. A harness can keep its runtime state in a separate
+directory so conversations and workflows survive a memory-store reset.
 
 ## Features
 
@@ -21,7 +21,7 @@ single engine.
 
 ## Harness Context
 
-The new `mmdb::context` contract provides versioned object and relation types,
+The `mmdb::context` contract provides versioned object and relation types,
 source-backed records, ordered session history, and bounded lexical and graph
 recall on the native memory transaction kernel. An assistant can save validated
 context directly, with provenance and an explicit inference label.
@@ -48,7 +48,7 @@ harness, and recalls an indirectly connected decision with its original source.
 The same contract now includes streamed message lifecycles, immutable checkpoints,
 current dependency validation, and business action definitions with harness-owned
 execution records. MiuMiu uses it for continuous windows and dynamic workflows.
-See the [implementation contract and limits](docs/CONTEXT-DESIGN.md).
+See [domain context](docs/feature/context-ontology.md), [session history](docs/feature/session-history.md), [checkpoints](docs/feature/context-checkpoints.md), and [business actions](docs/feature/business-actions.md).
 
 ## Quick Start
 
@@ -96,31 +96,31 @@ timeouts, and retries. `Database::ingest`, `Database::recall`, and
 
 | Crate | Description | Feature doc |
 |-------|-------------|-------------|
-| `mmdb` | High-level facade, `NodeBuilder`, vector/graph/hybrid/blob/query APIs | [`FEATURES.md`](docs/crates/mmdb/FEATURES.md) |
-| `mmdb-core` | Shared types, traits, and errors | [`FEATURES.md`](docs/crates/mmdb-core/FEATURES.md) |
-| `mmdb-storage` | fjall node store, key encoding, time/kind/meta indexes | [`FEATURES.md`](docs/crates/mmdb-storage/FEATURES.md) |
-| `mmdb-vector` | HNSW indexes, vector metadata, tombstones, snapshot reload | [`FEATURES.md`](docs/crates/mmdb-vector/FEATURES.md) |
-| `mmdb-graph` | Bi-directional edges, BFS, label dictionary | [`FEATURES.md`](docs/crates/mmdb-graph/FEATURES.md) |
-| `mmdb-blob` | BLAKE3 content-addressed blob store, chunks, refcounts, GC | [`FEATURES.md`](docs/crates/mmdb-blob/FEATURES.md) |
-| `mmdb-catalog` | Embedding model registry, tenant stats, named snapshots | [`FEATURES.md`](docs/crates/mmdb-catalog/FEATURES.md) |
-| `mmdb-query` | `LogicalPlan`, optimizer, batch/source executor, EXPLAIN | [`FEATURES.md`](docs/crates/mmdb-query/FEATURES.md) |
-| `mmdb-mmql` | MMQL parser, AST, resolver, lowering to `LogicalPlan` | [`FEATURES.md`](docs/crates/mmdb-mmql/FEATURES.md) |
-| `mmdb-udf` | WASM UDF registry, signatures, sandbox limits, runtime | [`FEATURES.md`](docs/crates/mmdb-udf/FEATURES.md) |
+| `mmdb` | High-level facade, `NodeBuilder`, vector/graph/hybrid/blob/query APIs | [Embedded multi-model memory](docs/feature/multi-model-memory.md) |
+| `mmdb-core` | Shared types, traits, and errors | [Memory nodes](docs/feature/memory-nodes.md) |
+| `mmdb-storage` | fjall node store, key encoding, time/kind/meta indexes | [Node persistence and indexes](docs/feature/memory-nodes.md) |
+| `mmdb-vector` | HNSW indexes, vector metadata, tombstones, snapshot reload | [Vector and hybrid search](docs/feature/vector-search.md) |
+| `mmdb-graph` | Bi-directional edges, BFS, label dictionary | [Graph traversal](docs/feature/graph-traversal.md) |
+| `mmdb-blob` | BLAKE3 content-addressed blob store, chunks, refcounts, GC | [Blob storage](docs/feature/blob-storage.md) |
+| `mmdb-catalog` | Embedding model registry, tenant stats, named snapshots | [Memory catalog](docs/feature/memory-catalog.md) |
+| `mmdb-query` | `LogicalPlan`, optimizer, batch/source executor, EXPLAIN | [Query execution](docs/feature/query-execution.md) |
+| `mmdb-mmql` | MMQL parser, AST, resolver, lowering to `LogicalPlan` | [MMQL](docs/feature/mmql.md) |
+| `mmdb-udf` | WASM UDF registry, signatures, sandbox limits, runtime | [WebAssembly UDFs](docs/feature/wasm-udfs.md) |
 
 ## Building
 
 ```bash
-cargo check          # type-check all crates
-cargo test           # run all tests
+cargo check                               # type-check all crates
+cargo test --workspace --locked           # run the pre-commit check
 cargo run -p mmdb --example agent_memory  # run quickstart
 ```
 
 ## Documentation
 
-- [`docs/FEATURES.md`](docs/FEATURES.md): agent context ontology product baseline (Chinese)
-- [`docs/CONTEXT-DESIGN.md`](docs/CONTEXT-DESIGN.md): context implementation, public contract, limits and stage verification (Chinese)
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — durable system architecture
-- [`docs/crates/`](docs/crates/) — crate-level feature references
+- [Cross-harness context goal](docs/polaris/agent-context.md) and [project glossary](docs/GLOSSARY.md).
+- [Operational state](docs/feature/operational-state.md) covers namespaced writes, revision checks, and separate storage roots.
+- [Embedding projections](docs/feature/embedding-projections.md) and [evidence recall](docs/feature/evidence-recall.md) describe ingestion, ranking, provenance, and revision-checked proposals.
+- [Dream maintenance](docs/feature/dream-maintenance.md) and the [audit journal](docs/feature/memory-audit.md) cover reversible compaction and operation inspection.
 
 ## License
 
