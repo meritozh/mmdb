@@ -1,4 +1,6 @@
-# mmdb-mmql Features
+# MMQL recall queries
+
+Status: shipped
 
 `mmdb-mmql` parses a compact memory-recall DSL and lowers it into
 `mmdb-query::LogicalPlan`.
@@ -104,7 +106,6 @@ keeps parser output separate from environment-specific availability checks.
 
 ## Source Files
 
-- `crates/mmdb-mmql/src/parser.rs`: parser and diagnostics.
-- `crates/mmdb-mmql/src/ast.rs`: AST, resolver, lowering.
-- `crates/mmdb-mmql/src/util.rs`: error helper.
-
+- [crates/mmdb-mmql/src/parser.rs](../../crates/mmdb-mmql/src/parser.rs): parser and diagnostics.
+- [crates/mmdb-mmql/src/ast.rs](../../crates/mmdb-mmql/src/ast.rs): AST, resolver, lowering.
+- [crates/mmdb-mmql/src/util.rs](../../crates/mmdb-mmql/src/util.rs): error helper.

@@ -1,12 +1,14 @@
 # mmdb 上下文内核：技术方案
 
-状态：实现说明 v0.6，2026-09-09。S1 内核及 S2 至 S4 所需的流式历史、检查点、当前依赖验证和业务动作已实现；首轮真实任务驱动的 checkpoint 生命周期修正见下文及 [MiuMiu 质量验收](../../miumiu/docs/CONTEXT-ACCEPTANCE.md)。旧数据不迁移，从新格式目录开始。产品依据见 [Feature Doc v1.0](FEATURES.md)。
+> 这是 S1 至 S4 的上下文内核实施方案及当时的验收记录。文中的测试数量、应用样本和阶段结论属于原修订；同一阶段的确定性测试与真实任务样本各有其覆盖范围。 [Source revision](https://github.com/meritozh/mmdb/blob/7011e2aee16b827722c2a03f256fdc24ff15cc51/docs/CONTEXT-DESIGN.md).
+
+状态：实现说明 v0.6，2026-09-09。S1 内核及 S2 至 S4 所需的流式历史、检查点、当前依赖验证和业务动作已实现；首轮真实任务驱动的 checkpoint 生命周期修正见下文及 [MiuMiu 质量验收](https://github.com/meritozh/miumiu/blob/aaf280a3cb4a973ea57f90c545344ab7fb87eda1/docs/CONTEXT-ACCEPTANCE.md)。旧数据不迁移，从新格式目录开始。产品依据见 [Feature Doc v1.0](https://github.com/meritozh/mmdb/blob/7011e2aee16b827722c2a03f256fdc24ff15cc51/docs/FEATURES.md)。
 
 ## 推荐方向
 
 沿用原生 `MemoryDatabase` 的持久化、版本、来源和操作回执机制，将其演进为所有 harness 共用的上下文入口。完整历史、ontology 内容、关系与检查点由 mmdb 管理；harness 通过这个入口读写上下文，继续拥有任务执行与工具权限。
 
-S1 提供一个最小可用场景：独立 Rust harness 定义领域对象和关系，保存原始交互及带来源的对象，关闭并重新打开数据库，然后按引用、词项和显式关系找回它们。可运行示例见 [context_harness.rs](../crates/mmdb/examples/context_harness.rs)，无需模型服务。
+S1 提供一个最小可用场景：独立 Rust harness 定义领域对象和关系，保存原始交互及带来源的对象，关闭并重新打开数据库，然后按引用、词项和显式关系找回它们。可运行示例见 [context_harness.rs](https://github.com/meritozh/mmdb/blob/7011e2aee16b827722c2a03f256fdc24ff15cc51/crates/mmdb/examples/context_harness.rs)，无需模型服务。
 
 ## 现有实现提供了什么
 
@@ -14,18 +16,18 @@ S1 提供一个最小可用场景：独立 Rust harness 定义领域对象和关
 
 | 依据 | 已有行为 | 对方案的影响 |
 | --- | --- | --- |
-| [原生记忆引擎](../crates/mmdb/src/native_memory.rs) | 带类型的记录引用、修订、来源依赖、操作去重、单写锁和同步持久化批次 | 作为上下文内核的基础，保留这些约束 |
-| [原生记忆引擎](../crates/mmdb/src/native_memory.rs) | 对象、结论和关系采用固定类型；`Scope::Personal` 本身不携带用户身份 | 补充类型目录及明确的用户归属，agent 和 session 仅记录来源 |
-| [多模型入口](../crates/mmdb/src/lib.rs) | `Database` 与 `native_memory::MemoryDatabase` 是不同的公开入口 | 新的 harness 上下文契约集中在原生入口，现有多模型能力按需要提供派生索引 |
-| [状态存储](../crates/mmdb/src/state.rs) | `StateStore` 提供带版本的跨命名空间原子批次 | harness 可以继续单独保存运行状态 |
-| [存储格式与租约](../crates/mmdb/src/store_format.rs) | 格式标识、独占租约、era 和可恢复的隔离重置 | 新格式与 reset 必须显式识别，避免旧程序误写新格式 |
-| [MiuMiu 记忆说明](../../miumiu/docs/MEMORY.md) | 精确来源目前依赖运行库中的原文及 source pin | 完成统一入口后，历史原文应由 mmdb 自己按引用读取 |
+| [原生记忆引擎](https://github.com/meritozh/mmdb/blob/7011e2aee16b827722c2a03f256fdc24ff15cc51/crates/mmdb/src/native_memory.rs) | 带类型的记录引用、修订、来源依赖、操作去重、单写锁和同步持久化批次 | 作为上下文内核的基础，保留这些约束 |
+| [原生记忆引擎](https://github.com/meritozh/mmdb/blob/7011e2aee16b827722c2a03f256fdc24ff15cc51/crates/mmdb/src/native_memory.rs) | 对象、结论和关系采用固定类型；`Scope::Personal` 本身不携带用户身份 | 补充类型目录及明确的用户归属，agent 和 session 仅记录来源 |
+| [多模型入口](https://github.com/meritozh/mmdb/blob/7011e2aee16b827722c2a03f256fdc24ff15cc51/crates/mmdb/src/lib.rs) | `Database` 与 `native_memory::MemoryDatabase` 是不同的公开入口 | 新的 harness 上下文契约集中在原生入口，现有多模型能力按需要提供派生索引 |
+| [状态存储](https://github.com/meritozh/mmdb/blob/7011e2aee16b827722c2a03f256fdc24ff15cc51/crates/mmdb/src/state.rs) | `StateStore` 提供带版本的跨命名空间原子批次 | harness 可以继续单独保存运行状态 |
+| [存储格式与租约](https://github.com/meritozh/mmdb/blob/7011e2aee16b827722c2a03f256fdc24ff15cc51/crates/mmdb/src/store_format.rs) | 格式标识、独占租约、era 和可恢复的隔离重置 | 新格式与 reset 必须显式识别，避免旧程序误写新格式 |
+| [MiuMiu 记忆说明](https://github.com/meritozh/miumiu/blob/aaf280a3cb4a973ea57f90c545344ab7fb87eda1/docs/MEMORY.md) | 精确来源目前依赖运行库中的原文及 source pin | 完成统一入口后，历史原文应由 mmdb 自己按引用读取 |
 
 现有文档要求显式裁决后才激活语义提案。Feature Doc 已确认自主保存后可召回，技术方案据此新增正式的 agent 写入路径，保留结构、来源及版本校验；不借用 `Actor::User` 伪装 agent 写入。
 
 ## 模块职责
 
-对外通过 `MemoryDatabase::context` 返回 `ContextStore`，内部实现位于 [context 模块](../crates/mmdb/src/context/mod.rs)。它复用原生数据库的 keyspace、写锁、同步批次、存储身份与租约。
+对外通过 `MemoryDatabase::context` 返回 `ContextStore`，内部实现位于 [context 模块](https://github.com/meritozh/mmdb/blob/7011e2aee16b827722c2a03f256fdc24ff15cc51/crates/mmdb/src/context/mod.rs)。它复用原生数据库的 keyspace、写锁、同步批次、存储身份与租约。
 
 | 模块 | 隐藏的复杂性 | 对外可观察结果 |
 | --- | --- | --- |
@@ -65,7 +67,7 @@ S1 的 `ContextAccess` 由可信 harness 提供 owner、actor 和允许范围，
 
 ## 统一接口的操作约束
 
-S1 的公开请求与响应类型见 [types.rs](../crates/mmdb/src/context/types.rs)。以下操作均已实现；业务执行与模型窗口管理仍由 harness 承担。
+S1 的公开请求与响应类型见 [types.rs](https://github.com/meritozh/mmdb/blob/7011e2aee16b827722c2a03f256fdc24ff15cc51/crates/mmdb/src/context/types.rs)。以下操作均已实现；业务执行与模型窗口管理仍由 harness 承担。
 
 | 操作 | 输入要点 | 成功结果与失败语义 |
 | --- | --- | --- |
@@ -139,7 +141,7 @@ S1 的代码集中在 mmdb crate，未增加依赖、服务或新的语言运行
 | S3 窗口连续执行 | 检查点、有限工作上下文、同 session 恢复及单条历史链 | 普通聊天与长任务均可使用，不依赖工作流改造 |
 | S4 动态工作流 | 业务动作描述与执行衔接，上下文参与规划，运行中重规划，模板版本与运行计划分别演进 | 使用前面已经可用的数据与恢复能力 |
 
-S2 至 S4 的应用侧流程和文件位置见 [MiuMiu 技术方案](../../miumiu/docs/CONTEXT-DESIGN.md)。
+S2 至 S4 的应用侧流程和文件位置见 [MiuMiu 技术方案](https://github.com/meritozh/miumiu/blob/aaf280a3cb4a973ea57f90c545344ab7fb87eda1/docs/CONTEXT-DESIGN.md)。
 
 ## 数据兼容与恢复
 
@@ -162,7 +164,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 git diff --check
 ```
 
-新增接口测试位于 [context_contract.rs](../crates/mmdb/tests/context_contract.rs)。[内核故障测试](../crates/mmdb/src/context/tests.rs) 另行注入持久提交后的确认丢失及载荷损坏；两项均通过公开读取与恢复行为断言。
+新增接口测试位于 [context_contract.rs](https://github.com/meritozh/mmdb/blob/7011e2aee16b827722c2a03f256fdc24ff15cc51/crates/mmdb/tests/context_contract.rs)。[内核故障测试](https://github.com/meritozh/mmdb/blob/7011e2aee16b827722c2a03f256fdc24ff15cc51/crates/mmdb/src/context/tests.rs) 另行注入持久提交后的确认丢失及载荷损坏；两项均通过公开读取与恢复行为断言。
 
 2026-09-08 验收记录：
 
@@ -192,6 +194,6 @@ git diff --check
 
 动作描述使用有界输入属性与 `exists`、`equals` 前置条件，`equals` 值必须匹配对象属性类型。准备动作检查当前动作、目标对象、有效时间、传递来源及参数；同一身份并发准备只有一个调用方取得首次调度权。执行状态包括 Prepared、Succeeded、RejectedBeforeDispatch、FailedNoEffect 和 EffectUnknown。实际执行事实要求 System/Operator 身份，普通 agent 不能伪造或撤回执行事实。
 
-S2 至 S4 的应用入口与运行恢复见 [MiuMiu 实现说明](../../miumiu/docs/CONTEXT-DESIGN.md)。2026-09-09 独立原生程序实际打开 MiuMiu 的公开任务数据库：`inspect_context_quality` 检查历史、工具配对、载荷、来源和 checkpoint 链；`verify_context_lifecycle` 在副本上核对关系命中、动作事实、作用域、预算、修订和清除后重开。完整报告见[真实任务质量验收](../../miumiu/docs/CONTEXT-ACCEPTANCE.md)。
+S2 至 S4 的应用入口与运行恢复见 [MiuMiu 实现说明](https://github.com/meritozh/miumiu/blob/aaf280a3cb4a973ea57f90c545344ab7fb87eda1/docs/CONTEXT-DESIGN.md)。2026-09-09 独立原生程序实际打开 MiuMiu 的公开任务数据库：`inspect_context_quality` 检查历史、工具配对、载荷、来源和 checkpoint 链；`verify_context_lifecycle` 在副本上核对关系命中、动作事实、作用域、预算、修订和清除后重开。完整报告见[真实任务质量验收](https://github.com/meritozh/miumiu/blob/aaf280a3cb4a973ea57f90c545344ab7fb87eda1/docs/CONTEXT-ACCEPTANCE.md)。
 
 本轮隔离 `cargo test --workspace --offline --locked` 通过，包括 189 项 mmdb 库测试、31 项 context 契约测试及其余 workspace 测试；fmt 和严格 workspace all-targets Clippy 通过。确定性边界测试与实际领域样本分别记录，不外推为一般召回准确率或规划质量保证。

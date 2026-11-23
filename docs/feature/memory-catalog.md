@@ -1,4 +1,6 @@
-# mmdb-catalog Features
+# Model registry, statistics and named snapshots
+
+Status: shipped
 
 `mmdb-catalog` owns lightweight registry and statistics state used by the
 facade and query optimizer.
@@ -39,7 +41,7 @@ and same-id replacement. `Database::query_optimizer_stats()` maps those stats to
 `NamedSnapshot` maps a user-facing snapshot name to a sequence number and
 creation timestamp.
 
-The catalog enforces unique snapshot names.
+The in-memory catalog enforces unique names for the lifetime of the handle. A name records a sequence number and a timestamp. The catalog has no operation to restore data or open a branch. The facade rebuilds node statistics from persisted nodes when opened.
 
 ## Public Surface
 
@@ -54,5 +56,4 @@ The catalog enforces unique snapshot names.
 
 ## Source Files
 
-- `crates/mmdb-catalog/src/lib.rs`: model registry, stats, and snapshots.
-
+- [crates/mmdb-catalog/src/lib.rs](../../crates/mmdb-catalog/src/lib.rs): model registry, stats, and snapshots.

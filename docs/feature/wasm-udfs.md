@@ -1,11 +1,13 @@
-# mmdb-udf Features
+# WebAssembly user-defined functions
+
+Status: shipped
 
 `mmdb-udf` provides WASM UDF registration metadata and a small Wasmtime runtime.
 It is separate from `mmdb-query` so the query crate does not depend on Wasmtime.
 
 ## Responsibilities
 
-- Validate WASM bytes.
+- Check the WASM magic and version on registration; Wasmtime compiles the module for execution.
 - Hash registered UDF definitions with BLAKE3.
 - Store typed signatures and sandbox limits.
 - Reject conflicting duplicate registrations.
@@ -63,5 +65,4 @@ from this crate without pulling Wasmtime into `mmdb-query`.
 
 ## Source Files
 
-- `crates/mmdb-udf/src/lib.rs`: registry, validation, limits, and runtime.
-
+- [crates/mmdb-udf/src/lib.rs](../../crates/mmdb-udf/src/lib.rs): registry, validation, limits, and runtime.
