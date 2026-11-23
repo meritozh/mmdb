@@ -48,7 +48,7 @@ harness, and recalls an indirectly connected decision with its original source.
 The same contract now includes streamed message lifecycles, immutable checkpoints,
 current dependency validation, and business action definitions with harness-owned
 execution records. MiuMiu uses it for continuous windows and dynamic workflows.
-See [domain context](docs/feature/context-ontology.md), [session history](docs/feature/session-history.md), [checkpoints](docs/feature/context-checkpoints.md), and [business actions](docs/feature/business-actions.md).
+See [domain context](docs/feature/context-ontology.md), [session log](docs/feature/session-log.md), [checkpoints](docs/feature/context-checkpoints.md), and [business actions](docs/feature/business-actions.md).
 
 ## Quick Start
 
