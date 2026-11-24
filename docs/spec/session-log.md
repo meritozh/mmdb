@@ -166,7 +166,7 @@ pub type KernelResult<T> = Result<T, KernelError>;
   - 批次只接受同一内核的分区。`commit` 在内部的 era 读锁下检查批次涉及的每个模块 era 仍是当前 era，否则整批返回 `StaleEra`；`commit_module_reset` 持有写锁，所以提交与切换 era 互斥。批次在重置前开好、重置后才提交时，跨模块的整批都被拒绝，不会只写入一半。
   - `prepare_module_reset` 拒绝当前 era 和已登记的 Retired era。
 - Ordering:
-  - `create`/`open`：校验 spec，取得租约（先恢复中断的整库重置），检查格式，打开 keyspace，读出或首次写入元数据，再逐个识别分区。`kernel_v1` 和当前 era 的 spec 分区保留，缺的就创建；已知模块的非当前 era 分区删除；其他名字返回 `Corrupt`。
+  - `create`/`open`：校验 spec，取得租约（先恢复中断的整库重置），检查格式，打开 keyspace，读出或首次写入元数据（全部 Retired 键读进内存，`era_state` 只查内存），再逐个识别分区。`kernel_v1` 和当前 era 的 spec 分区保留，缺的就创建；已知模块的非当前 era 分区删除；其他名字返回 `Corrupt`。
   - 重置一个模块：先 `prepare_module_reset` 建新分区，调用方再用返回的 `EraPartitions` 准备新句柄，最后 `commit_module_reset` 一次提交调用方的变更、新的当前 era 和 Retired 记录，然后删除旧 era 的分区。
 - Errors:
   - 格式不符返回 `Format(FormatMismatch)`，目录被占返回 `Format(StoreBusy)`；元数据缺失或与清单不一致返回 `Corrupt`；分区名不在 spec 里返回 `UnknownPartition`。
@@ -174,7 +174,7 @@ pub type KernelResult<T> = Result<T, KernelError>;
   - `commit_module_reset` 提交之前失败时，什么都没变，准备好的分区由下次 `open` 删除。提交本身返回错误时，结果为 `CommitUnknown`，内核随即中毒。中毒只作用于访问存储的操作：`EraPartitions::partition`、`Partition` 的读取、`Batch::commit`、`prepare_module_reset` 和 `commit_module_reset` 都返回 `Poisoned`。`era`、`era_state`、`module`、`canonical_root`、`store_era`、`keyed_hasher` 和 `write_lock` 不读存储，签名不变，照常返回内存里的值，era 停在重置之前；因为所有读写都会失败，这个过时的 era 不会让调用方读到任何数据。重新打开时按持久化的元数据决定当前 era，删除另一组分区。提交成功、删除旧分区失败时，`cleanup_pending` 为 true，下次 `open` 接着删。
 - Configuration: 无。
 - Performance:
-  - `open` 的开销与分区数成正比。
+  - `open` 的开销与分区数加上 Retired era 数成正比。每次模块重置只多一个很小的 Retired 键，而重置是操作者发起的少见操作。
   - `prepare_module_reset` 只建一个模块的分区。`commit_module_reset` 只提交一个小批次，再删除一个模块的分区。两者的开销与该模块的分区数成正比，与记录数无关。
   - `delete_partition` 只做逻辑删除。磁盘文件在最后一个句柄释放时，或下次打开时，由 fjall 移除。`cleanup_pending` 只说明是否还有旧分区没做逻辑删除。
 
