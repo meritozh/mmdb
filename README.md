@@ -1,8 +1,8 @@
 # mmdb — Multi-Model Database for AI Agent Memory
 
 MMDB is an embedded Rust data layer for agents. It persists operational state,
-memories, and session history. A harness can keep its runtime state in a separate
-directory so conversations and workflows survive a memory-store reset.
+memories, and session logs. A harness can keep its operational state in a separate
+directory so workflows and queues survive a memory-store reset.
 
 ## Features
 
@@ -22,8 +22,8 @@ directory so conversations and workflows survive a memory-store reset.
 ## Harness Context
 
 The `mmdb::context` contract provides versioned object and relation types,
-source-backed records, ordered session history, and bounded lexical and graph
-recall on the native memory transaction kernel. An assistant can save validated
+source-backed records, ordered session logs, and bounded lexical and graph
+recall, committed through the batches of `MemoryDatabase`. An assistant can save validated
 context directly, with provenance and an explicit inference label.
 
 Create a fresh root with `native_memory::MemoryDatabase::create_context(path)`,
