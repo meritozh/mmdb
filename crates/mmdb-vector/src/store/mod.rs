@@ -82,6 +82,7 @@ impl VectorStore {
         database: FjallDatabase,
         snapshot_dir: impl Into<PathBuf>,
     ) -> Result<Self> {
+        let snapshot_dir = std::path::absolute(snapshot_dir.into())?;
         let meta = database
             .keyspace(PART_META, KeyspaceCreateOptions::default)
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -96,7 +97,7 @@ impl VectorStore {
             meta,
             rev,
             tomb,
-            snapshot_dir: snapshot_dir.into(),
+            snapshot_dir,
             indices: DashMap::new(),
             snapshot_reloads: AtomicUsize::new(0),
             model_names: DashMap::new(),

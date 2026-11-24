@@ -217,6 +217,33 @@ fn open_falls_back_to_rebuild_when_hnsw_snapshot_is_corrupt() {
 }
 
 #[test]
+fn corrupt_manifest_rebuilds_its_model_and_flushes_a_reloadable_snapshot() {
+    let dir = tempdir().unwrap();
+    let id = Ulid::new();
+    let vector = [1.0, 0.0];
+    let store = make_store_at(dir.path());
+    for model in ["broken", "healthy"] {
+        store.insert(0, model, id, &vector).unwrap();
+    }
+    assert_eq!(store.flush_snapshots().unwrap(), 2);
+    let manifest = manifest_path(&store.snapshot_dir, 0, model_hash("broken"));
+    drop(store);
+
+    for invalid in [b"{".as_slice(), b"{}"] {
+        std::fs::write(&manifest, invalid).unwrap();
+        let store = make_store_at(dir.path());
+        assert_eq!(store.snapshot_reload_count(), 1);
+        assert_eq!(
+            store.search(0, "broken", &vector, 1).unwrap()[0].node_id,
+            id
+        );
+        assert_eq!(store.flush_snapshots().unwrap(), 1);
+        drop(store);
+        assert_eq!(make_store_at(dir.path()).snapshot_reload_count(), 2);
+    }
+}
+
+#[test]
 fn tombstones_survive_reopen() {
     let dir = tempdir().unwrap();
     let id = Ulid::new();

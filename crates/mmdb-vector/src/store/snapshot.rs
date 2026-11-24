@@ -162,9 +162,8 @@ impl VectorStore {
     fn read_snapshot_manifest(&self, tenant: u32, mh: u32) -> Result<Option<SnapshotManifest>> {
         let path = manifest_path(&self.snapshot_dir, tenant, mh);
         match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map(Some)
-                .map_err(|e| Error::Storage(e.to_string())),
+            // A malformed cache manifest is a cache miss for this model.
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(Error::Storage(err.to_string())),
         }
