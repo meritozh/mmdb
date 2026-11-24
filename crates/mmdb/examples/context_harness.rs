@@ -1,6 +1,8 @@
 //! A deterministic pair of harnesses sharing a context store across reopen.
 use mmdb::context::*;
-use mmdb::native_memory::{Actor, MemoryDatabase, OperationId, Scope, TemporalFacts};
+use mmdb::session::EventInput;
+use mmdb::Store;
+use mmdb::{Actor, OperationId, Scope, TemporalFacts};
 use serde_json::json;
 use std::collections::BTreeMap;
 
@@ -8,18 +10,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let temporary = tempfile::tempdir()?;
     let path = temporary.path().join("context");
     let (saved, relation) = {
-        let db = MemoryDatabase::create_context(&path)?;
+        let db = Store::create(&path)?;
         let mut access = ContextAccess::new("owner", Actor::System);
         access.agent = Some("research".into());
+        let log = db.session_log(access.clone())?;
         let context = db.context(access)?;
-        let evidence = context.append_history(
+        let evidence = log.append(
             OperationId::new(),
-            HistoryInput {
+            EventInput {
                 sources: Vec::new(),
                 session: "research-session".into(),
                 event_id: "user-message-1".into(),
                 scope: Scope::Personal,
-                kind: HistoryKind::UserMessage,
+                kind: EventKind::UserMessage,
                 media_type: "text/plain".into(),
                 occurred_at_ms: 1,
                 expected_sequence: Some(0),
@@ -96,10 +99,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         (saved, relation)
     };
-    let db = MemoryDatabase::open_context(&path)?;
+    let db = Store::open(&path)?;
     let mut access = ContextAccess::new("owner", Actor::Assistant);
     access.agent = Some("trading".into());
     access.session = Some("trading-session".into());
+    let log = db.session_log(access.clone())?;
     let context = db.context(access)?;
     let (_, definition) = context
         .find_type(&Scope::Personal, "research.observation")?
@@ -118,7 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if hit.path != vec![relation.pin] {
         return Err("indirect record did not retain its relation path".into());
     }
-    let raw = context.read_payload(&hit.record.header.sources[0], 0, 4096)?;
+    let raw = log.read_payload(&hit.record.header.sources[0], 0, 4096)?;
     println!(
         "Trading recalled record {} at revision {} from agent {:?}.",
         saved.pin.record.id, saved.pin.revision, hit.record.header.provenance.agent
@@ -130,8 +134,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         hit.path.len()
     );
     println!(
-        "Original session history position: {}",
-        context.history_position("research-session")?
+        "Session log position: {}",
+        log.position("research-session")?
     );
     Ok(())
 }

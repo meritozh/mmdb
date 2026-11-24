@@ -1,6 +1,6 @@
 # Agent notes
 
-MMDB is an embedded Rust data layer for agents. It persists and manages operational state, memory, and the session history that gives memories their context.
+MMDB is an embedded Rust data layer for agents. It persists and manages operational state, memory, and the session logs that give memories their context.
 
 ## Repo
 
@@ -13,8 +13,8 @@ MMDB is an embedded Rust data layer for agents. It persists and manages operatio
 
 ### Gotchas
 
-- `Database::state()` shares the database's keyspace. Use `StateStore::open_path` with a separate root for conversations, workflows, and other operational state that must survive a memory-store reset.
-- `MemoryDatabase::open_context` rejects an unexpected store format. An explicit reset of a managed store moves its old directory into quarantine.
+- `Database::state()` shares the database's keyspace. Use `StateStore::open_path` with a separate root for workflows, queues, and other operational state that must survive a memory-store reset.
+- `Store::reset_memory` requires the plan's full confirmation digest and preserves the session log. Reopen after an unknown reset outcome or to finish pending cleanup. `Store::open` rejects an unexpected format. A whole-store reset quarantines the old directory.
 
 ## Principles
 

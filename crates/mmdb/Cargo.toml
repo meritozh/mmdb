@@ -7,6 +7,7 @@ authors.workspace = true
 
 [dependencies]
 mmdb-core = { path = "../mmdb-core" }
+mmdb-kernel = { path = "../mmdb-kernel" }
 mmdb-storage = { path = "../mmdb-storage" }
 mmdb-vector = { path = "../mmdb-vector" }
 mmdb-graph = { path = "../mmdb-graph" }

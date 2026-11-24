@@ -1,7 +1,9 @@
 //! Native acceptance on a temporary copy of a closed real-task context store.
 //! Usage: verify_context_lifecycle STORE BUSINESS_PINS_JSON REPORT_JSON
 use mmdb::context::*;
-use mmdb::native_memory::{Actor, MemoryDatabase, OperationId, Scope, TemporalFacts};
+use mmdb::session::{CheckpointInput, EventInput};
+use mmdb::Store;
+use mmdb::{Actor, OperationId, Scope, TemporalFacts};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -54,6 +56,18 @@ fn query(text: &str, seeds: Vec<ContextRef>, depth: usize) -> ContextQuery {
     }
 }
 
+fn read_pin(
+    context: &ContextStore<'_>,
+    log: &mmdb::session::SessionLog<'_>,
+    pin: &RecordPin,
+) -> ContextResult<()> {
+    match pin.record.kind {
+        RecordKind::Event => log.read_payload(pin, 0, MAX_PAYLOAD_PAGE_BYTES).map(|_| ()),
+        RecordKind::Checkpoint => log.read_checkpoint(pin).map(|_| ()),
+        _ => context.read(pin).map(|_| ()),
+    }
+}
+
 fn main() -> Result<()> {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     if args.len() != 3 {
@@ -78,10 +92,12 @@ fn main() -> Result<()> {
         &mut copied_bytes,
     )?;
     let report = {
-        let db = MemoryDatabase::open_context(&copied)?;
-        let store = db.context(ContextAccess::new("local-user", Actor::System))?;
+        let db = Store::open(&copied)?;
+        let access = ContextAccess::new("local-user", Actor::System);
+        let log = db.session_log(access.clone())?;
+        let store = db.context(access)?;
         for pin in pins.values() {
-            store.read(pin)?;
+            read_pin(&store, &log, pin)?;
         }
         let original = store.read(&target)?;
         let RecordBody::Object(properties) = original.body.clone() else {
@@ -151,15 +167,15 @@ fn main() -> Result<()> {
             .first()
             .ok_or("real task object lacks provenance")?
             .clone();
-        let anchor = store
-            .append_history(
+        let anchor = log
+            .append(
                 OperationId::new(),
-                HistoryInput {
+                EventInput {
                     sources: vec![source.clone()],
                     session: "independent-lifecycle".into(),
                     event_id: "lifecycle-anchor".into(),
                     scope: Scope::Personal,
-                    kind: HistoryKind::Notice,
+                    kind: EventKind::Notice,
                     media_type: "text/plain".into(),
                     occurred_at_ms: 1,
                     expected_sequence: Some(0),
@@ -167,8 +183,8 @@ fn main() -> Result<()> {
                 b"Native verifier operating on a temporary copy".as_slice(),
             )?
             .pin;
-        let checkpoint=store.save_checkpoint(OperationId::new(),CheckpointInput {
-            scope:CheckpointScope::Session,session:"independent-lifecycle".into(),run:"native-verifier".into(),history_sequence:1,
+        let checkpoint=log.save_checkpoint(OperationId::new(),CheckpointInput {
+            scope:CheckpointScope::Session,session:"independent-lifecycle".into(),run:"native-verifier".into(),sequence:1,
             expected_previous:None,expected_availability_epoch:store.availability_epoch()?,sources:vec![target.clone(),anchor],
             payload:json!({"goal":"verify actual task records on a disposable copy","state":"pending"}),
         })?.pin;
@@ -196,7 +212,7 @@ fn main() -> Result<()> {
             return Err("revision identity drift".into());
         }
         store.read(&target)?;
-        store.read(&checkpoint)?;
+        log.read_checkpoint(&checkpoint)?;
         if store
             .validate_current(&[target.clone(), checkpoint.clone()], None)
             .is_ok()
@@ -255,8 +271,15 @@ fn main() -> Result<()> {
         {
             return Err("owner boundary leaked real task data".into());
         }
-        db.context(ContextAccess::new("local-user", Actor::Operator))?
-            .purge(OperationId::new(), source.clone())?;
+        let operator = ContextAccess::new("local-user", Actor::Operator);
+        match source.record.kind.module() {
+            StoreModule::Session => db
+                .session_log(operator)?
+                .purge(OperationId::new(), source.clone())?,
+            StoreModule::Memory => db
+                .context(operator)?
+                .purge(OperationId::new(), source.clone())?,
+        };
         for pin in [
             &source,
             &target,
@@ -273,7 +296,10 @@ fn main() -> Result<()> {
             } else {
                 &store
             };
-            if !matches!(reader.read(pin), Err(ContextError::Unavailable(_))) {
+            if !matches!(
+                read_pin(reader, &log, pin),
+                Err(ContextError::Unavailable(_))
+            ) {
                 return Err(format!("purged source did not hide {}", pin.record.id).into());
             }
         }
@@ -283,7 +309,7 @@ fn main() -> Result<()> {
             "privateWorkspaceDenied":true,"foreignOwnerDenied":true,"purgedSource":source,"derivedRecordsHidden":9})
     };
     // A second independent open must observe the committed purge.
-    let db = MemoryDatabase::open_context(&copied)?;
+    let db = Store::open(&copied)?;
     let store = db.context(ContextAccess::new("local-user", Actor::System))?;
     if !matches!(store.read(&target), Err(ContextError::Unavailable(_))) {
         return Err("purge was not durable after reopen".into());

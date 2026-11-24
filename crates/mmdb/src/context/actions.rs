@@ -1,6 +1,6 @@
-use super::super::{Actor, OperationId, RecordState, Scope, TemporalFacts};
 use super::storage::*;
 use super::*;
+use crate::{Actor, OperationId, RecordState, Scope, TemporalFacts};
 use serde_json::Value;
 
 fn action_name_key(owner: &str, scope: &Scope, name: &str) -> ContextResult<Vec<u8>> {
@@ -48,9 +48,11 @@ impl ContextStore<'_> {
         expected: Option<RecordPin>,
         definition: ActionDefinition,
     ) -> ContextResult<WriteReceipt> {
-        let _guard = self.db.write_lock.lock();
-        let digest = self.digest("define-action", &(&expected, &definition))?;
-        if let Some(receipt) = self.replay(operation, digest)? {
+        let _guard = self.scoped.lock();
+        let digest = self
+            .scoped
+            .digest("define-action", &(&expected, &definition))?;
+        if let Some(receipt) = self.scoped.replay(operation, digest)? {
             return Ok(receipt);
         }
         validate_name(&definition.name, "action name")?;
@@ -92,18 +94,22 @@ impl ContextStore<'_> {
                 self.validate_value(&property_type.value_type, value, &definition.scope)?;
             }
         }
-        let information = match self.access.actor {
+        let information = match self.scoped.access().actor {
             Actor::Assistant => InformationKind::Inference,
             Actor::User | Actor::Operator => InformationKind::Instruction,
             _ => InformationKind::Observation,
         };
-        self.validate_sources(
+        self.scoped.validate_sources(
             &definition.scope,
             &definition.sources,
             information,
             expected.as_ref().map(|pin| &pin.record),
         )?;
-        let key = action_name_key(&self.access.owner, &definition.scope, &definition.name)?;
+        let key = action_name_key(
+            &self.scoped.access().owner,
+            &definition.scope,
+            &definition.name,
+        )?;
         let pin = if let Some(expected) = expected {
             let previous = self.action_locked(&expected)?;
             if previous.name != definition.name || previous.scope != definition.scope {
@@ -111,50 +117,49 @@ impl ContextStore<'_> {
                     "action identity and scope cannot change".into(),
                 ));
             }
-            self.next_revision(&expected)?.1
+            self.scoped.next_revision(&expected)?.1
         } else if let Some(bytes) = self.parts.action_names.get(&key)? {
             let reference = decode(&bytes)?;
-            let previous = self.head_locked(&reference)?;
+            let previous = self.scoped.head_locked(&reference)?;
             if self.action_locked(&previous.pin)? != definition {
                 return Err(ContextError::TypeConflict(definition.name));
             }
-            return self.commit_operation(
-                self.db.durable_batch(),
+            return self.scoped.commit_operation(
+                self.scoped.batch(),
                 operation,
                 digest,
                 WriteReceipt {
                     pin: previous.pin,
-                    history_sequence: None,
+                    sequence: None,
                 },
             );
         } else {
-            self.fresh_pin(RecordKind::Action)
+            self.scoped.fresh_pin(RecordKind::Action)
         };
         let bytes = encode(&definition)?;
         if bytes.len() > MAX_RECORD_BYTES {
             return Err(ContextError::BudgetExceeded);
         }
+        let mut batch = self.scoped.batch();
         let header = self.action_header(
             pin.clone(),
             definition.scope,
             definition.sources,
             information,
-            &bytes,
+            self.scoped.put_payload(&mut batch, &pin, &bytes),
         );
-        let mut batch = self.db.durable_batch();
         if pin.revision > 1 {
-            self.advance_availability_epoch(&mut batch)?;
+            self.scoped.advance_epoch(&mut batch)?;
         }
-        self.put_payload(&mut batch, &pin, &bytes);
-        self.put_header(&mut batch, &header)?;
+        self.scoped.put_header(&mut batch, &header)?;
         batch.insert(&self.parts.action_names, key, encode(&pin.record)?);
-        self.commit_operation(
+        self.scoped.commit_operation(
             batch,
             operation,
             digest,
             WriteReceipt {
                 pin,
-                history_sequence: None,
+                sequence: None,
             },
         )
     }
@@ -164,18 +169,19 @@ impl ContextStore<'_> {
         scope: &Scope,
         name: &str,
     ) -> ContextResult<Option<(RecordPin, ActionDefinition)>> {
-        let _guard = self.db.write_lock.lock();
-        self.check_scope(scope)?;
+        let _guard = self.scoped.lock();
+        self.scoped.check_scope(scope)?;
         validate_name(name, "action name")?;
-        let Some(bytes) =
-            self.parts
-                .action_names
-                .get(action_name_key(&self.access.owner, scope, name)?)?
+        let Some(bytes) = self.parts.action_names.get(action_name_key(
+            &self.scoped.access().owner,
+            scope,
+            name,
+        )?)?
         else {
             return Ok(None);
         };
         let reference = decode(&bytes)?;
-        let header = self.head_locked(&reference)?;
+        let header = self.scoped.head_locked(&reference)?;
         Ok(Some((header.pin.clone(), self.action_locked(&header.pin)?)))
     }
 
@@ -191,77 +197,51 @@ impl ContextStore<'_> {
                 "action page limit must be 1..=100".into(),
             ));
         }
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.scoped.lock();
         let target_record = self.current_action_target(target)?;
         let RecordBody::Object(properties) = target_record.body else {
             return Err(ContextError::InvalidInput(
                 "action target must be an object".into(),
             ));
         };
-        let mut prefix = owner_key(&self.access.owner);
-        prefix.push(kind_byte(RecordKind::Action));
-        let start = if let Some(after) = after {
-            self.check_ref(after)?;
-            if after.kind != RecordKind::Action {
-                return Err(ContextError::InvalidInput(
-                    "action cursor has the wrong family".into(),
-                ));
-            }
-            record_key(after)
-        } else {
-            prefix.clone()
-        };
         let mut actions = Vec::new();
-        let mut next = None;
-        for (scanned, entry) in self.parts.heads.range(start.clone()..).enumerate() {
-            let (key, revision) = entry?;
-            if !key.starts_with(&prefix) {
-                break;
+        let mut after = after.cloned();
+        let mut remaining = 4096;
+        loop {
+            let page = self.scoped.scan_heads(
+                RecordKind::Action,
+                after.as_ref(),
+                (limit - actions.len()).min(remaining),
+            )?;
+            remaining -= page.heads.len();
+            for pin in page.heads {
+                let header = match self.scoped.header_locked(&pin) {
+                    Ok(header) => header,
+                    Err(ContextError::AccessDenied) => continue,
+                    Err(error) => return Err(error),
+                };
+                if !self.scoped.available_locked(&header.pin, true)? {
+                    continue;
+                }
+                let definition = self.action_locked(&header.pin)?;
+                if applicable_target(&definition, &target_record.header).is_err() {
+                    continue;
+                }
+                let preconditions_met = conditions_match(&definition.preconditions, &properties);
+                actions.push(ActionOffer {
+                    pin: header.pin,
+                    definition,
+                    preconditions_met,
+                });
             }
-            if after.is_some() && key.as_ref() == start {
-                continue;
+            if page.next.is_none() || remaining == 0 || actions.len() == limit {
+                return Ok(ActionPage {
+                    actions,
+                    next: page.next,
+                });
             }
-            if actions.len() == limit || scanned == 4096 {
-                return Ok(ActionPage { actions, next });
-            }
-            if key.len() != prefix.len() + 16 || revision.len() != 8 {
-                return Err(ContextError::Corrupt("invalid action index".into()));
-            }
-            let id = u128::from_be_bytes(
-                key[prefix.len()..]
-                    .try_into()
-                    .map_err(|_| ContextError::Corrupt("invalid action identity".into()))?,
-            );
-            let reference = ContextRef {
-                era: self.db.era_id,
-                owner: self.access.owner.clone(),
-                kind: RecordKind::Action,
-                id: ulid::Ulid(id),
-            };
-            next = Some(reference.clone());
-            let header = match self.head_locked(&reference) {
-                Ok(header) => header,
-                Err(ContextError::AccessDenied) => continue,
-                Err(error) => return Err(error),
-            };
-            if !self.available_locked(&header.pin, true)? {
-                continue;
-            }
-            let definition = self.action_locked(&header.pin)?;
-            if applicable_target(&definition, &target_record.header).is_err() {
-                continue;
-            }
-            let preconditions_met = conditions_match(&definition.preconditions, &properties);
-            actions.push(ActionOffer {
-                pin: header.pin,
-                definition,
-                preconditions_met,
-            });
+            after = page.next;
         }
-        Ok(ActionPage {
-            actions,
-            next: None,
-        })
     }
 
     /// A durable execution intent. Only a trusted harness may create it.
@@ -280,20 +260,20 @@ impl ContextStore<'_> {
         operation: OperationId,
         invocation: ActionInvocation,
     ) -> ContextResult<ActionPreparation> {
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.scoped.lock();
         self.require_action_harness()?;
-        let digest = self.digest("prepare-action", &invocation)?;
-        if let Some(receipt) = self.replay(operation, digest)? {
+        let digest = self.scoped.digest("prepare-action", &invocation)?;
+        if let Some(receipt) = self.scoped.replay(operation, digest)? {
             return Ok(ActionPreparation {
                 receipt,
                 already_present: true,
             });
         }
         let definition = self.action_locked(&invocation.action)?;
-        if !self.available_locked(&invocation.action, true)? {
+        if !self.scoped.available_locked(&invocation.action, true)? {
             return Err(ContextError::Unavailable(invocation.action.record.clone()));
         }
-        if self.head_locked(&invocation.action.record)?.pin != invocation.action {
+        if self.scoped.head_locked(&invocation.action.record)?.pin != invocation.action {
             return Err(ContextError::InvalidInput("action version changed".into()));
         }
         let target = self.current_action_target(&invocation.target)?;
@@ -318,13 +298,13 @@ impl ContextStore<'_> {
         let mut sources = invocation.sources.clone();
         sources.push(invocation.action.clone());
         sources.push(invocation.target.clone());
-        self.validate_sources(
+        self.scoped.validate_sources(
             &target.header.scope,
             &sources,
             InformationKind::Observation,
             None,
         )?;
-        let pin = self.fresh_pin(RecordKind::ActionExecution);
+        let pin = self.scoped.fresh_pin(RecordKind::ActionExecution);
         let execution = ActionExecution {
             invocation,
             status: ActionStatus::Prepared,
@@ -335,24 +315,23 @@ impl ContextStore<'_> {
         if bytes.len() > MAX_RECORD_BYTES {
             return Err(ContextError::BudgetExceeded);
         }
+        let mut batch = self.scoped.batch();
         let header = self.action_header(
             pin.clone(),
             target.header.scope,
             sources,
             InformationKind::Observation,
-            &bytes,
+            self.scoped.put_payload(&mut batch, &pin, &bytes),
         );
-        let mut batch = self.db.durable_batch();
-        self.put_payload(&mut batch, &pin, &bytes);
-        self.put_header(&mut batch, &header)?;
+        self.scoped.put_header(&mut batch, &header)?;
         Ok(ActionPreparation {
-            receipt: self.commit_operation(
+            receipt: self.scoped.commit_operation(
                 batch,
                 operation,
                 digest,
                 WriteReceipt {
                     pin,
-                    history_sequence: None,
+                    sequence: None,
                 },
             )?,
             already_present: false,
@@ -369,13 +348,13 @@ impl ContextStore<'_> {
         result: Value,
         result_sources: Vec<RecordPin>,
     ) -> ContextResult<WriteReceipt> {
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.scoped.lock();
         self.require_action_harness()?;
-        let digest = self.digest(
+        let digest = self.scoped.digest(
             "finish-action",
             &(&expected, status, &result, &result_sources),
         )?;
-        if let Some(receipt) = self.replay(operation, digest)? {
+        if let Some(receipt) = self.scoped.replay(operation, digest)? {
             return Ok(receipt);
         }
         if expected.record.kind != RecordKind::ActionExecution || status == ActionStatus::Prepared {
@@ -383,16 +362,16 @@ impl ContextStore<'_> {
                 "invalid action outcome transition".into(),
             ));
         }
-        let (previous, pin) = self.next_revision(&expected)?;
+        let (previous, pin) = self.scoped.next_revision(&expected)?;
         // A target may have changed as a consequence of this action. Its exact
         // previous revision remains provenance, without asserting it is current.
-        let mut execution: ActionExecution = decode(&self.small_payload_locked(&previous)?)?;
+        let mut execution: ActionExecution = decode(&self.scoped.small_payload_locked(&previous)?)?;
         if execution.status != ActionStatus::Prepared {
             return Err(ContextError::InvalidInput(
                 "action already has a terminal outcome".into(),
             ));
         }
-        self.validate_sources(
+        self.scoped.validate_sources(
             &previous.scope,
             &result_sources,
             InformationKind::Observation,
@@ -410,30 +389,29 @@ impl ContextStore<'_> {
         if sources.len() > MAX_CONTEXT_SOURCES {
             return Err(ContextError::BudgetExceeded);
         }
+        let mut batch = self.scoped.batch();
         let header = self.action_header(
             pin.clone(),
             previous.scope,
             sources,
             InformationKind::Observation,
-            &bytes,
+            self.scoped.put_payload(&mut batch, &pin, &bytes),
         );
-        let mut batch = self.db.durable_batch();
-        self.advance_availability_epoch(&mut batch)?;
-        self.put_payload(&mut batch, &pin, &bytes);
-        self.put_header(&mut batch, &header)?;
-        self.commit_operation(
+        self.scoped.advance_epoch(&mut batch)?;
+        self.scoped.put_header(&mut batch, &header)?;
+        self.scoped.commit_operation(
             batch,
             operation,
             digest,
             WriteReceipt {
                 pin,
-                history_sequence: None,
+                sequence: None,
             },
         )
     }
 
     fn require_action_harness(&self) -> ContextResult<()> {
-        if matches!(self.access.actor, Actor::System | Actor::Operator) {
+        if matches!(self.scoped.access().actor, Actor::System | Actor::Operator) {
             Ok(())
         } else {
             Err(ContextError::AccessDenied)
@@ -446,23 +424,30 @@ impl ContextStore<'_> {
                 "expected an action definition".into(),
             ));
         }
-        if !self.available_locked(pin, false)? {
+        if !self.scoped.available_locked(pin, false)? {
             return Err(ContextError::Unavailable(pin.record.clone()));
         }
-        decode(&self.small_payload_locked(&self.header_locked(pin)?)?)
+        decode(
+            &self
+                .scoped
+                .small_payload_locked(&self.scoped.header_locked(pin)?)?,
+        )
     }
 
     fn current_action_target(&self, pin: &RecordPin) -> ContextResult<ContextRecord> {
-        if pin.record.kind != RecordKind::Object || self.head_locked(&pin.record)?.pin != *pin {
+        if pin.record.kind != RecordKind::Object
+            || self.scoped.head_locked(&pin.record)?.pin != *pin
+        {
             return Err(ContextError::InvalidInput(
                 "action target must be the current object version".into(),
             ));
         }
-        if !self.available_locked(pin, true)?
+        if !self.scoped.available_locked(pin, true)?
             || !self
+                .scoped
                 .header_locked(pin)?
                 .temporal
-                .contains_valid_time(super::super::now_ms())
+                .is_valid_at(super::super::now_ms())
         {
             return Err(ContextError::Unavailable(pin.record.clone()));
         }
@@ -475,7 +460,7 @@ impl ContextStore<'_> {
         scope: Scope,
         sources: Vec<RecordPin>,
         information: InformationKind,
-        bytes: &[u8],
+        payload: PayloadDescriptor,
     ) -> RecordHeader {
         let now = super::super::now_ms();
         RecordHeader {
@@ -484,17 +469,14 @@ impl ContextStore<'_> {
             state: RecordState::Active,
             type_pin: None,
             sources,
-            provenance: self.provenance(),
+            source_scopes: Vec::new(),
+            provenance: self.scoped.provenance(),
             information,
             temporal: TemporalFacts::observed_at(now),
             recorded_at_ms: now,
-            payload: PayloadDescriptor {
-                revision: pin.revision,
-                bytes: bytes.len() as u64,
-                digest: self.content_digest(bytes),
-            },
+            payload,
             endpoints: None,
-            history: None,
+            event: None,
             checkpoint: None,
         }
     }

@@ -1,91 +1,87 @@
 //! Clean-slate, evidence-first memory storage.
 //!
 //! This module deliberately does not share records or persisted formats with the
-//! legacy `MemoryNode` database.  The manifest is checked before fjall is opened,
+//! legacy `MemoryNode` database.  The manifest is checked before storage is opened,
 //! so an old or otherwise unrecognised root is never adopted accidentally.
 
-use crate::store_format::{
-    require_managed_store, StoreEraId, StoreFormatError, StoreLease,
-    StoreManifest as OuterStoreManifest,
-};
-use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
-use parking_lot::Mutex;
+use crate::records::InvalidTemporalFacts;
+use crate::{Actor, EraId, OperationId, RecordState, Scope, TemporalFacts, MAX_ACCESS_SCOPES};
+use mmdb_kernel::store_format::StoreFormatError;
+use mmdb_kernel::{Batch, EraPartitions, Kernel, KernelError, Partition};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use ulid::Ulid;
 
-#[path = "context/mod.rs"]
-pub mod context;
+macro_rules! native_partition_names {
+    ($($constant:ident => $name:literal),+ $(,)?) => {
+        $(const $constant: &str = $name;)+
+        pub(crate) const NATIVE_PARTITIONS: &[&str] = &[$($constant),+];
+    };
+}
 
-/// Exact outer format recognized by both native opening and reset planning.
-pub const MEMORY_STORE_FORMAT_ID: &str = "mmdb-native-memory-v1";
-
-const PART_NATIVE_METADATA: &str = "native_internal_metadata_v1";
-const NATIVE_METADATA_KEY: &[u8] = b"native-memory-metadata";
-const PART_EVIDENCE: &str = "native_evidence_headers_v1";
-const PART_EVIDENCE_AVAILABILITY: &str = "native_evidence_availability_v1";
-const PART_EVIDENCE_HEADS: &str = "native_evidence_heads_v1";
-const PART_CLAIMS: &str = "native_claim_revisions_v1";
-const PART_CLAIM_HEADS: &str = "native_claim_heads_v1";
-const PART_RELATIONS: &str = "native_relation_revisions_v1";
-const PART_RELATION_HEADS: &str = "native_relation_heads_v1";
-const PART_ENTITIES: &str = "native_entity_revisions_v1";
-const PART_ENTITY_HEADS: &str = "native_entity_heads_v1";
-const PART_PROPOSALS: &str = "native_proposal_revisions_v1";
-const PART_PROPOSAL_HEADS: &str = "native_proposal_heads_v1";
-const PART_PROPOSAL_SOURCES: &str = "native_proposal_sources_v1";
-const PART_PENDING_PROPOSALS: &str = "native_pending_proposals_v1";
-const PART_AWAITING_ADJUDICATION: &str = "native_awaiting_adjudication_v1";
-const PART_PROPOSAL_REVIEWS: &str = "native_proposal_review_revisions_v1";
-const PART_PROPOSAL_REVIEW_HEADS: &str = "native_proposal_review_heads_v1";
-const PART_LATEST_PROPOSAL_REVIEW: &str = "native_latest_proposal_review_v1";
-const PART_RECALL_FEEDBACK: &str = "native_recall_feedback_v1";
-const PART_ARTIFACT_COLLECTIONS: &str = "native_artifact_collection_headers_v1";
-const PART_ARTIFACT_COLLECTION_AVAILABILITY: &str = "native_artifact_collection_availability_v1";
-const PART_ARTIFACT_COLLECTION_HEADS: &str = "native_artifact_collection_heads_v1";
-const PART_ARTIFACT_SNAPSHOTS: &str = "native_artifact_snapshot_headers_v1";
-const PART_ARTIFACT_SNAPSHOT_AVAILABILITY: &str = "native_artifact_snapshot_availability_v1";
-const PART_ARTIFACT_SNAPSHOT_HEADS: &str = "native_artifact_snapshot_heads_v1";
-const PART_ARTIFACT_SNAPSHOT_BLOBS: &str = "native_artifact_snapshot_blobs_v1";
-const PART_ARTIFACT_PASSAGES: &str = "native_artifact_passage_headers_v1";
-const PART_ARTIFACT_PASSAGE_AVAILABILITY: &str = "native_artifact_passage_availability_v1";
-const PART_ARTIFACT_PASSAGE_HEADS: &str = "native_artifact_passage_heads_v1";
-const PART_ARTIFACT_PASSAGE_ORDINALS: &str = "native_artifact_passage_ordinals_v1";
-const PART_ARTIFACT_BY_EVIDENCE: &str = "native_artifact_by_evidence_v1";
-const PART_PAYLOADS: &str = "native_erasable_payloads_v1";
-const PART_LEXICAL_DOCS: &str = "native_lexical_documents_v1";
-const PART_LEXICAL_POSTINGS: &str = "native_lexical_postings_v1";
-const PART_TIME_INDEX: &str = "native_observed_time_v1";
-const PART_DEPENDENCIES: &str = "native_dependencies_v1";
-const PART_RECALL_CASES: &str = "native_recall_cases_v1";
-const PART_RELATION_EVALUATORS: &str = "native_relation_evaluator_revisions_v1";
-const PART_RELATION_EVALUATOR_HEADS: &str = "native_relation_evaluator_heads_v1";
-const PART_RELATION_PROFILES: &str = "native_relation_profile_revisions_v1";
-const PART_RELATION_PROFILE_HEADS: &str = "native_relation_profile_heads_v1";
-const PART_RELATION_SIGNALS: &str = "native_relation_signal_revisions_v1";
-const PART_RELATION_SIGNAL_HEADS: &str = "native_relation_signal_heads_v1";
-const PART_RELATION_SIGNAL_PAYLOADS: &str = "native_relation_signal_payloads_v1";
-const PART_RELATION_SIGNAL_PAIRS: &str = "native_relation_signal_pairs_v1";
-const PART_RELATION_SIGNALS_BY_RECORD: &str = "native_relation_signals_by_record_v1";
-const PART_RELATION_SIGNALS_BY_EVALUATOR: &str = "native_relation_signals_by_evaluator_v1";
-const PART_RELATION_SIGNALS_BY_PROFILE: &str = "native_relation_signals_by_profile_v1";
-const PART_ACTIVATION_TRACES: &str = "native_activation_traces_v1";
-const PART_ACTIVATION_TRACE_PAYLOADS: &str = "native_activation_trace_payloads_v1";
-const PART_ACTIVATION_TRACES_BY_RECORD: &str = "native_activation_traces_by_record_v1";
-const PART_ACTIVATION_TRACES_BY_EVALUATOR: &str = "native_activation_traces_by_evaluator_v1";
-const PART_ACTIVATION_TRACES_BY_PROFILE: &str = "native_activation_traces_by_profile_v1";
-const PART_AUDIT: &str = "native_audit_events_v1";
-const PART_OPERATIONS: &str = "native_operations_v1";
+native_partition_names! {
+    PART_EVIDENCE => "native_evidence_headers_v1",
+    PART_EVIDENCE_AVAILABILITY => "native_evidence_availability_v1",
+    PART_EVIDENCE_HEADS => "native_evidence_heads_v1",
+    PART_CLAIMS => "native_claim_revisions_v1",
+    PART_CLAIM_HEADS => "native_claim_heads_v1",
+    PART_RELATIONS => "native_relation_revisions_v1",
+    PART_RELATION_HEADS => "native_relation_heads_v1",
+    PART_ENTITIES => "native_entity_revisions_v1",
+    PART_ENTITY_HEADS => "native_entity_heads_v1",
+    PART_PROPOSALS => "native_proposal_revisions_v1",
+    PART_PROPOSAL_HEADS => "native_proposal_heads_v1",
+    PART_PROPOSAL_SOURCES => "native_proposal_sources_v1",
+    PART_PENDING_PROPOSALS => "native_pending_proposals_v1",
+    PART_AWAITING_ADJUDICATION => "native_awaiting_adjudication_v1",
+    PART_PROPOSAL_REVIEWS => "native_proposal_review_revisions_v1",
+    PART_PROPOSAL_REVIEW_HEADS => "native_proposal_review_heads_v1",
+    PART_LATEST_PROPOSAL_REVIEW => "native_latest_proposal_review_v1",
+    PART_RECALL_FEEDBACK => "native_recall_feedback_v1",
+    PART_ARTIFACT_COLLECTIONS => "native_artifact_collection_headers_v1",
+    PART_ARTIFACT_COLLECTION_AVAILABILITY => "native_artifact_collection_availability_v1",
+    PART_ARTIFACT_COLLECTION_HEADS => "native_artifact_collection_heads_v1",
+    PART_ARTIFACT_SNAPSHOTS => "native_artifact_snapshot_headers_v1",
+    PART_ARTIFACT_SNAPSHOT_AVAILABILITY => "native_artifact_snapshot_availability_v1",
+    PART_ARTIFACT_SNAPSHOT_HEADS => "native_artifact_snapshot_heads_v1",
+    PART_ARTIFACT_SNAPSHOT_BLOBS => "native_artifact_snapshot_blobs_v1",
+    PART_ARTIFACT_PASSAGES => "native_artifact_passage_headers_v1",
+    PART_ARTIFACT_PASSAGE_AVAILABILITY => "native_artifact_passage_availability_v1",
+    PART_ARTIFACT_PASSAGE_HEADS => "native_artifact_passage_heads_v1",
+    PART_ARTIFACT_PASSAGE_ORDINALS => "native_artifact_passage_ordinals_v1",
+    PART_ARTIFACT_BY_EVIDENCE => "native_artifact_by_evidence_v1",
+    PART_PAYLOADS => "native_erasable_payloads_v1",
+    PART_LEXICAL_DOCS => "native_lexical_documents_v1",
+    PART_LEXICAL_POSTINGS => "native_lexical_postings_v1",
+    PART_TIME_INDEX => "native_observed_time_v1",
+    PART_DEPENDENCIES => "native_dependencies_v1",
+    PART_RECALL_CASES => "native_recall_cases_v1",
+    PART_RELATION_EVALUATORS => "native_relation_evaluator_revisions_v1",
+    PART_RELATION_EVALUATOR_HEADS => "native_relation_evaluator_heads_v1",
+    PART_RELATION_PROFILES => "native_relation_profile_revisions_v1",
+    PART_RELATION_PROFILE_HEADS => "native_relation_profile_heads_v1",
+    PART_RELATION_SIGNALS => "native_relation_signal_revisions_v1",
+    PART_RELATION_SIGNAL_HEADS => "native_relation_signal_heads_v1",
+    PART_RELATION_SIGNAL_PAYLOADS => "native_relation_signal_payloads_v1",
+    PART_RELATION_SIGNAL_PAIRS => "native_relation_signal_pairs_v1",
+    PART_RELATION_SIGNALS_BY_RECORD => "native_relation_signals_by_record_v1",
+    PART_RELATION_SIGNALS_BY_EVALUATOR => "native_relation_signals_by_evaluator_v1",
+    PART_RELATION_SIGNALS_BY_PROFILE => "native_relation_signals_by_profile_v1",
+    PART_ACTIVATION_TRACES => "native_activation_traces_v1",
+    PART_ACTIVATION_TRACE_PAYLOADS => "native_activation_trace_payloads_v1",
+    PART_ACTIVATION_TRACES_BY_RECORD => "native_activation_traces_by_record_v1",
+    PART_ACTIVATION_TRACES_BY_EVALUATOR => "native_activation_traces_by_evaluator_v1",
+    PART_ACTIVATION_TRACES_BY_PROFILE => "native_activation_traces_by_profile_v1",
+    PART_AUDIT => "native_audit_events_v1",
+    PART_OPERATIONS => "native_operations_v1",
+}
 
 const MAX_RECALL_LIMIT: usize = 100;
 const MAX_RECALL_TERMS: usize = 64;
 const MAX_RECALL_CANDIDATES: usize = 4_096;
-pub const MAX_RECALL_SCOPES: usize = 32;
 pub const MAX_TEXT_BYTES: usize = 64 * 1024;
 /// Exact observations may be larger than derived semantic text. This keeps a
 /// normal long-form user turn lossless while retaining a hard per-record cap.
@@ -149,8 +145,6 @@ macro_rules! id_type {
     };
 }
 
-id_type!(EraId);
-id_type!(OperationId);
 id_type!(EvidenceId);
 id_type!(ClaimId);
 id_type!(RelationId);
@@ -174,14 +168,10 @@ id_type!(ActivationTraceId);
 pub enum MemoryError {
     Io(std::io::Error),
     StoreFormat(StoreFormatError),
-    Storage(String),
+    Storage(KernelError),
     Codec(serde_json::Error),
     Corrupt(String),
     StoreAlreadyExists(PathBuf),
-    StoreEraMismatch {
-        outer: String,
-        internal: String,
-    },
     NotFound(RecordRef),
     OperationConflict(OperationId),
     RevisionConflict {
@@ -213,17 +203,13 @@ impl fmt::Display for MemoryError {
         match self {
             Self::Io(error) => write!(f, "I/O error: {error}"),
             Self::StoreFormat(error) => error.fmt(f),
-            Self::Storage(error) => write!(f, "storage error: {error}"),
+            Self::Storage(error) => error.fmt(f),
             Self::Codec(error) => write!(f, "codec error: {error}"),
             Self::Corrupt(message) => write!(f, "corrupt native memory store: {message}"),
             Self::StoreAlreadyExists(path) => write!(
                 f,
                 "refusing to initialize an existing store root: {}",
                 path.display()
-            ),
-            Self::StoreEraMismatch { outer, internal } => write!(
-                f,
-                "native metadata era {internal} does not match outer store era {outer}"
             ),
             Self::NotFound(record) => write!(f, "record not found: {record:?}"),
             Self::OperationConflict(id) => {
@@ -272,6 +258,7 @@ impl std::error::Error for MemoryError {
         match self {
             Self::Io(error) => Some(error),
             Self::StoreFormat(error) => Some(error),
+            Self::Storage(error) => Some(error),
             Self::Codec(error) => Some(error),
             _ => None,
         }
@@ -296,15 +283,22 @@ impl From<StoreFormatError> for MemoryError {
     }
 }
 
-pub type MemoryResult<T> = std::result::Result<T, MemoryError>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Actor {
-    User,
-    Assistant,
-    System,
-    Operator,
+impl From<KernelError> for MemoryError {
+    fn from(error: KernelError) -> Self {
+        match error {
+            KernelError::Format(error) => Self::StoreFormat(error),
+            error => Self::Storage(error),
+        }
+    }
 }
+
+impl From<InvalidTemporalFacts> for MemoryError {
+    fn from(error: InvalidTemporalFacts) -> Self {
+        Self::InvalidInput(error.to_string())
+    }
+}
+
+pub type MemoryResult<T> = std::result::Result<T, MemoryError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationContext {
@@ -319,70 +313,6 @@ impl OperationContext {
             actor,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum Scope {
-    Personal,
-    Workspace(Ulid),
-    Session(Ulid),
-    Artifact(Ulid),
-    System,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TemporalFacts {
-    pub observed_at_ms: i64,
-    pub source_at_ms: Option<i64>,
-    pub valid_from_ms: Option<i64>,
-    pub valid_to_ms: Option<i64>,
-}
-
-impl TemporalFacts {
-    pub fn observed_at(observed_at_ms: i64) -> Self {
-        Self {
-            observed_at_ms,
-            source_at_ms: None,
-            valid_from_ms: None,
-            valid_to_ms: None,
-        }
-    }
-
-    fn validate(self) -> MemoryResult<()> {
-        if let (Some(from), Some(to)) = (self.valid_from_ms, self.valid_to_ms) {
-            if from >= to {
-                return Err(MemoryError::InvalidInput(
-                    "valid time must use a non-empty [from, to) interval".into(),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn contains_valid_time(self, at_ms: i64) -> bool {
-        self.valid_from_ms.is_none_or(|from| at_ms >= from)
-            && self.valid_to_ms.is_none_or(|to| at_ms < to)
-    }
-
-    /// Whether `at_ms` falls inside the record's explicit valid-time window.
-    ///
-    /// This deliberately only reasons about *valid time* (when the fact holds in
-    /// the world). It is distinct from `observed_at_ms`, which records when the
-    /// observation was captured, and from `recorded_at_ms` on the header, which
-    /// is when the row was written to the store. The three concepts are kept on
-    /// separate fields so they can never be conflated.
-    pub fn is_valid_at(&self, at_ms: i64) -> bool {
-        self.contains_valid_time(at_ms)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RecordState {
-    Active,
-    Retracted,
-    Superseded,
-    Unsupported,
-    Purged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1593,12 +1523,6 @@ pub struct RetractionReceipt {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct NativeMetadata {
-    store_era_id: String,
-    digest_key: [u8; 32],
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredOperation {
     digest: [u8; 32],
     receipt: serde_json::Value,
@@ -1641,225 +1565,124 @@ struct ArtifactEvidenceInsert<'a> {
 }
 
 pub struct MemoryDatabase {
-    keyspace: Keyspace,
-    context: Option<context::ContextPartitions>,
+    pub(crate) kernel: Kernel,
     era_id: EraId,
-    digest_key: [u8; 32],
-    evidence: PartitionHandle,
-    evidence_availability: PartitionHandle,
-    evidence_heads: PartitionHandle,
-    claims: PartitionHandle,
-    claim_heads: PartitionHandle,
-    relations: PartitionHandle,
-    relation_heads: PartitionHandle,
-    entities: PartitionHandle,
-    entity_heads: PartitionHandle,
-    proposals: PartitionHandle,
-    proposal_heads: PartitionHandle,
-    proposal_sources: PartitionHandle,
-    pending_proposals: PartitionHandle,
-    awaiting_adjudication: PartitionHandle,
-    proposal_reviews: PartitionHandle,
-    proposal_review_heads: PartitionHandle,
-    latest_proposal_review: PartitionHandle,
-    recall_feedback: PartitionHandle,
-    artifact_collections: PartitionHandle,
-    artifact_collection_availability: PartitionHandle,
-    artifact_collection_heads: PartitionHandle,
-    artifact_snapshots: PartitionHandle,
-    artifact_snapshot_availability: PartitionHandle,
-    artifact_snapshot_heads: PartitionHandle,
-    artifact_snapshot_blobs: PartitionHandle,
-    artifact_passages: PartitionHandle,
-    artifact_passage_availability: PartitionHandle,
-    artifact_passage_heads: PartitionHandle,
-    artifact_passage_ordinals: PartitionHandle,
-    artifact_by_evidence: PartitionHandle,
-    payloads: PartitionHandle,
-    lexical_docs: PartitionHandle,
-    lexical_postings: PartitionHandle,
-    time_index: PartitionHandle,
-    dependencies: PartitionHandle,
-    recall_cases: PartitionHandle,
-    relation_evaluators: PartitionHandle,
-    relation_evaluator_heads: PartitionHandle,
-    relation_profiles: PartitionHandle,
-    relation_profile_heads: PartitionHandle,
-    relation_signals: PartitionHandle,
-    relation_signal_heads: PartitionHandle,
-    relation_signal_payloads: PartitionHandle,
-    relation_signal_pairs: PartitionHandle,
-    relation_signals_by_record: PartitionHandle,
-    relation_signals_by_evaluator: PartitionHandle,
-    relation_signals_by_profile: PartitionHandle,
-    activation_traces: PartitionHandle,
-    activation_trace_payloads: PartitionHandle,
-    activation_traces_by_record: PartitionHandle,
-    activation_traces_by_evaluator: PartitionHandle,
-    activation_traces_by_profile: PartitionHandle,
-    audit: PartitionHandle,
-    operations: PartitionHandle,
-    write_lock: Mutex<()>,
-    _lease: StoreLease,
+    evidence: Partition,
+    evidence_availability: Partition,
+    evidence_heads: Partition,
+    claims: Partition,
+    claim_heads: Partition,
+    relations: Partition,
+    relation_heads: Partition,
+    entities: Partition,
+    entity_heads: Partition,
+    proposals: Partition,
+    proposal_heads: Partition,
+    proposal_sources: Partition,
+    pending_proposals: Partition,
+    awaiting_adjudication: Partition,
+    proposal_reviews: Partition,
+    proposal_review_heads: Partition,
+    latest_proposal_review: Partition,
+    recall_feedback: Partition,
+    artifact_collections: Partition,
+    artifact_collection_availability: Partition,
+    artifact_collection_heads: Partition,
+    artifact_snapshots: Partition,
+    artifact_snapshot_availability: Partition,
+    artifact_snapshot_heads: Partition,
+    artifact_snapshot_blobs: Partition,
+    artifact_passages: Partition,
+    artifact_passage_availability: Partition,
+    artifact_passage_heads: Partition,
+    artifact_passage_ordinals: Partition,
+    artifact_by_evidence: Partition,
+    payloads: Partition,
+    lexical_docs: Partition,
+    lexical_postings: Partition,
+    time_index: Partition,
+    dependencies: Partition,
+    recall_cases: Partition,
+    relation_evaluators: Partition,
+    relation_evaluator_heads: Partition,
+    relation_profiles: Partition,
+    relation_profile_heads: Partition,
+    relation_signals: Partition,
+    relation_signal_heads: Partition,
+    relation_signal_payloads: Partition,
+    relation_signal_pairs: Partition,
+    relation_signals_by_record: Partition,
+    relation_signals_by_evaluator: Partition,
+    relation_signals_by_profile: Partition,
+    activation_traces: Partition,
+    activation_trace_payloads: Partition,
+    activation_traces_by_record: Partition,
+    activation_traces_by_evaluator: Partition,
+    activation_traces_by_profile: Partition,
+    audit: Partition,
+    operations: Partition,
 }
 
 impl MemoryDatabase {
-    /// Explicitly initialize a new store at an absent path, write the sole
-    /// outer marker, and then open it through the same validation path as every
-    /// later process.
-    pub fn create(root: impl AsRef<Path>) -> MemoryResult<Self> {
-        Self::create_format(root.as_ref(), MEMORY_STORE_FORMAT_ID)
-    }
-
-    /// Create a fresh context store. Existing roots are never adopted or reset.
-    pub fn create_context(root: impl AsRef<Path>) -> MemoryResult<Self> {
-        Self::create_format(root.as_ref(), context::CONTEXT_STORE_FORMAT_ID)
-    }
-
-    fn create_format(root: &Path, format_id: &str) -> MemoryResult<Self> {
-        let lease = StoreLease::acquire(root)?;
-        match fs::symlink_metadata(root) {
-            Ok(_) => return Err(MemoryError::StoreAlreadyExists(root.to_path_buf())),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(MemoryError::Io(error)),
-        }
-        fs::create_dir(root)?;
-        let store_era_id = StoreEraId::new();
-        OuterStoreManifest::new(format_id, store_era_id)?.write_new(root)?;
-        Self::open_with_lease(root, lease, true, format_id)
-    }
-
-    /// Open only an existing root with the exact clean-store marker and format.
-    /// The outer check happens before fjall sees the path.
-    pub fn open(root: impl AsRef<Path>) -> MemoryResult<Self> {
-        Self::open_format(root.as_ref(), MEMORY_STORE_FORMAT_ID)
-    }
-
-    /// Open the context format without converting or modifying an older format.
-    pub fn open_context(root: impl AsRef<Path>) -> MemoryResult<Self> {
-        Self::open_format(root.as_ref(), context::CONTEXT_STORE_FORMAT_ID)
-    }
-
-    fn open_format(root: &Path, format_id: &str) -> MemoryResult<Self> {
-        let lease = StoreLease::acquire(root)?;
-        let allow_metadata_initialization = root_contains_only_outer_manifest(root)?;
-        Self::open_with_lease(root, lease, allow_metadata_initialization, format_id)
-    }
-
-    fn open_with_lease(
-        root: &Path,
-        lease: StoreLease,
-        allow_metadata_initialization: bool,
-        format_id: &str,
-    ) -> MemoryResult<Self> {
-        let managed = require_managed_store(root, format_id)?;
-        let outer_store_era_id = managed.manifest().store_era_id().as_str().to_owned();
-        let era_ulid = outer_store_era_id.parse::<Ulid>().map_err(|error| {
-            MemoryError::Corrupt(format!("outer store era is not a ULID: {error}"))
-        })?;
-        let keyspace = Config::new(managed.canonical_root())
-            .open()
-            .map_err(|error| MemoryError::Storage(error.to_string()))?;
-        let metadata_partition = open_partition(&keyspace, PART_NATIVE_METADATA)?;
-        let metadata = load_or_create_native_metadata(
-            &keyspace,
-            &metadata_partition,
-            &outer_store_era_id,
-            allow_metadata_initialization,
-        )?;
-        if metadata.store_era_id != outer_store_era_id {
-            return Err(MemoryError::StoreEraMismatch {
-                outer: outer_store_era_id,
-                internal: metadata.store_era_id,
-            });
-        }
+    pub(crate) fn on_era(kernel: Kernel, era: &EraPartitions) -> MemoryResult<Self> {
         Ok(Self {
-            context: (format_id == context::CONTEXT_STORE_FORMAT_ID)
-                .then(|| context::ContextPartitions::open(&keyspace))
-                .transpose()?,
-            evidence: open_partition(&keyspace, PART_EVIDENCE)?,
-            evidence_availability: open_partition(&keyspace, PART_EVIDENCE_AVAILABILITY)?,
-            evidence_heads: open_partition(&keyspace, PART_EVIDENCE_HEADS)?,
-            claims: open_partition(&keyspace, PART_CLAIMS)?,
-            claim_heads: open_partition(&keyspace, PART_CLAIM_HEADS)?,
-            relations: open_partition(&keyspace, PART_RELATIONS)?,
-            relation_heads: open_partition(&keyspace, PART_RELATION_HEADS)?,
-            entities: open_partition(&keyspace, PART_ENTITIES)?,
-            entity_heads: open_partition(&keyspace, PART_ENTITY_HEADS)?,
-            proposals: open_partition(&keyspace, PART_PROPOSALS)?,
-            proposal_heads: open_partition(&keyspace, PART_PROPOSAL_HEADS)?,
-            proposal_sources: open_partition(&keyspace, PART_PROPOSAL_SOURCES)?,
-            pending_proposals: open_partition(&keyspace, PART_PENDING_PROPOSALS)?,
-            awaiting_adjudication: open_partition(&keyspace, PART_AWAITING_ADJUDICATION)?,
-            proposal_reviews: open_partition(&keyspace, PART_PROPOSAL_REVIEWS)?,
-            proposal_review_heads: open_partition(&keyspace, PART_PROPOSAL_REVIEW_HEADS)?,
-            latest_proposal_review: open_partition(&keyspace, PART_LATEST_PROPOSAL_REVIEW)?,
-            recall_feedback: open_partition(&keyspace, PART_RECALL_FEEDBACK)?,
-            artifact_collections: open_partition(&keyspace, PART_ARTIFACT_COLLECTIONS)?,
-            artifact_collection_availability: open_partition(
-                &keyspace,
-                PART_ARTIFACT_COLLECTION_AVAILABILITY,
-            )?,
-            artifact_collection_heads: open_partition(&keyspace, PART_ARTIFACT_COLLECTION_HEADS)?,
-            artifact_snapshots: open_partition(&keyspace, PART_ARTIFACT_SNAPSHOTS)?,
-            artifact_snapshot_availability: open_partition(
-                &keyspace,
-                PART_ARTIFACT_SNAPSHOT_AVAILABILITY,
-            )?,
-            artifact_snapshot_heads: open_partition(&keyspace, PART_ARTIFACT_SNAPSHOT_HEADS)?,
-            artifact_snapshot_blobs: open_partition(&keyspace, PART_ARTIFACT_SNAPSHOT_BLOBS)?,
-            artifact_passages: open_partition(&keyspace, PART_ARTIFACT_PASSAGES)?,
-            artifact_passage_availability: open_partition(
-                &keyspace,
-                PART_ARTIFACT_PASSAGE_AVAILABILITY,
-            )?,
-            artifact_passage_heads: open_partition(&keyspace, PART_ARTIFACT_PASSAGE_HEADS)?,
-            artifact_passage_ordinals: open_partition(&keyspace, PART_ARTIFACT_PASSAGE_ORDINALS)?,
-            artifact_by_evidence: open_partition(&keyspace, PART_ARTIFACT_BY_EVIDENCE)?,
-            payloads: open_partition(&keyspace, PART_PAYLOADS)?,
-            lexical_docs: open_partition(&keyspace, PART_LEXICAL_DOCS)?,
-            lexical_postings: open_partition(&keyspace, PART_LEXICAL_POSTINGS)?,
-            time_index: open_partition(&keyspace, PART_TIME_INDEX)?,
-            dependencies: open_partition(&keyspace, PART_DEPENDENCIES)?,
-            recall_cases: open_partition(&keyspace, PART_RECALL_CASES)?,
-            relation_evaluators: open_partition(&keyspace, PART_RELATION_EVALUATORS)?,
-            relation_evaluator_heads: open_partition(&keyspace, PART_RELATION_EVALUATOR_HEADS)?,
-            relation_profiles: open_partition(&keyspace, PART_RELATION_PROFILES)?,
-            relation_profile_heads: open_partition(&keyspace, PART_RELATION_PROFILE_HEADS)?,
-            relation_signals: open_partition(&keyspace, PART_RELATION_SIGNALS)?,
-            relation_signal_heads: open_partition(&keyspace, PART_RELATION_SIGNAL_HEADS)?,
-            relation_signal_payloads: open_partition(&keyspace, PART_RELATION_SIGNAL_PAYLOADS)?,
-            relation_signal_pairs: open_partition(&keyspace, PART_RELATION_SIGNAL_PAIRS)?,
-            relation_signals_by_record: open_partition(&keyspace, PART_RELATION_SIGNALS_BY_RECORD)?,
-            relation_signals_by_evaluator: open_partition(
-                &keyspace,
-                PART_RELATION_SIGNALS_BY_EVALUATOR,
-            )?,
-            relation_signals_by_profile: open_partition(
-                &keyspace,
-                PART_RELATION_SIGNALS_BY_PROFILE,
-            )?,
-            activation_traces: open_partition(&keyspace, PART_ACTIVATION_TRACES)?,
-            activation_trace_payloads: open_partition(&keyspace, PART_ACTIVATION_TRACE_PAYLOADS)?,
-            activation_traces_by_record: open_partition(
-                &keyspace,
-                PART_ACTIVATION_TRACES_BY_RECORD,
-            )?,
-            activation_traces_by_evaluator: open_partition(
-                &keyspace,
-                PART_ACTIVATION_TRACES_BY_EVALUATOR,
-            )?,
-            activation_traces_by_profile: open_partition(
-                &keyspace,
-                PART_ACTIVATION_TRACES_BY_PROFILE,
-            )?,
-            audit: open_partition(&keyspace, PART_AUDIT)?,
-            operations: open_partition(&keyspace, PART_OPERATIONS)?,
-            keyspace,
-            era_id: EraId(era_ulid),
-            digest_key: metadata.digest_key,
-            write_lock: Mutex::new(()),
-            _lease: lease,
+            evidence: era.partition(PART_EVIDENCE)?,
+            evidence_availability: era.partition(PART_EVIDENCE_AVAILABILITY)?,
+            evidence_heads: era.partition(PART_EVIDENCE_HEADS)?,
+            claims: era.partition(PART_CLAIMS)?,
+            claim_heads: era.partition(PART_CLAIM_HEADS)?,
+            relations: era.partition(PART_RELATIONS)?,
+            relation_heads: era.partition(PART_RELATION_HEADS)?,
+            entities: era.partition(PART_ENTITIES)?,
+            entity_heads: era.partition(PART_ENTITY_HEADS)?,
+            proposals: era.partition(PART_PROPOSALS)?,
+            proposal_heads: era.partition(PART_PROPOSAL_HEADS)?,
+            proposal_sources: era.partition(PART_PROPOSAL_SOURCES)?,
+            pending_proposals: era.partition(PART_PENDING_PROPOSALS)?,
+            awaiting_adjudication: era.partition(PART_AWAITING_ADJUDICATION)?,
+            proposal_reviews: era.partition(PART_PROPOSAL_REVIEWS)?,
+            proposal_review_heads: era.partition(PART_PROPOSAL_REVIEW_HEADS)?,
+            latest_proposal_review: era.partition(PART_LATEST_PROPOSAL_REVIEW)?,
+            recall_feedback: era.partition(PART_RECALL_FEEDBACK)?,
+            artifact_collections: era.partition(PART_ARTIFACT_COLLECTIONS)?,
+            artifact_collection_availability: era
+                .partition(PART_ARTIFACT_COLLECTION_AVAILABILITY)?,
+            artifact_collection_heads: era.partition(PART_ARTIFACT_COLLECTION_HEADS)?,
+            artifact_snapshots: era.partition(PART_ARTIFACT_SNAPSHOTS)?,
+            artifact_snapshot_availability: era.partition(PART_ARTIFACT_SNAPSHOT_AVAILABILITY)?,
+            artifact_snapshot_heads: era.partition(PART_ARTIFACT_SNAPSHOT_HEADS)?,
+            artifact_snapshot_blobs: era.partition(PART_ARTIFACT_SNAPSHOT_BLOBS)?,
+            artifact_passages: era.partition(PART_ARTIFACT_PASSAGES)?,
+            artifact_passage_availability: era.partition(PART_ARTIFACT_PASSAGE_AVAILABILITY)?,
+            artifact_passage_heads: era.partition(PART_ARTIFACT_PASSAGE_HEADS)?,
+            artifact_passage_ordinals: era.partition(PART_ARTIFACT_PASSAGE_ORDINALS)?,
+            artifact_by_evidence: era.partition(PART_ARTIFACT_BY_EVIDENCE)?,
+            payloads: era.partition(PART_PAYLOADS)?,
+            lexical_docs: era.partition(PART_LEXICAL_DOCS)?,
+            lexical_postings: era.partition(PART_LEXICAL_POSTINGS)?,
+            time_index: era.partition(PART_TIME_INDEX)?,
+            dependencies: era.partition(PART_DEPENDENCIES)?,
+            recall_cases: era.partition(PART_RECALL_CASES)?,
+            relation_evaluators: era.partition(PART_RELATION_EVALUATORS)?,
+            relation_evaluator_heads: era.partition(PART_RELATION_EVALUATOR_HEADS)?,
+            relation_profiles: era.partition(PART_RELATION_PROFILES)?,
+            relation_profile_heads: era.partition(PART_RELATION_PROFILE_HEADS)?,
+            relation_signals: era.partition(PART_RELATION_SIGNALS)?,
+            relation_signal_heads: era.partition(PART_RELATION_SIGNAL_HEADS)?,
+            relation_signal_payloads: era.partition(PART_RELATION_SIGNAL_PAYLOADS)?,
+            relation_signal_pairs: era.partition(PART_RELATION_SIGNAL_PAIRS)?,
+            relation_signals_by_record: era.partition(PART_RELATION_SIGNALS_BY_RECORD)?,
+            relation_signals_by_evaluator: era.partition(PART_RELATION_SIGNALS_BY_EVALUATOR)?,
+            relation_signals_by_profile: era.partition(PART_RELATION_SIGNALS_BY_PROFILE)?,
+            activation_traces: era.partition(PART_ACTIVATION_TRACES)?,
+            activation_trace_payloads: era.partition(PART_ACTIVATION_TRACE_PAYLOADS)?,
+            activation_traces_by_record: era.partition(PART_ACTIVATION_TRACES_BY_RECORD)?,
+            activation_traces_by_evaluator: era.partition(PART_ACTIVATION_TRACES_BY_EVALUATOR)?,
+            activation_traces_by_profile: era.partition(PART_ACTIVATION_TRACES_BY_PROFILE)?,
+            audit: era.partition(PART_AUDIT)?,
+            operations: era.partition(PART_OPERATIONS)?,
+            kernel,
+            era_id: era.era(),
         })
     }
 
@@ -1904,7 +1727,7 @@ impl MemoryDatabase {
         operation: OperationContext,
         input: NewEvidence,
     ) -> MemoryResult<EvidenceReceipt> {
-        let _guard = self.write_lock.lock();
+        let _guard = self.kernel.write_lock();
         self.capture_evidence_locked(operation, input)
     }
 
@@ -1952,7 +1775,7 @@ impl MemoryDatabase {
             recorded_at_ms,
         );
 
-        let mut batch = self.durable_batch();
+        let mut batch = self.kernel.batch();
         batch.insert(&self.evidence, id_key(id.0), encode(&header)?);
         batch.insert(
             &self.evidence_availability,
@@ -2112,7 +1935,7 @@ impl MemoryDatabase {
         // side of any concurrent retract/purge commit. Without this gate a
         // purge between the metadata and blob reads could either surface a
         // false corruption error or return bytes after the purge linearized.
-        let _guard = self.write_lock.lock();
+        let _guard = self.kernel.write_lock();
         let Some(record) = self.inspect_artifact_snapshot(id)? else {
             return Ok(None);
         };
@@ -2128,8 +1951,7 @@ impl MemoryDatabase {
         after_metadata();
         let Some(bytes) = self
             .artifact_snapshot_blobs
-            .get(id_key(id.0))
-            .map_err(storage_error)?
+            .get(id_key(id.0))?
             .map(|value| value.to_vec())
         else {
             return Err(MemoryError::Corrupt(format!(
@@ -2207,7 +2029,7 @@ impl MemoryDatabase {
         input.label =
             validate_exact_bounded_text(input.label, "artifact label", MAX_ARTIFACT_LABEL_BYTES)?;
         let digest = self.mutation_digest("create_artifact_collection", operation.actor, &input)?;
-        let _guard = self.write_lock.lock();
+        let _guard = self.kernel.write_lock();
         if let Some(receipt) = self.replayed_operation(operation.id, digest)? {
             return Ok(receipt);
         }
@@ -2231,7 +2053,7 @@ impl MemoryDatabase {
             id,
             availability_revision: 1,
         };
-        let mut batch = self.durable_batch();
+        let mut batch = self.kernel.batch();
         batch.insert(&self.artifact_collections, id_key(id.0), encode(&header)?);
         batch.insert(
             &self.artifact_collection_availability,
@@ -2278,7 +2100,7 @@ impl MemoryDatabase {
             )));
         }
         let digest = self.artifact_snapshot_mutation_digest(operation.actor, &input)?;
-        let _guard = self.write_lock.lock();
+        let _guard = self.kernel.write_lock();
         if let Some(receipt) = self.replayed_operation(operation.id, digest)? {
             return Ok(receipt);
         }
@@ -2323,7 +2145,7 @@ impl MemoryDatabase {
             availability_revision: 1,
             evidence: evidence.clone(),
         };
-        let mut batch = self.durable_batch();
+        let mut batch = self.kernel.batch();
         batch.insert(&self.artifact_snapshots, id_key(id.0), encode(&header)?);
         batch.insert(
             &self.artifact_snapshot_availability,
@@ -2402,7 +2224,7 @@ impl MemoryDatabase {
         require_artifact_actor(operation.actor)?;
         validate_artifact_passage_batch(&mut input)?;
         let digest = self.mutation_digest("create_artifact_passages", operation.actor, &input)?;
-        let _guard = self.write_lock.lock();
+        let _guard = self.kernel.write_lock();
         if let Some(receipt) = self.replayed_operation(operation.id, digest)? {
             return Ok(receipt);
         }
@@ -2431,8 +2253,7 @@ impl MemoryDatabase {
                 .get(artifact_passage_ordinal_key(
                     input.snapshot_id,
                     passage.locator.ordinal,
-                ))
-                .map_err(storage_error)?
+                ))?
                 .is_some()
             {
                 return Err(MemoryError::InvalidInput(format!(
@@ -2442,7 +2263,7 @@ impl MemoryDatabase {
             }
         }
         let recorded_at_ms = now_ms();
-        let mut batch = self.durable_batch();
+        let mut batch = self.kernel.batch();
         let mut receipts = Vec::with_capacity(input.passages.len());
         let mut subjects = Vec::with_capacity(input.passages.len() * 2);
         for passage in &input.passages {
@@ -2549,7 +2370,7 @@ impl MemoryDatabase {
 
     fn insert_artifact_evidence(
         &self,
-        batch: &mut fjall::Batch,
+        batch: &mut Batch,
         operation: OperationContext,
         input: ArtifactEvidenceInsert<'_>,
     ) -> MemoryResult<()> {
@@ -2614,7 +2435,7 @@ impl MemoryDatabase {
             expected_revision,
         };
         let digest = self.mutation_digest("retract", operation.actor, &mutation)?;
-        let _guard = self.write_lock.lock();
+        let _guard = self.kernel.write_lock();
         if let Some(receipt) = self.replayed_operation(operation.id, digest)? {
             return Ok(receipt);
         }
@@ -2633,7 +2454,7 @@ impl MemoryDatabase {
         }
         let dependencies = self.active_dependency_closure(record)?;
         let recorded_at_ms = now_ms();
-        let mut batch = self.durable_batch();
+        let mut batch = self.kernel.batch();
         let target = self.append_state_revision(
             &mut batch,
             record,
@@ -2699,7 +2520,7 @@ impl MemoryDatabase {
             &[EvidenceClass::UserAssertion],
         )?;
         let digest = self.mutation_digest("remember_user_claim", operation.actor, &input)?;
-        let _guard = self.write_lock.lock();
+        let _guard = self.kernel.write_lock();
         if let Some(receipt) = self.replayed_operation(operation.id, digest)? {
             return Ok(receipt);
         }
@@ -2754,7 +2575,7 @@ impl MemoryDatabase {
             recorded_at_ms,
         );
 
-        let mut batch = self.durable_batch();
+        let mut batch = self.kernel.batch();
         batch.insert(
             &self.evidence,
             id_key(evidence_id.0),
@@ -2829,7 +2650,7 @@ impl MemoryDatabase {
         input.replacement_proposition =
             validate_text(input.replacement_proposition, "replacement proposition")?;
         let digest = self.mutation_digest("correct_user_claim", operation.actor, &input)?;
-        let _guard = self.write_lock.lock();
+        let _guard = self.kernel.write_lock();
         if let Some(receipt) = self.replayed_operation(operation.id, digest)? {
             return Ok(receipt);
         }
@@ -2907,7 +2728,7 @@ impl MemoryDatabase {
             operation_id: operation.id,
         };
 
-        let mut batch = self.durable_batch();
+        let mut batch = self.kernel.batch();
         let superseded = self.append_state_revision(
             &mut batch,
             RecordRef::Claim(input.target),
@@ -3079,7 +2900,7 @@ impl MemoryDatabase {
             )));
         }
         let digest = self.mutation_digest("create_claim", operation.actor, &input)?;
-        let _guard = self.write_lock.lock();
+        let _guard = self.kernel.write_lock();
         if let Some(receipt) = self.replayed_operation(operation.id, digest)? {
             return Ok(receipt);
         }
@@ -3132,7 +2953,7 @@ impl MemoryDatabase {
             recorded_at_ms,
         );
 
-        let mut batch = self.durable_batch();
+        let mut batch = self.kernel.batch();
         batch.insert(&self.claims, revision_key(id.0, 1), encode(&header)?);
         batch.insert(&self.claim_heads, id_key(id.0), 1_u64.to_be_bytes());
         batch.insert(
@@ -3227,7 +3048,7 @@ impl MemoryDatabase {
             )));
         }
         let digest = self.mutation_digest("create_semantic_relation", operation.actor, &input)?;
-        let _guard = self.write_lock.lock();
+        let _guard = self.kernel.write_lock();
         if let Some(receipt) = self.replayed_operation(operation.id, digest)? {
             return Ok(receipt);
         }
@@ -3295,7 +3116,7 @@ impl MemoryDatabase {
             recorded_at_ms,
         );
 
-        let mut batch = self.durable_batch();
+        let mut batch = self.kernel.batch();
         batch.insert(&self.relations, revision_key(id.0, 1), encode(&header)?);
         batch.insert(&self.relation_heads, id_key(id.0), 1_u64.to_be_bytes());
         batch.insert(
@@ -3375,7 +3196,7 @@ impl MemoryDatabase {
         }
 
         let digest = self.mutation_digest("put_relation_evaluator", operation.actor, &input)?;
-        let _guard = self.write_lock.lock();
+        let _guard = self.kernel.write_lock();
         if let Some(receipt) = self.replayed_operation(operation.id, digest)? {
             return Ok(receipt);
         }
@@ -3442,7 +3263,7 @@ impl MemoryDatabase {
             vec![DerivedRecordRef::RelationEvaluator(input.id)],
             recorded_at_ms,
         );
-        let mut batch = self.durable_batch();
+        let mut batch = self.kernel.batch();
         batch.insert(
             &self.relation_evaluators,
             revision_key(input.id.0, revision),
@@ -3492,7 +3313,7 @@ impl MemoryDatabase {
             operation.actor,
             &(pin, change),
         )?;
-        let _guard = self.write_lock.lock();
+        let _guard = self.kernel.write_lock();
         if let Some(receipt) = self.replayed_operation(operation.id, digest)? {
             return Ok(receipt);
         }
@@ -3532,7 +3353,7 @@ impl MemoryDatabase {
         next.state = target_state;
         next.recorded_at_ms = recorded_at_ms;
         next.operation_id = operation.id;
-        let mut batch = self.durable_batch();
+        let mut batch = self.kernel.batch();
         let mut purged_relation_signals = Vec::new();
         let mut purged_activation_traces = Vec::new();
         if change == DerivedDefinitionStateChange::Purge {
@@ -3632,7 +3453,7 @@ impl MemoryDatabase {
         }
 
         let digest = self.mutation_digest("put_relation_profile", operation.actor, &input)?;
-        let _guard = self.write_lock.lock();
+        let _guard = self.kernel.write_lock();
         if let Some(receipt) = self.replayed_operation(operation.id, digest)? {
             return Ok(receipt);
         }
@@ -3723,7 +3544,7 @@ impl MemoryDatabase {
             vec![DerivedRecordRef::RelationProfile(input.id)],
             recorded_at_ms,
         );
-        let mut batch = self.durable_batch();
+        let mut batch = self.kernel.batch();
         batch.insert(
             &self.relation_profiles,
             revision_key(input.id.0, revision),
@@ -3778,7 +3599,7 @@ impl MemoryDatabase {
             operation.actor,
             &(pin, change),
         )?;
-        let _guard = self.write_lock.lock();
+        let _guard = self.kernel.write_lock();
         if let Some(receipt) = self.replayed_operation(operation.id, digest)? {
             return Ok(receipt);
         }
@@ -3818,7 +3639,7 @@ impl MemoryDatabase {
         next.state = target_state;
         next.recorded_at_ms = recorded_at_ms;
         next.operation_id = operation.id;
-        let mut batch = self.durable_batch();
+        let mut batch = self.kernel.batch();
         let mut purged_relation_signals = Vec::new();
         let mut purged_activation_traces = Vec::new();
         if change == DerivedDefinitionStateChange::Purge {
@@ -3955,7 +3776,7 @@ impl MemoryDatabase {
         }
 
         let digest = self.mutation_digest("put_relation_signals", operation.actor, &input)?;
-        let _guard = self.write_lock.lock();
+        let _guard = self.kernel.write_lock();
         if let Some(receipt) = self.replayed_operation(operation.id, digest)? {
             return Ok(receipt);
         }
@@ -4129,7 +3950,7 @@ impl MemoryDatabase {
                 .collect(),
             recorded_at_ms,
         );
-        let mut batch = self.durable_batch();
+        let mut batch = self.kernel.batch();
         for entry in &prepared {
             batch.insert(
                 &self.relation_signals,
@@ -4342,7 +4163,7 @@ impl MemoryDatabase {
             ));
         }
 
-        let _guard = self.write_lock.lock();
+        let _guard = self.kernel.write_lock();
         let recall_case = self
             .inspect_recall_case(input.recall_case.id)?
             .ok_or_else(|| MemoryError::InvalidInput("recall case does not exist".into()))?;
@@ -4552,7 +4373,7 @@ impl MemoryDatabase {
             vec![DerivedRecordRef::ActivationTrace(trace.id)],
             recorded_at_ms,
         );
-        let mut batch = self.durable_batch();
+        let mut batch = self.kernel.batch();
         let header = ActivationTraceHeader {
             id: trace.id,
             revision: trace.revision,
@@ -4701,7 +4522,7 @@ impl MemoryDatabase {
         let limit = limit.min(MAX_OPERATOR_LIST_LIMIT);
         let mut proposals = Vec::with_capacity(limit);
         for item in self.proposal_heads.iter().rev().take(limit) {
-            let (key, value) = item.map_err(storage_error)?;
+            let (key, value) = item?;
             let id = ProposalId(ulid_from_id_key(&key)?);
             let revision = decode_u64(&value)?;
             let header =
@@ -4723,7 +4544,7 @@ impl MemoryDatabase {
         let limit = limit.min(MAX_OPERATOR_LIST_LIMIT);
         let mut proposals = Vec::with_capacity(limit);
         for item in self.pending_proposals.iter().rev().take(limit) {
-            let (key, _) = item.map_err(storage_error)?;
+            let (key, _) = item?;
             let id = ProposalId(ulid_from_id_key(&key)?);
             let proposal = self.inspect_proposal(id)?.ok_or_else(|| {
                 MemoryError::Corrupt(format!("pending proposal index points to missing {id}"))
@@ -4750,7 +4571,7 @@ impl MemoryDatabase {
         let limit = limit.min(MAX_OPERATOR_LIST_LIMIT);
         let mut proposals = Vec::with_capacity(limit);
         for item in self.awaiting_adjudication.iter().rev().take(limit) {
-            let (key, _) = item.map_err(storage_error)?;
+            let (key, _) = item?;
             let id = ProposalId(ulid_from_id_key(&key)?);
             let proposal = self.inspect_proposal(id)?.ok_or_else(|| {
                 MemoryError::Corrupt(format!(
@@ -4975,7 +4796,7 @@ impl MemoryDatabase {
         {
             return Err(MemoryError::Unauthorized);
         }
-        let _guard = self.write_lock.lock();
+        let _guard = self.kernel.write_lock();
         let evidence = self.capture_evidence_locked(operation, evidence)?;
         let excluded = BTreeSet::from([RecordRef::Evidence(evidence.id)]);
         let recall = self.recall_locked(query, &excluded)?;
@@ -4986,7 +4807,7 @@ impl MemoryDatabase {
         // Recall persists a case, so it shares the mutation lock.  More
         // importantly, a concurrent purge cannot return content after its
         // immediate-unreadability commit point.
-        let _guard = self.write_lock.lock();
+        let _guard = self.kernel.write_lock();
         self.recall_locked(query, &BTreeSet::new())
     }
 
@@ -5002,9 +4823,9 @@ impl MemoryDatabase {
                 "recall requires at least one visible scope".into(),
             ));
         }
-        if query.scopes.len() > MAX_RECALL_SCOPES {
+        if query.scopes.len() > MAX_ACCESS_SCOPES {
             return Err(MemoryError::InvalidInput(format!(
-                "recall cannot include more than {MAX_RECALL_SCOPES} visible scopes"
+                "recall cannot include more than {MAX_ACCESS_SCOPES} visible scopes"
             )));
         }
         if let (Some(from), Some(to)) = (query.observed_from_ms, query.observed_to_ms) {
@@ -5084,7 +4905,7 @@ impl MemoryDatabase {
             }
             if query
                 .valid_at_ms
-                .is_some_and(|at| !citation.temporal.contains_valid_time(at))
+                .is_some_and(|at| !citation.temporal.is_valid_at(at))
             {
                 continue;
             }
@@ -5127,7 +4948,7 @@ impl MemoryDatabase {
                 .collect(),
             recorded_at_ms: now_ms(),
         };
-        let mut batch = self.durable_batch();
+        let mut batch = self.kernel.batch();
         batch.insert(&self.recall_cases, id_key(case_id.0), encode(&case)?);
         commit(batch)?;
         Ok(RecallResult { case_id, citations })
@@ -5147,7 +4968,7 @@ impl MemoryDatabase {
     ) -> MemoryResult<ProposalReceipt> {
         let input = normalize_proposal_bundle(input)?;
         let digest = self.mutation_digest("submit_proposal", operation.actor, &input)?;
-        let _guard = self.write_lock.lock();
+        let _guard = self.kernel.write_lock();
         if let Some(receipt) = self.replayed_operation(operation.id, digest)? {
             return Ok(receipt);
         }
@@ -5166,7 +4987,7 @@ impl MemoryDatabase {
                 .inspect_proposal(existing.proposal_id)?
                 .ok_or_else(|| MemoryError::Corrupt("proposal source index is dangling".into()))?;
             let receipt = proposal_receipt(&proposal.header);
-            let mut batch = self.durable_batch();
+            let mut batch = self.kernel.batch();
             self.insert_operation(&mut batch, operation.id, digest, &receipt)?;
             commit(batch)?;
             return Ok(receipt);
@@ -5223,7 +5044,7 @@ impl MemoryDatabase {
             recorded_at_ms,
         );
 
-        let mut batch = self.durable_batch();
+        let mut batch = self.kernel.batch();
         batch.insert(&self.proposals, revision_key(id.0, 1), encode(&header)?);
         batch.insert(&self.proposal_heads, id_key(id.0), 1_u64.to_be_bytes());
         batch.insert(&self.pending_proposals, id_key(id.0), []);
@@ -5278,7 +5099,7 @@ impl MemoryDatabase {
         }
         normalize_review(&mut input)?;
         let digest = self.mutation_digest("review_proposal", operation.actor, &input)?;
-        let _guard = self.write_lock.lock();
+        let _guard = self.kernel.write_lock();
         if let Some(receipt) = self.replayed_operation(operation.id, digest)? {
             return Ok(receipt);
         }
@@ -5401,7 +5222,7 @@ impl MemoryDatabase {
             review_revision: 1,
             proposal: proposal_receipt(&proposal_header),
         };
-        let mut batch = self.durable_batch();
+        let mut batch = self.kernel.batch();
         batch.insert(
             &self.proposals,
             revision_key(input.proposal_id.0, proposal_revision),
@@ -5486,7 +5307,7 @@ impl MemoryDatabase {
     ) -> MemoryResult<ProposalAdjudicationReceipt> {
         validate_adjudication_authority(operation.actor, input.authority)?;
         let digest = self.mutation_digest("adjudicate_proposal", operation.actor, &input)?;
-        let _guard = self.write_lock.lock();
+        let _guard = self.kernel.write_lock();
         if let Some(receipt) = self.replayed_operation(operation.id, digest)? {
             return Ok(receipt);
         }
@@ -5514,7 +5335,7 @@ impl MemoryDatabase {
                 draft_mappings: Vec::new(),
                 changed_records: Vec::new(),
             };
-            let mut batch = self.durable_batch();
+            let mut batch = self.kernel.batch();
             batch.remove(&self.awaiting_adjudication, id_key(proposal.header.id.0));
             let audit = self.new_adjudication_audit_event(
                 operation,
@@ -5565,7 +5386,7 @@ impl MemoryDatabase {
                 draft_mappings: Vec::new(),
                 changed_records: Vec::new(),
             };
-            let mut batch = self.durable_batch();
+            let mut batch = self.kernel.batch();
             batch.remove(&self.awaiting_adjudication, id_key(next.id.0));
             batch.insert(
                 &self.proposals,
@@ -5662,7 +5483,7 @@ impl MemoryDatabase {
                 draft_mappings: Vec::new(),
                 changed_records: Vec::new(),
             };
-            let mut batch = self.durable_batch();
+            let mut batch = self.kernel.batch();
             batch.remove(&self.awaiting_adjudication, id_key(next.id.0));
             batch.insert(
                 &self.proposals,
@@ -5745,7 +5566,7 @@ impl MemoryDatabase {
             })
             .collect();
         let recorded_at_ms = now_ms();
-        let mut batch = self.durable_batch();
+        let mut batch = self.kernel.batch();
         batch.remove(&self.awaiting_adjudication, id_key(proposal.header.id.0));
         let mut changed_records = Vec::new();
 
@@ -6085,7 +5906,7 @@ impl MemoryDatabase {
             (_, Some(_)) => {}
         }
         let digest = self.mutation_digest("record_recall_feedback", operation.actor, &input)?;
-        let _guard = self.write_lock.lock();
+        let _guard = self.kernel.write_lock();
         if let Some(receipt) = self.replayed_operation(operation.id, digest)? {
             return Ok(receipt);
         }
@@ -6118,7 +5939,7 @@ impl MemoryDatabase {
             kind: input.kind,
             recorded_at_ms: now_ms(),
         };
-        let mut batch = self.durable_batch();
+        let mut batch = self.kernel.batch();
         batch.insert(
             &self.recall_feedback,
             id_key(feedback.id.0),
@@ -6149,7 +5970,7 @@ impl MemoryDatabase {
         if actor != Actor::Operator {
             return Err(MemoryError::Unauthorized);
         }
-        let _guard = self.write_lock.lock();
+        let _guard = self.kernel.write_lock();
         let issued_at_ms = now_ms();
         let expires_at_ms = issued_at_ms
             .checked_add(PURGE_PREVIEW_TTL_MS)
@@ -6166,7 +5987,7 @@ impl MemoryDatabase {
             return Err(MemoryError::Unauthorized);
         }
         let digest = self.mutation_digest("commit_purge", operation.actor, &preview)?;
-        let _guard = self.write_lock.lock();
+        let _guard = self.kernel.write_lock();
         if let Some(receipt) = self.replayed_operation(operation.id, digest)? {
             return Ok(receipt);
         }
@@ -6194,7 +6015,7 @@ impl MemoryDatabase {
         }
 
         let recorded_at_ms = now_ms();
-        let mut batch = self.durable_batch();
+        let mut batch = self.kernel.batch();
         let target = self.append_state_revision(
             &mut batch,
             preview.target,
@@ -6282,7 +6103,7 @@ impl MemoryDatabase {
         }
         let mut events = Vec::new();
         for item in self.audit.iter() {
-            let (_, value) = item.map_err(storage_error)?;
+            let (_, value) = item?;
             events.push(decode(&value)?);
             if events.len() == limit {
                 break;
@@ -6291,7 +6112,7 @@ impl MemoryDatabase {
         Ok(events)
     }
 
-    fn remove_record_payload(&self, batch: &mut fjall::Batch, record: RecordRef) {
+    fn remove_record_payload(&self, batch: &mut Batch, record: RecordRef) {
         batch.remove(&self.payloads, payload_key(record));
         if let RecordRef::ArtifactSnapshot(id) = record {
             batch.remove(&self.artifact_snapshot_blobs, id_key(id.0));
@@ -6315,7 +6136,12 @@ impl MemoryDatabase {
             actor,
             input,
         })?;
-        Ok(*blake3::keyed_hash(&self.digest_key, &bytes).as_bytes())
+        Ok(*self
+            .kernel
+            .keyed_hasher("native-mutation")
+            .update(&bytes)
+            .finalize()
+            .as_bytes())
     }
 
     fn artifact_snapshot_mutation_digest(
@@ -6336,7 +6162,7 @@ impl MemoryDatabase {
             temporal: input.temporal,
             media_type: &input.media_type,
         })?;
-        let mut hasher = blake3::Hasher::new_keyed(&self.digest_key);
+        let mut hasher = self.kernel.keyed_hasher("native-artifact-snapshot");
         update_framed_digest(&mut hasher, b"import_artifact_snapshot");
         update_framed_digest(&mut hasher, &[actor_tag(actor)]);
         update_framed_digest(&mut hasher, &metadata);
@@ -6361,7 +6187,7 @@ impl MemoryDatabase {
 
     fn insert_operation<T: Serialize>(
         &self,
-        batch: &mut fjall::Batch,
+        batch: &mut Batch,
         id: OperationId,
         digest: [u8; 32],
         receipt: &T,
@@ -6372,17 +6198,6 @@ impl MemoryDatabase {
         };
         batch.insert(&self.operations, id_key(id.0), encode(&stored)?);
         Ok(())
-    }
-
-    pub(crate) fn durable_batch(&self) -> fjall::Batch {
-        self.keyspace.batch().durability(Some(PersistMode::SyncAll))
-    }
-
-    /// Acquire the single context write mutex. New facade modules
-    /// (`crate::entity`, `crate::extraction`) hold this guard across read-modify
-    /// -write sequences exactly like the built-in context writers.
-    pub(crate) fn lock_write(&self) -> parking_lot::MutexGuard<'_, ()> {
-        self.write_lock.lock()
     }
 
     fn new_audit_event(
@@ -6438,14 +6253,14 @@ impl MemoryDatabase {
         event
     }
 
-    fn insert_audit(&self, batch: &mut fjall::Batch, event: &AuditEvent) -> MemoryResult<()> {
+    fn insert_audit(&self, batch: &mut Batch, event: &AuditEvent) -> MemoryResult<()> {
         batch.insert(&self.audit, audit_key(event), encode(event)?);
         Ok(())
     }
 
     fn insert_lexical_document(
         &self,
-        batch: &mut fjall::Batch,
+        batch: &mut Batch,
         record: RecordRef,
         revision: u64,
         scope: Scope,
@@ -6494,11 +6309,7 @@ impl MemoryDatabase {
         Ok(())
     }
 
-    fn remove_lexical_document(
-        &self,
-        batch: &mut fjall::Batch,
-        record: RecordRef,
-    ) -> MemoryResult<()> {
+    fn remove_lexical_document(&self, batch: &mut Batch, record: RecordRef) -> MemoryResult<()> {
         let Some(document): Option<LexicalDocument> =
             get_decoded(&self.lexical_docs, record_key(record))?
         else {
@@ -6520,10 +6331,13 @@ impl MemoryDatabase {
     }
 
     fn index_hash(&self, domain: u8, value: &[u8]) -> [u8; 32] {
-        let mut input = Vec::with_capacity(value.len() + 1);
-        input.push(domain);
-        input.extend_from_slice(value);
-        *blake3::keyed_hash(&self.digest_key, &input).as_bytes()
+        *self
+            .kernel
+            .keyed_hasher("native-index")
+            .update(&[domain])
+            .update(value)
+            .finalize()
+            .as_bytes()
     }
 
     fn evidence_lifecycle_truth(&self, lifecycle: &EvidenceLifecycle) -> EvidenceLifecycleTruth {
@@ -6552,7 +6366,7 @@ impl MemoryDatabase {
         upper.push(0xff);
         let mut records = Vec::new();
         for item in self.lexical_postings.range(prefix.clone()..upper) {
-            let (key, _) = item.map_err(storage_error)?;
+            let (key, _) = item?;
             if key.len() != prefix.len() + 17 {
                 return Err(MemoryError::Corrupt("invalid lexical posting key".into()));
             }
@@ -6583,7 +6397,7 @@ impl MemoryDatabase {
             .unwrap_or_else(|| vec![0xff; 26]);
         let mut records = Vec::new();
         for item in self.time_index.range(lower..upper).rev() {
-            let (key, _) = item.map_err(storage_error)?;
+            let (key, _) = item?;
             if key.len() != 25 {
                 return Err(MemoryError::Corrupt("invalid observed-time key".into()));
             }
@@ -6740,12 +6554,7 @@ impl MemoryDatabase {
             self.activation_traces_depending_on_records(&dependency_records)?;
         let mut payloads_to_make_unavailable = 0_u32;
         for record in &dependency_records {
-            if self
-                .payloads
-                .get(payload_key(*record))
-                .map_err(storage_error)?
-                .is_some()
-            {
+            if self.payloads.get(payload_key(*record))?.is_some() {
                 payloads_to_make_unavailable = payloads_to_make_unavailable
                     .checked_add(1)
                     .ok_or_else(|| MemoryError::InvalidInput("too many purge payloads".into()))?;
@@ -6754,8 +6563,7 @@ impl MemoryDatabase {
         for dependency in &relation_signal_invalidations {
             if self
                 .relation_signal_payloads
-                .get(id_key(dependency.signal.id.0))
-                .map_err(storage_error)?
+                .get(id_key(dependency.signal.id.0))?
                 .is_some()
             {
                 payloads_to_make_unavailable = payloads_to_make_unavailable
@@ -6766,8 +6574,7 @@ impl MemoryDatabase {
         for trace_id in &activation_trace_invalidations {
             if self
                 .activation_trace_payloads
-                .get(id_key(trace_id.0))
-                .map_err(storage_error)?
+                .get(id_key(trace_id.0))?
                 .is_some()
             {
                 payloads_to_make_unavailable = payloads_to_make_unavailable
@@ -6813,19 +6620,14 @@ impl MemoryDatabase {
                 .activation_traces_by_record
                 .range(prefix.clone()..upper)
             {
-                let (key, _) = item.map_err(storage_error)?;
+                let (key, _) = item?;
                 if key.len() != prefix.len() + 16 {
                     return Err(MemoryError::Corrupt(
                         "invalid activation-trace record dependency key".into(),
                     ));
                 }
                 let id = ActivationTraceId(ulid_from_id_key(&key[prefix.len()..])?);
-                if self
-                    .activation_trace_payloads
-                    .get(id_key(id.0))
-                    .map_err(storage_error)?
-                    .is_some()
-                {
+                if self.activation_trace_payloads.get(id_key(id.0))?.is_some() {
                     ids.insert(id);
                 }
             }
@@ -6843,7 +6645,7 @@ impl MemoryDatabase {
             let mut upper = prefix.clone();
             upper.push(0xff);
             for item in self.relation_signals_by_record.range(prefix.clone()..upper) {
-                let (key, _) = item.map_err(storage_error)?;
+                let (key, _) = item?;
                 if key.len() != prefix.len() + 16 {
                     return Err(MemoryError::Corrupt(
                         "invalid relation-signal record dependency key".into(),
@@ -6898,7 +6700,7 @@ impl MemoryDatabase {
             let mut upper = prefix.clone();
             upper.push(0xff);
             for item in self.dependencies.range(prefix.clone()..upper) {
-                let (key, _) = item.map_err(storage_error)?;
+                let (key, _) = item?;
                 if key.len() != prefix.len() + 17 {
                     return Err(MemoryError::Corrupt("invalid dependency key".into()));
                 }
@@ -6927,7 +6729,7 @@ impl MemoryDatabase {
 
     fn append_relation_signal_state_revision(
         &self,
-        batch: &mut fjall::Batch,
+        batch: &mut Batch,
         pin: RelationSignalPin,
         state: RecordState,
         operation_id: OperationId,
@@ -6981,7 +6783,7 @@ impl MemoryDatabase {
 
     fn relation_signal_pins_for_owner(
         &self,
-        index: &PartitionHandle,
+        index: &Partition,
         owner_id: Ulid,
     ) -> MemoryResult<Vec<RelationSignalPin>> {
         let prefix = id_key(owner_id).to_vec();
@@ -6989,7 +6791,7 @@ impl MemoryDatabase {
         upper.push(0xff);
         let mut pins = Vec::new();
         for item in index.range(prefix.clone()..upper) {
-            let (key, _) = item.map_err(storage_error)?;
+            let (key, _) = item?;
             if key.len() != prefix.len() + 16 {
                 return Err(MemoryError::Corrupt(
                     "invalid relation-signal owner dependency key".into(),
@@ -7020,7 +6822,7 @@ impl MemoryDatabase {
 
     fn activation_trace_ids_for_owner(
         &self,
-        index: &PartitionHandle,
+        index: &Partition,
         owner_id: Ulid,
     ) -> MemoryResult<Vec<ActivationTraceId>> {
         let prefix = id_key(owner_id).to_vec();
@@ -7028,19 +6830,14 @@ impl MemoryDatabase {
         upper.push(0xff);
         let mut ids = Vec::new();
         for item in index.range(prefix.clone()..upper) {
-            let (key, _) = item.map_err(storage_error)?;
+            let (key, _) = item?;
             if key.len() != prefix.len() + 16 {
                 return Err(MemoryError::Corrupt(
                     "invalid activation-trace owner dependency key".into(),
                 ));
             }
             let id = ActivationTraceId(ulid_from_id_key(&key[prefix.len()..])?);
-            if self
-                .activation_trace_payloads
-                .get(id_key(id.0))
-                .map_err(storage_error)?
-                .is_some()
-            {
+            if self.activation_trace_payloads.get(id_key(id.0))?.is_some() {
                 ids.push(id);
             }
         }
@@ -7051,7 +6848,7 @@ impl MemoryDatabase {
 
     fn append_state_revision(
         &self,
-        batch: &mut fjall::Batch,
+        batch: &mut Batch,
         record: RecordRef,
         expected_revision: u64,
         state: RecordState,
@@ -8135,8 +7932,8 @@ fn validate_artifact_passage_batch(input: &mut NewArtifactPassageBatch) -> Memor
 }
 
 fn insert_bidirectional_dependency(
-    batch: &mut fjall::Batch,
-    dependencies: &PartitionHandle,
+    batch: &mut Batch,
+    dependencies: &Partition,
     first: RecordRef,
     second: RecordRef,
 ) {
@@ -8333,20 +8130,18 @@ fn decode<T: DeserializeOwned>(value: &[u8]) -> MemoryResult<T> {
 }
 
 fn get_decoded<T: DeserializeOwned>(
-    partition: &PartitionHandle,
+    partition: &Partition,
     key: impl AsRef<[u8]>,
 ) -> MemoryResult<Option<T>> {
     partition
-        .get(key.as_ref())
-        .map_err(storage_error)?
+        .get(key.as_ref())?
         .map(|value| decode(&value))
         .transpose()
 }
 
-fn get_payload(partition: &PartitionHandle, record: RecordRef) -> MemoryResult<Option<String>> {
+fn get_payload(partition: &Partition, record: RecordRef) -> MemoryResult<Option<String>> {
     partition
-        .get(payload_key(record))
-        .map_err(storage_error)?
+        .get(payload_key(record))?
         .map(|value| {
             String::from_utf8(value.to_vec())
                 .map_err(|error| MemoryError::Corrupt(error.to_string()))
@@ -8354,10 +8149,9 @@ fn get_payload(partition: &PartitionHandle, record: RecordRef) -> MemoryResult<O
         .transpose()
 }
 
-fn get_head(partition: &PartitionHandle, id: Ulid) -> MemoryResult<Option<u64>> {
+fn get_head(partition: &Partition, id: Ulid) -> MemoryResult<Option<u64>> {
     partition
-        .get(id_key(id))
-        .map_err(storage_error)?
+        .get(id_key(id))?
         .map(|value| decode_u64(&value))
         .transpose()
 }
@@ -8369,12 +8163,8 @@ fn decode_u64(bytes: &[u8]) -> MemoryResult<u64> {
     Ok(u64::from_be_bytes(bytes))
 }
 
-fn storage_error(error: fjall::Error) -> MemoryError {
-    MemoryError::Storage(error.to_string())
-}
-
-fn commit(batch: fjall::Batch) -> MemoryResult<()> {
-    batch.commit().map_err(storage_error)
+fn commit(batch: Batch) -> MemoryResult<()> {
+    batch.commit().map_err(MemoryError::from)
 }
 
 fn id_key(id: Ulid) -> [u8; 16] {
@@ -8574,50 +8364,6 @@ fn is_cjk(character: char) -> bool {
     matches!(character as u32, 0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xf900..=0xfaff)
 }
 
-fn load_or_create_native_metadata(
-    keyspace: &Keyspace,
-    partition: &PartitionHandle,
-    outer_store_era_id: &str,
-    allow_initialization: bool,
-) -> MemoryResult<NativeMetadata> {
-    if let Some(metadata) = get_decoded(partition, NATIVE_METADATA_KEY)? {
-        return Ok(metadata);
-    }
-    if !allow_initialization {
-        return Err(MemoryError::Corrupt(
-            "native metadata is missing from a non-pristine store".into(),
-        ));
-    }
-    let first = Ulid::new().0.to_be_bytes();
-    let second = Ulid::new().0.to_be_bytes();
-    let mut digest_key = [0_u8; 32];
-    digest_key[..16].copy_from_slice(&first);
-    digest_key[16..].copy_from_slice(&second);
-    let metadata = NativeMetadata {
-        store_era_id: outer_store_era_id.to_owned(),
-        digest_key,
-    };
-    let mut batch = keyspace.batch().durability(Some(PersistMode::SyncAll));
-    batch.insert(partition, NATIVE_METADATA_KEY, encode(&metadata)?);
-    commit(batch)?;
-    Ok(metadata)
-}
-
-fn root_contains_only_outer_manifest(root: &Path) -> MemoryResult<bool> {
-    let mut entries = fs::read_dir(root).map_err(MemoryError::Io)?;
-    let Some(entry) = entries.next() else {
-        return Ok(false);
-    };
-    let entry = entry.map_err(MemoryError::Io)?;
-    Ok(entry.file_name() == crate::store_format::STORE_MANIFEST_FILE && entries.next().is_none())
-}
-
-fn open_partition(keyspace: &Keyspace, name: &str) -> MemoryResult<PartitionHandle> {
-    keyspace
-        .open_partition(name, PartitionCreateOptions::default())
-        .map_err(|error| MemoryError::Storage(error.to_string()))
-}
-
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -8629,49 +8375,54 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store_format::{ResetPlan, ResetSafety, STORE_MANIFEST_FILE};
+    use crate::{Store, StoreError, STORE_FORMAT_ID};
+    use mmdb_kernel::store_format::{
+        ResetPlan, ResetSafety, StoreEraId, StoreManifest as OuterStoreManifest,
+        STORE_MANIFEST_FILE,
+    };
+    use std::fs;
     use std::time::Duration;
 
-    fn create_test_database() -> (tempfile::TempDir, PathBuf, MemoryDatabase) {
+    fn create_test_database() -> (tempfile::TempDir, PathBuf, Store) {
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("memory");
-        let database = MemoryDatabase::create(&root).unwrap();
+        let database = Store::create(&root).unwrap();
         (parent, root, database)
     }
 
     #[test]
     fn fresh_store_gets_a_stable_era_and_foreign_roots_are_refused() {
-        assert_eq!(MEMORY_STORE_FORMAT_ID, "mmdb-native-memory-v1");
+        assert_eq!(STORE_FORMAT_ID, "mmdb-store-v1");
         let fresh = tempfile::tempdir().unwrap();
         let fresh_root = fresh.path().join("memory");
         let first_era = {
-            let database = MemoryDatabase::create(&fresh_root).unwrap();
-            database.era_id()
+            let database = Store::create(&fresh_root).unwrap();
+            database.memory().era_id()
         };
-        let reopened = MemoryDatabase::open(&fresh_root).unwrap();
-        assert_eq!(reopened.era_id(), first_era);
+        let reopened = Store::open(&fresh_root).unwrap();
+        assert_eq!(reopened.memory().era_id(), first_era);
         assert!(fresh_root.join(STORE_MANIFEST_FILE).is_file());
         assert!(!fresh_root.join("mmdb-native-manifest.json").exists());
 
         let existing_empty = tempfile::tempdir().unwrap();
         assert!(matches!(
-            MemoryDatabase::open(existing_empty.path()),
-            Err(MemoryError::StoreFormat(
+            Store::open(existing_empty.path()),
+            Err(StoreError::Kernel(KernelError::Format(
                 StoreFormatError::MissingManagedMarker(_)
-            ))
+            )))
         ));
         assert!(matches!(
-            MemoryDatabase::create(existing_empty.path()),
-            Err(MemoryError::StoreAlreadyExists(path)) if path == existing_empty.path()
+            Store::create(existing_empty.path()),
+            Err(StoreError::Kernel(KernelError::Format(StoreFormatError::Io { source, .. }))) if source.kind() == std::io::ErrorKind::AlreadyExists
         ));
 
         let foreign = tempfile::tempdir().unwrap();
         fs::write(foreign.path().join("legacy.data"), b"legacy").unwrap();
         assert!(matches!(
-            MemoryDatabase::open(foreign.path()),
-            Err(MemoryError::StoreFormat(
+            Store::open(foreign.path()),
+            Err(StoreError::Kernel(KernelError::Format(
                 StoreFormatError::MissingManagedMarker(_)
-            ))
+            )))
         ));
     }
 
@@ -8679,63 +8430,48 @@ mod tests {
     fn memory_database_holds_an_exclusive_root_lease_for_its_lifetime() {
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("memory");
-        let database = MemoryDatabase::create(&root).unwrap();
+        let database_store = Store::create(&root).unwrap();
 
-        let error = match MemoryDatabase::open(&root) {
+        let error = match Store::open(&root) {
             Ok(_) => panic!("a second database handle must not open the same root"),
             Err(error) => error,
         };
         assert!(matches!(
             error,
-            MemoryError::StoreFormat(StoreFormatError::StoreBusy(path))
+            StoreError::Kernel(KernelError::Format(StoreFormatError::StoreBusy(path)))
                 if path == std::fs::canonicalize(&root).unwrap()
         ));
 
-        drop(database);
-        MemoryDatabase::open(&root).expect("dropping the owner releases the root lease");
+        drop(database_store);
+        Store::open(&root).expect("dropping the owner releases the root lease");
     }
 
     #[test]
     fn reset_plan_recognizes_the_memory_database_outer_manifest() {
-        let (_parent, root, database) = create_test_database();
-        let era = database.era_id();
-        drop(database);
+        let (_parent, root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let era = database.kernel.store_era().clone();
+        drop(database_store);
         let safety = ResetSafety::new(None, Vec::new()).unwrap();
         let canonical_root = fs::canonicalize(&root).unwrap();
         let plan = ResetPlan::build(
             std::slice::from_ref(&canonical_root),
-            MEMORY_STORE_FORMAT_ID,
+            STORE_FORMAT_ID,
+            STORE_FORMAT_ID,
             UNIX_EPOCH + Duration::from_secs(1_000),
             Duration::from_secs(600),
             &safety,
         )
         .unwrap();
 
-        assert_eq!(plan.expected_format_id(), MEMORY_STORE_FORMAT_ID);
+        assert_eq!(plan.source_format_id(), STORE_FORMAT_ID);
+        assert_eq!(plan.replacement_format_id(), STORE_FORMAT_ID);
         assert_eq!(plan.targets().len(), 1);
         assert_eq!(plan.targets()[0].store_era_id().as_str(), era.to_string());
     }
 
     #[test]
-    fn pristine_marker_only_store_initializes_native_metadata_once() {
-        let parent = tempfile::tempdir().unwrap();
-        let root = parent.path().join("reset-replacement");
-        std::fs::create_dir(&root).unwrap();
-        let era = StoreEraId::parse(Ulid::new().to_string()).unwrap();
-        OuterStoreManifest::new(MEMORY_STORE_FORMAT_ID, era.clone())
-            .unwrap()
-            .write_new(&root)
-            .unwrap();
-
-        let database = MemoryDatabase::open(&root).unwrap();
-        assert_eq!(database.era_id().to_string(), era.as_str());
-        drop(database);
-
-        MemoryDatabase::open(&root).expect("persisted metadata reopens without rotation");
-    }
-
-    #[test]
-    fn exact_format_mismatch_is_refused_before_fjall_opens_the_root() {
+    fn exact_format_mismatch_is_refused_before_storage_opens_the_root() {
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("wrong-format");
         fs::create_dir(&root).unwrap();
@@ -8746,93 +8482,38 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            MemoryDatabase::open(&root),
-            Err(MemoryError::StoreFormat(StoreFormatError::FormatMismatch {
+            Store::open(&root),
+            Err(StoreError::Kernel(KernelError::Format(StoreFormatError::FormatMismatch {
                 expected,
                 found,
                 ..
-            })) if expected == MEMORY_STORE_FORMAT_ID && found == "some-other-format"
+            }))) if expected == STORE_FORMAT_ID && found == "some-other-format"
         ));
         let entries: Vec<_> = fs::read_dir(&root).unwrap().collect();
-        assert_eq!(entries.len(), 1, "fjall must not touch a mismatched root");
+        assert_eq!(entries.len(), 1, "opening must not touch a mismatched root");
         assert!(root.join(STORE_MANIFEST_FILE).is_file());
     }
 
     #[cfg(unix)]
     #[test]
     fn symlink_store_roots_are_refused() {
-        let (parent, root, database) = create_test_database();
-        drop(database);
+        let (parent, root, database_store) = create_test_database();
+        drop(database_store);
         let linked = parent.path().join("linked-memory");
         std::os::unix::fs::symlink(&root, &linked).unwrap();
 
         assert!(matches!(
-            MemoryDatabase::open(&linked),
-            Err(MemoryError::StoreFormat(
+            Store::open(&linked),
+            Err(StoreError::Kernel(KernelError::Format(
                 StoreFormatError::StoreRootIsNotDirectory(path)
-            )) if path == linked
-        ));
-    }
-
-    #[test]
-    fn private_digest_metadata_must_match_the_outer_store_era() {
-        let (_parent, root, database) = create_test_database();
-        drop(database);
-        let keyspace = Config::new(&root).open().unwrap();
-        let partition = open_partition(&keyspace, PART_NATIVE_METADATA).unwrap();
-        let wrong = NativeMetadata {
-            store_era_id: Ulid::new().to_string(),
-            digest_key: [7; 32],
-        };
-        let mut batch = keyspace.batch().durability(Some(PersistMode::SyncAll));
-        batch.insert(&partition, NATIVE_METADATA_KEY, encode(&wrong).unwrap());
-        batch.commit().unwrap();
-        drop(partition);
-        drop(keyspace);
-
-        assert!(matches!(
-            MemoryDatabase::open(&root),
-            Err(MemoryError::StoreEraMismatch { internal, .. }) if internal == wrong.store_era_id
-        ));
-    }
-
-    #[test]
-    fn populated_store_with_missing_native_metadata_fails_closed() {
-        let (_parent, root, database) = create_test_database();
-        database
-            .capture_evidence(
-                OperationContext::new(Actor::User),
-                NewEvidence {
-                    class: EvidenceClass::UserAssertion,
-                    scope: Scope::Personal,
-                    temporal: TemporalFacts::observed_at(10),
-                    lifecycle: EvidenceLifecycle::Direct,
-                    text: "metadata must not rotate".into(),
-                },
-            )
-            .unwrap();
-        drop(database);
-
-        let keyspace = Config::new(&root).open().unwrap();
-        let metadata = open_partition(&keyspace, PART_NATIVE_METADATA).unwrap();
-        metadata.remove(NATIVE_METADATA_KEY).unwrap();
-        keyspace.persist(PersistMode::SyncAll).unwrap();
-        drop(metadata);
-        drop(keyspace);
-
-        let error = match MemoryDatabase::open(&root) {
-            Ok(_) => panic!("missing metadata in a populated store must be corruption"),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            error,
-            MemoryError::Corrupt(message) if message.contains("native metadata")
+            ))) if path == linked
         ));
     }
 
     #[test]
     fn evidence_preserves_exact_bytes_while_rejecting_blank_input() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let exact = " \n\t{\"value\":\" exact tool payload \"}\r\n ".to_string();
         let captured = database
             .capture_evidence(
@@ -8876,7 +8557,8 @@ mod tests {
 
     #[test]
     fn evidence_over_lexical_term_budget_roundtrips_exactly_and_recalls_an_indexed_prefix() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let mut exact = String::from("lexical_prefix_marker\n");
         for index in 0..(MAX_INDEX_TERMS_PER_RECORD + 64) {
             exact.push_str(&format!("evidence_term_{index:05} "));
@@ -8926,7 +8608,8 @@ mod tests {
 
     #[test]
     fn evidence_authority_claim_cas_and_operation_replay_are_enforced() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let evidence_operation = OperationContext::new(Actor::User);
         let evidence_input = NewEvidence {
             class: EvidenceClass::UserAssertion,
@@ -9019,7 +8702,8 @@ mod tests {
 
     #[test]
     fn semantic_relation_identity_is_stable_across_cas_retraction() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let evidence = database
             .capture_evidence(
                 OperationContext::new(Actor::User),
@@ -9082,8 +8766,9 @@ mod tests {
 
     #[test]
     fn relation_kinds_enforce_endpoint_shapes_for_direct_and_proposed_writes() {
-        let (_parent, _root, database) = create_test_database();
-        let source = imported_source(&database, "relation endpoint source");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "relation endpoint source");
         let make_claim = |text: &str| {
             database
                 .create_claim(
@@ -9174,7 +8859,8 @@ mod tests {
 
     #[test]
     fn unicode_lexical_and_time_recall_returns_revision_citations_and_ids_only_case() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let earlier = database
             .capture_evidence(
                 OperationContext::new(Actor::User),
@@ -9280,7 +8966,8 @@ mod tests {
 
     #[test]
     fn recall_exposes_typed_evidence_truth_but_never_direct_assistant_utterances() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let scope = Scope::Session(Ulid::new());
         let raw_source_event_id = "run-018f-private-linkage";
         let outcome = database
@@ -9350,7 +9037,8 @@ mod tests {
 
     #[test]
     fn purge_preview_makes_exact_payload_unavailable_and_invalidates_dependency_closure() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let evidence = database
             .capture_evidence(
                 OperationContext::new(Actor::User),
@@ -9472,7 +9160,8 @@ mod tests {
 
     #[test]
     fn purge_after_retraction_removes_every_descendant_payload_without_reinvalidating_it() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let evidence = database
             .capture_evidence(
                 OperationContext::new(Actor::User),
@@ -9548,9 +9237,10 @@ mod tests {
     #[test]
     fn privacy_retraction_and_purge_do_not_refuse_more_than_4096_reverse_edges() {
         const OLD_REFUSAL_THRESHOLD: usize = 4_096;
-        let (_parent, _root, database) = create_test_database();
-        let source = imported_source(&database, "large privacy fanout source");
-        let recall_case = recall_case_for(&database, "large privacy fanout source");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "large privacy fanout source");
+        let recall_case = recall_case_for(database, "large privacy fanout source");
         let mut sample_claims = Vec::new();
         for bundle in 0..33 {
             let changes = (0..MAX_PROPOSAL_CHANGES)
@@ -9576,7 +9266,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            let review = approve_proposal(&database, &proposal, &recall_case);
+            let review = approve_proposal(database, &proposal, &recall_case);
             let applied = database
                 .adjudicate_proposal(
                     OperationContext::new(Actor::Operator),
@@ -9625,7 +9315,8 @@ mod tests {
 
     #[test]
     fn observed_range_candidate_limit_keeps_the_newest_records() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let mut ids = Vec::new();
         for observed_at_ms in [100, 200, 300] {
             let receipt = database
@@ -9655,8 +9346,9 @@ mod tests {
 
     #[test]
     fn recall_rejects_an_unbounded_scope_set() {
-        let (_parent, _root, database) = create_test_database();
-        let scopes = (0..=MAX_RECALL_SCOPES)
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let scopes = (0..=MAX_ACCESS_SCOPES)
             .map(|_| Scope::Session(Ulid::new()))
             .collect();
 
@@ -9678,7 +9370,8 @@ mod tests {
 
     #[test]
     fn oversized_payload_is_rejected_before_any_durable_write() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let oversized = "x".repeat(MAX_EVIDENCE_TEXT_BYTES + 1);
 
         let error = database
@@ -9714,7 +9407,8 @@ mod tests {
 
     #[test]
     fn claim_source_fanout_is_bounded_before_source_reads() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let evidence_ids = (0..=MAX_EVIDENCE_SOURCES)
             .map(|_| EvidenceId::new())
             .collect();
@@ -9738,7 +9432,8 @@ mod tests {
 
     #[test]
     fn utterances_never_support_claims_and_commitments_require_a_completed_terminal_turn() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         assert!(matches!(
             database.capture_evidence(
                 OperationContext::new(Actor::Assistant),
@@ -9909,7 +9604,8 @@ mod tests {
 
     #[test]
     fn assistant_cannot_activate_claims_or_semantic_relations() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let evidence = database
             .capture_evidence(
                 OperationContext::new(Actor::User),
@@ -9958,7 +9654,8 @@ mod tests {
 
     #[test]
     fn purge_preview_expires_after_ten_minutes() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let evidence = database
             .capture_evidence(
                 OperationContext::new(Actor::User),
@@ -9997,8 +9694,9 @@ mod tests {
         use std::thread;
         use std::time::Instant;
 
-        let (_parent, _root, database) = create_test_database();
-        let database = Arc::new(database);
+        let (_parent, _root, database_store) = create_test_database();
+        let database_store = Arc::new(database_store);
+        let database = database_store.memory();
         let proposal_source = database
             .capture_evidence(
                 OperationContext::new(Actor::System),
@@ -10027,9 +9725,9 @@ mod tests {
         }
 
         let begin_operation = OperationContext::new(Actor::User);
-        let begin_database = Arc::clone(&database);
+        let begin_store = Arc::clone(&database_store);
         let begin = thread::spawn(move || {
-            begin_database.begin_turn_recall(
+            begin_store.memory().begin_turn_recall(
                 begin_operation,
                 NewEvidence {
                     class: EvidenceClass::UserAssertion,
@@ -10072,9 +9770,9 @@ mod tests {
             thread::yield_now();
         }
 
-        let writer_database = Arc::clone(&database);
+        let writer_store = Arc::clone(&database_store);
         let writer = thread::spawn(move || {
-            writer_database.create_claim(
+            writer_store.memory().create_claim(
                 OperationContext::new(Actor::System),
                 NewClaim {
                     domain: ClaimDomain::ExternalFact,
@@ -10121,7 +9819,8 @@ mod tests {
 
     #[test]
     fn generic_retraction_cas_removes_recall_and_invalidates_dependents_once() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let evidence = database
             .capture_evidence(
                 OperationContext::new(Actor::User),
@@ -10234,7 +9933,8 @@ mod tests {
 
     #[test]
     fn remember_user_claim_commits_assertion_and_user_note_as_one_idempotent_operation() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let operation = OperationContext::new(Actor::User);
         let input = RememberUserClaim {
             domain: ClaimDomain::UserNote,
@@ -10319,7 +10019,8 @@ mod tests {
 
     #[test]
     fn correct_user_claim_atomically_supersedes_and_replaces_the_target() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let remembered = database
             .remember_user_claim(
                 OperationContext::new(Actor::User),
@@ -10498,7 +10199,8 @@ mod tests {
 
     #[test]
     fn generic_inspect_selects_head_or_an_exact_structural_revision() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let remembered = database
             .remember_user_claim(
                 OperationContext::new(Actor::User),
@@ -10614,9 +10316,10 @@ mod tests {
 
     #[test]
     fn adjudication_requires_real_authority_and_audits_the_structural_decision() {
-        let (_parent, _root, database) = create_test_database();
-        let source = imported_source(&database, "audited authority source");
-        let recall_case = recall_case_for(&database, "audited authority source");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "audited authority source");
+        let recall_case = recall_case_for(database, "audited authority source");
         let proposal = database
             .submit_proposal(
                 OperationContext::new(Actor::Assistant),
@@ -10638,7 +10341,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let review = approve_proposal(&database, &proposal, &recall_case);
+        let review = approve_proposal(database, &proposal, &recall_case);
         let base = ProposalAdjudication {
             proposal_id: proposal.id,
             expected_proposal_revision: review.proposal.revision,
@@ -10671,8 +10374,9 @@ mod tests {
 
     #[test]
     fn review_findings_accept_only_exact_same_scope_sources_and_approve_fails_closed() {
-        let (_parent, _root, database) = create_test_database();
-        let source = imported_source(&database, "review_pin_marker proposal source");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "review_pin_marker proposal source");
         let session_scope = Scope::Session(Ulid::new());
         let cross_scope = database
             .capture_evidence(
@@ -10700,7 +10404,7 @@ mod tests {
             .inspect_recall_case(recalled.case_id)
             .unwrap()
             .unwrap();
-        let unrelated = imported_source(&database, "not present in the pinned recall case");
+        let unrelated = imported_source(database, "not present in the pinned recall case");
         let proposal = database
             .submit_proposal(
                 OperationContext::new(Actor::Assistant),
@@ -10815,9 +10519,10 @@ mod tests {
 
     #[test]
     fn proposal_drafts_are_not_recalled_and_operator_accept_maps_all_drafts_atomically() {
-        let (_parent, root, database) = create_test_database();
-        let source = imported_source(&database, "Ada wrote proposal_atomic_marker");
-        let recall_case = recall_case_for(&database, "proposal_atomic_marker");
+        let (_parent, root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "Ada wrote proposal_atomic_marker");
+        let recall_case = recall_case_for(database, "proposal_atomic_marker");
         let entity_draft = ProposalDraftId::new();
         let claim_draft = ProposalDraftId::new();
         let relation_draft = ProposalDraftId::new();
@@ -10874,7 +10579,7 @@ mod tests {
             .iter()
             .all(|citation| !matches!(citation.record, RecordRef::Entity(_))));
 
-        let review = approve_proposal(&database, &proposal, &recall_case);
+        let review = approve_proposal(database, &proposal, &recall_case);
         let adjudication = ProposalAdjudication {
             proposal_id: proposal.id,
             expected_proposal_revision: review.proposal.revision,
@@ -10959,8 +10664,9 @@ mod tests {
         assert!(unavailable.canonical_name.is_none());
         assert!(unavailable.aliases.is_empty());
 
-        drop(database);
-        let reopened = MemoryDatabase::open(&root).unwrap();
+        drop(database_store);
+        let reopened_store = Store::open(&root).unwrap();
+        let reopened = reopened_store.memory();
         assert_eq!(
             reopened
                 .adjudicate_proposal(operation, adjudication)
@@ -10971,8 +10677,9 @@ mod tests {
 
     #[test]
     fn proposal_source_job_and_operation_replay_survive_reopen() {
-        let (_parent, root, database) = create_test_database();
-        let source = imported_source(&database, "durable proposal source");
+        let (_parent, root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "durable proposal source");
         let source_job_id = ProposalSourceJobId::new();
         let operation = OperationContext::new(Actor::Assistant);
         let input = NewProposalBundle {
@@ -10993,9 +10700,10 @@ mod tests {
         };
         let first = database.submit_proposal(operation, input.clone()).unwrap();
         assert_eq!(database.submit_proposal(operation, input).unwrap(), first);
-        drop(database);
+        drop(database_store);
 
-        let reopened = MemoryDatabase::open(&root).unwrap();
+        let reopened_store = Store::open(&root).unwrap();
+        let reopened = reopened_store.memory();
         assert_eq!(
             reopened
                 .proposal_by_source_job(source_job_id)
@@ -11009,9 +10717,10 @@ mod tests {
 
     #[test]
     fn proposal_operator_reads_are_bounded_and_latest_review_is_directly_addressable() {
-        let (_parent, _root, database) = create_test_database();
-        let source = imported_source(&database, "operator proposal listing source");
-        let recall_case = recall_case_for(&database, "operator proposal listing source");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "operator proposal listing source");
+        let recall_case = recall_case_for(database, "operator proposal listing source");
         let submit = |name: &str| {
             database
                 .submit_proposal(
@@ -11038,7 +10747,7 @@ mod tests {
         let first = submit("first pending");
         let reviewed = submit("reviewed proposal");
         let third = submit("third pending");
-        let review = approve_proposal(&database, &reviewed, &recall_case);
+        let review = approve_proposal(database, &reviewed, &recall_case);
 
         let listed = database.list_proposals(2).unwrap();
         assert_eq!(listed.len(), 2);
@@ -11095,8 +10804,9 @@ mod tests {
 
     #[test]
     fn proposal_bundle_has_an_aggregate_encoded_byte_budget() {
-        let (_parent, _root, database) = create_test_database();
-        let source = imported_source(&database, "aggregate proposal byte source");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "aggregate proposal byte source");
         let changes = (0..17)
             .map(|index| ProposalChange::CreateClaim {
                 draft_id: ProposalDraftId::new(),
@@ -11129,8 +10839,9 @@ mod tests {
 
     #[test]
     fn proposal_bundle_has_an_aggregate_alias_budget() {
-        let (_parent, _root, database) = create_test_database();
-        let source = imported_source(&database, "aggregate proposal alias source");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "aggregate proposal alias source");
         let changes = (0..17)
             .map(|entity| ProposalChange::CreateEntity {
                 draft_id: ProposalDraftId::new(),
@@ -11166,9 +10877,10 @@ mod tests {
 
     #[test]
     fn proposal_bundle_has_an_aggregate_dependency_edge_budget() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let sources: Vec<_> = (0..MAX_EVIDENCE_SOURCES)
-            .map(|index| imported_source(&database, &format!("edge source {index}")))
+            .map(|index| imported_source(database, &format!("edge source {index}")))
             .collect();
         let source_evidence: Vec<_> = sources
             .iter()
@@ -11207,9 +10919,10 @@ mod tests {
 
     #[test]
     fn stale_source_pin_prevents_any_proposal_change_from_applying() {
-        let (_parent, _root, database) = create_test_database();
-        let source = imported_source(&database, "stale proposal source marker");
-        let recall_case = recall_case_for(&database, "stale proposal source marker");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "stale proposal source marker");
+        let recall_case = recall_case_for(database, "stale proposal source marker");
         let proposal = database
             .submit_proposal(
                 OperationContext::new(Actor::Assistant),
@@ -11231,7 +10944,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let review = approve_proposal(&database, &proposal, &recall_case);
+        let review = approve_proposal(database, &proposal, &recall_case);
         database
             .retract(
                 OperationContext::new(Actor::Operator),
@@ -11284,10 +10997,11 @@ mod tests {
 
     #[test]
     fn stale_recall_candidate_pin_marks_acceptance_stale_without_partial_writes() {
-        let (_parent, _root, database) = create_test_database();
-        let source = imported_source(&database, "independent proposal source");
-        let candidate = imported_source(&database, "lawyer_candidate_marker");
-        let recall_case = recall_case_for(&database, "lawyer_candidate_marker");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "independent proposal source");
+        let candidate = imported_source(database, "lawyer_candidate_marker");
+        let recall_case = recall_case_for(database, "lawyer_candidate_marker");
         assert_eq!(
             recall_case.candidates[0].record,
             RecordRef::Evidence(candidate.id)
@@ -11313,7 +11027,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let review = approve_proposal(&database, &proposal, &recall_case);
+        let review = approve_proposal(database, &proposal, &recall_case);
         database
             .retract(
                 OperationContext::new(Actor::Operator),
@@ -11352,9 +11066,10 @@ mod tests {
 
     #[test]
     fn purge_during_review_removes_entity_proposal_and_review_payloads_and_blocks_accept() {
-        let (_parent, _root, database) = create_test_database();
-        let source = imported_source(&database, "purge_review_marker");
-        let recall_case = recall_case_for(&database, "purge_review_marker");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "purge_review_marker");
+        let recall_case = recall_case_for(database, "purge_review_marker");
         let proposal = database
             .submit_proposal(
                 OperationContext::new(Actor::Assistant),
@@ -11376,7 +11091,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let review = approve_proposal(&database, &proposal, &recall_case);
+        let review = approve_proposal(database, &proposal, &recall_case);
         let preview = database
             .preview_purge(Actor::Operator, RecordRef::Evidence(source.id))
             .unwrap();
@@ -11430,9 +11145,10 @@ mod tests {
 
     #[test]
     fn recall_feedback_is_structured_idempotent_and_does_not_correct_memory() {
-        let (_parent, _root, database) = create_test_database();
-        let source = imported_source(&database, "feedback_marker");
-        let recall_case = recall_case_for(&database, "feedback_marker");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "feedback_marker");
+        let recall_case = recall_case_for(database, "feedback_marker");
         let operation = OperationContext::new(Actor::User);
         let input = NewRecallFeedback {
             recall_case_id: recall_case.id,
@@ -11467,9 +11183,10 @@ mod tests {
 
     #[test]
     fn recall_feedback_kind_determines_whether_a_candidate_is_allowed() {
-        let (_parent, _root, database) = create_test_database();
-        let source = imported_source(&database, "feedback candidate semantics");
-        let recall_case = recall_case_for(&database, "feedback candidate semantics");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "feedback candidate semantics");
+        let recall_case = recall_case_for(database, "feedback candidate semantics");
         let candidate = RecordRevisionPin {
             record: RecordRef::Evidence(source.id),
             revision: 1,
@@ -11503,8 +11220,10 @@ mod tests {
 
     #[test]
     fn operational_fingerprint_is_keyed_stable_and_store_specific() {
-        let (first_parent, first_root, first) = create_test_database();
-        let (_, _, second) = create_test_database();
+        let (first_parent, first_root, first_store) = create_test_database();
+        let first = first_store.memory();
+        let (_, _, second_store) = create_test_database();
+        let second = second_store.memory();
         let fingerprint = first
             .operational_fingerprint("assistant-memory-ledger", b"same durable input")
             .unwrap();
@@ -11526,8 +11245,9 @@ mod tests {
                 .operational_fingerprint("assistant-memory-ledger", b"same durable input")
                 .unwrap()
         );
-        drop(first);
-        let reopened = MemoryDatabase::open(&first_root).unwrap();
+        drop(first_store);
+        let reopened_store = Store::open(&first_root).unwrap();
+        let reopened = reopened_store.memory();
         assert_eq!(
             fingerprint,
             reopened
@@ -11566,7 +11286,8 @@ mod tests {
 
     #[test]
     fn artifact_snapshot_is_exact_immutable_and_replay_safe() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let collection = database
             .create_artifact_collection(
                 OperationContext::new(Actor::User),
@@ -11652,8 +11373,9 @@ mod tests {
 
     #[test]
     fn artifact_passage_batch_preserves_exact_text_locator_and_lineage() {
-        let (_parent, _root, database) = create_test_database();
-        let (collection, snapshot) = artifact_snapshot_fixture(&database, vec![1; 100]);
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let (collection, snapshot) = artifact_snapshot_fixture(database, vec![1; 100]);
         let operation = OperationContext::new(Actor::System);
         let input = NewArtifactPassageBatch {
             snapshot_id: snapshot.id,
@@ -11723,8 +11445,9 @@ mod tests {
 
     #[test]
     fn artifact_recall_citations_carry_typed_provenance_and_locator() {
-        let (_parent, _root, database) = create_test_database();
-        let (collection, snapshot) = artifact_snapshot_fixture(&database, vec![7; 100]);
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let (collection, snapshot) = artifact_snapshot_fixture(database, vec![7; 100]);
         let passage = database
             .create_artifact_passages(
                 OperationContext::new(Actor::System),
@@ -11796,8 +11519,9 @@ mod tests {
 
     #[test]
     fn passage_ordinals_are_unique_across_batches_without_partial_write() {
-        let (_parent, root, database) = create_test_database();
-        let (_collection, snapshot) = artifact_snapshot_fixture(&database, vec![1; 100]);
+        let (_parent, root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let (_collection, snapshot) = artifact_snapshot_fixture(database, vec![1; 100]);
         database
             .create_artifact_passages(
                 OperationContext::new(Actor::System),
@@ -11864,8 +11588,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(retry.passages.len(), 1);
-        drop(database);
-        let reopened = MemoryDatabase::open(&root).unwrap();
+        drop(database_store);
+        let reopened_store = Store::open(&root).unwrap();
+        let reopened = reopened_store.memory();
         assert!(matches!(
             reopened.create_artifact_passages(
                 OperationContext::new(Actor::System),
@@ -11889,8 +11614,9 @@ mod tests {
 
     #[test]
     fn artifact_inputs_are_bounded_before_any_partial_write() {
-        let (_parent, _root, database) = create_test_database();
-        let (collection, snapshot) = artifact_snapshot_fixture(&database, vec![1; 100]);
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let (collection, snapshot) = artifact_snapshot_fixture(database, vec![1; 100]);
         let oversized_snapshot_operation = OperationContext::new(Actor::System);
         assert!(matches!(
             database.import_artifact_snapshot(
@@ -12000,7 +11726,8 @@ mod tests {
 
     #[test]
     fn generic_capture_cannot_forge_artifact_evidence_and_purge_closes_lineage() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         for class in [
             EvidenceClass::ArtifactSnapshot,
             EvidenceClass::ArtifactPassage,
@@ -12019,7 +11746,7 @@ mod tests {
                 Err(MemoryError::InvalidInput(message)) if message.contains("first-class artifact API")
             ));
         }
-        let (_collection, snapshot) = artifact_snapshot_fixture(&database, vec![9; 100]);
+        let (_collection, snapshot) = artifact_snapshot_fixture(database, vec![9; 100]);
         let passages = database
             .create_artifact_passages(
                 OperationContext::new(Actor::System),
@@ -12087,9 +11814,10 @@ mod tests {
 
     #[test]
     fn artifact_materialization_and_purge_are_linearized_at_the_blob_boundary() {
-        let (_parent, _root, database) = create_test_database();
-        let database = std::sync::Arc::new(database);
-        let (_collection, snapshot) = artifact_snapshot_fixture(&database, vec![7; 128]);
+        let (_parent, _root, database_store) = create_test_database();
+        let database_store = std::sync::Arc::new(database_store);
+        let database = database_store.memory();
+        let (_collection, snapshot) = artifact_snapshot_fixture(database, vec![7; 128]);
         let preview = database
             .preview_purge(Actor::Operator, RecordRef::ArtifactSnapshot(snapshot.id))
             .unwrap();
@@ -12097,30 +11825,40 @@ mod tests {
         let metadata_observed = std::sync::Arc::new(std::sync::Barrier::new(2));
         let continue_materialization = std::sync::Arc::new(std::sync::Barrier::new(2));
         let materializer = {
-            let database = database.clone();
+            let store = database_store.clone();
             let metadata_observed = metadata_observed.clone();
             let continue_materialization = continue_materialization.clone();
             std::thread::spawn(move || {
-                database.materialize_artifact_snapshot_with_observer(snapshot.id, || {
-                    metadata_observed.wait();
-                    continue_materialization.wait();
-                })
+                store
+                    .memory()
+                    .materialize_artifact_snapshot_with_observer(snapshot.id, || {
+                        metadata_observed.wait();
+                        continue_materialization.wait();
+                    })
             })
         };
 
         metadata_observed.wait();
-        assert!(database.write_lock.try_lock().is_none());
 
         let purge_started = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let (finished, result) = std::sync::mpsc::channel();
         let purger = {
-            let database = database.clone();
+            let store = database_store.clone();
             let purge_started = purge_started.clone();
             std::thread::spawn(move || {
                 purge_started.wait();
-                database.commit_purge(OperationContext::new(Actor::Operator), preview)
+                let receipt = store
+                    .memory()
+                    .commit_purge(OperationContext::new(Actor::Operator), preview);
+                finished.send(()).unwrap();
+                receipt
             })
         };
         purge_started.wait();
+        assert_eq!(
+            result.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
         continue_materialization.wait();
 
         let materialized = materializer.join().unwrap().unwrap().unwrap();
@@ -12134,8 +11872,9 @@ mod tests {
 
     #[test]
     fn collection_purge_closes_artifact_evidence_and_derived_claim_lineage() {
-        let (_parent, _root, database) = create_test_database();
-        let (collection, snapshot) = artifact_snapshot_fixture(&database, vec![5; 100]);
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let (collection, snapshot) = artifact_snapshot_fixture(database, vec![5; 100]);
         let passage = database
             .create_artifact_passages(
                 OperationContext::new(Actor::System),
@@ -12215,8 +11954,9 @@ mod tests {
 
     #[test]
     fn artifact_evidence_purge_closes_passage_and_derived_claim_lineage() {
-        let (_parent, _root, database) = create_test_database();
-        let (collection, snapshot) = artifact_snapshot_fixture(&database, vec![6; 100]);
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let (collection, snapshot) = artifact_snapshot_fixture(database, vec![6; 100]);
         let passage = database
             .create_artifact_passages(
                 OperationContext::new(Actor::System),
@@ -12279,9 +12019,10 @@ mod tests {
 
     #[test]
     fn maximum_snapshot_metadata_operations_do_not_materialize_the_blob() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let (_collection, snapshot) =
-            artifact_snapshot_fixture(&database, vec![0xa5; MAX_ARTIFACT_SNAPSHOT_BYTES]);
+            artifact_snapshot_fixture(database, vec![0xa5; MAX_ARTIFACT_SNAPSHOT_BYTES]);
         let metadata = database
             .inspect_artifact_snapshot(snapshot.id)
             .unwrap()
@@ -12291,10 +12032,9 @@ mod tests {
 
         // Simulate loss in the separately stored blob. Metadata/state paths
         // must remain usable and must not attempt to load or hash the blob.
-        database
-            .artifact_snapshot_blobs
-            .remove(id_key(snapshot.id.0))
-            .unwrap();
+        let mut batch = database.kernel.batch();
+        batch.remove(&database.artifact_snapshot_blobs, id_key(snapshot.id.0));
+        batch.commit().unwrap();
         database
             .inspect(
                 RecordRef::ArtifactSnapshot(snapshot.id),
@@ -12319,7 +12059,8 @@ mod tests {
 
     #[test]
     fn relation_evaluator_definitions_are_operator_owned_versioned_and_idempotent() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let evaluator_id = RelationEvaluatorId::new();
         let input = NewRelationEvaluatorRevision {
             id: evaluator_id,
@@ -12387,7 +12128,8 @@ mod tests {
 
     #[test]
     fn relation_profiles_pin_an_exact_evaluator_and_reject_duplicate_heads() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let evaluator_id = RelationEvaluatorId::new();
         let evaluator = database
             .put_relation_evaluator(
@@ -12466,9 +12208,10 @@ mod tests {
 
     #[test]
     fn relation_signals_are_versioned_fixed_point_sidecars_with_computed_staleness() {
-        let (_parent, _root, database) = create_test_database();
-        let first = imported_source(&database, "signal source alpha");
-        let second = imported_source(&database, "signal source beta");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let first = imported_source(database, "signal source alpha");
+        let second = imported_source(database, "signal source beta");
         let evaluator_id = RelationEvaluatorId::new();
         let evaluator = database
             .put_relation_evaluator(
@@ -12608,10 +12351,11 @@ mod tests {
 
     #[test]
     fn shadow_activation_is_one_hop_deterministic_structural_and_non_authoritative() {
-        let (_parent, _root, database) = create_test_database();
-        imported_source(&database, "shadow_query_marker common alpha");
-        imported_source(&database, "shadow_query_marker common beta");
-        let recall_case = recall_case_for(&database, "shadow_query_marker common");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        imported_source(database, "shadow_query_marker common alpha");
+        imported_source(database, "shadow_query_marker common beta");
+        let recall_case = recall_case_for(database, "shadow_query_marker common");
         assert_eq!(recall_case.candidates.len(), 2);
         let baseline = recall_case.clone();
         let candidate_pins: Vec<_> = recall_case
@@ -12724,9 +12468,10 @@ mod tests {
 
     #[test]
     fn canonical_purge_exactly_erases_dependent_relation_signal_payloads() {
-        let (_parent, _root, database) = create_test_database();
-        let first = imported_source(&database, "purge signal private alpha");
-        let second = imported_source(&database, "purge signal private beta");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let first = imported_source(database, "purge signal private alpha");
+        let second = imported_source(database, "purge signal private beta");
         let evaluator = database
             .put_relation_evaluator(
                 OperationContext::new(Actor::Operator),
@@ -12782,7 +12527,7 @@ mod tests {
             .unwrap()
             .signals[0];
 
-        let recall_case = recall_case_for(&database, "purge signal private");
+        let recall_case = recall_case_for(database, "purge signal private");
         let trace = database
             .shadow_activate(
                 OperationContext::new(Actor::System),
@@ -12842,9 +12587,10 @@ mod tests {
 
     #[test]
     fn definition_retraction_stales_and_definition_purge_erases_dependent_signals() {
-        let (_parent, _root, database) = create_test_database();
-        let first = imported_source(&database, "definition lifecycle alpha");
-        let second = imported_source(&database, "definition lifecycle beta");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let first = imported_source(database, "definition lifecycle alpha");
+        let second = imported_source(database, "definition lifecycle beta");
         let evaluator = database
             .put_relation_evaluator(
                 OperationContext::new(Actor::Operator),
@@ -12900,7 +12646,7 @@ mod tests {
             .unwrap()
             .signals[0];
 
-        let recall_case = recall_case_for(&database, "definition lifecycle");
+        let recall_case = recall_case_for(database, "definition lifecycle");
         let trace = database
             .shadow_activate(
                 OperationContext::new(Actor::System),
@@ -12986,9 +12732,10 @@ mod tests {
 
     #[test]
     fn relation_signal_owner_indexes_follow_evaluator_changes_exactly() {
-        let (_parent, _root, database) = create_test_database();
-        let first = imported_source(&database, "evaluator migration alpha");
-        let second = imported_source(&database, "evaluator migration beta");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let first = imported_source(database, "evaluator migration alpha");
+        let second = imported_source(database, "evaluator migration beta");
         let evaluator_one = database
             .put_relation_evaluator(
                 OperationContext::new(Actor::Operator),
@@ -13114,9 +12861,10 @@ mod tests {
 
     #[test]
     fn relation_signal_and_activation_inputs_enforce_aggregate_bounds_and_uniqueness() {
-        let (_parent, _root, database) = create_test_database();
-        let first = imported_source(&database, "bound alpha");
-        let second = imported_source(&database, "bound beta");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let first = imported_source(database, "bound alpha");
+        let second = imported_source(database, "bound beta");
         let evaluator = database
             .put_relation_evaluator(
                 OperationContext::new(Actor::Operator),

@@ -7,7 +7,7 @@
 //!   same id returns the cached receipt (`replayed = true`) with no duplicate
 //!   rows.
 //! * A transaction that crashed after writing its `Incomplete` marker but before
-//!   committing leaves no partial rows (fjall batches commit atomically). The
+//!   committing leaves no partial rows (storage batches commit atomically). The
 //!   next submission notices the marker, clears it, and re-executes.
 
 use crate::context::storage::{decode, encode, owner_key, segment};
@@ -15,7 +15,7 @@ use crate::context::{
     ContextError, ContextRef, ContextResult, ContextStore, Endpoints, InformationKind, Properties,
     RecordHeader, RecordKind, RecordPin, TypeKind,
 };
-use crate::native_memory::{OperationId, RecordState, Scope, TemporalFacts};
+use crate::{OperationId, RecordState, Scope, TemporalFacts};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use ulid::Ulid;
@@ -88,13 +88,13 @@ impl ContextStore<'_> {
                 "extraction batch exceeds {MAX_BATCH_SIZE} operations"
             )));
         }
-        let _guard = self.db.lock_write();
-        let op_key = extraction_key(&self.access.owner, operation_id);
+        let _guard = self.scoped.lock();
+        let op_key = extraction_key(&self.scoped.access().owner, operation_id);
 
         // Completed memo -> replay.
         if let Some(bytes) = self.parts.extraction_receipts.get(op_key.clone())? {
             let mut receipt: ExtractionReceipt = decode(&bytes)?;
-            let _ = self.parts.extraction_incomplete.remove(op_key.clone())?;
+            self.clear_extraction_marker(&op_key)?;
             receipt.replayed = true;
             return Ok(receipt);
         }
@@ -107,11 +107,11 @@ impl ContextStore<'_> {
             .get(op_key.clone())?
             .is_some()
         {
-            self.parts.extraction_incomplete.remove(op_key.clone())?;
+            self.clear_extraction_marker(&op_key)?;
         }
 
         // Persist the Incomplete marker in its own durable commit first.
-        let mut marker = self.db.durable_batch();
+        let mut marker = self.scoped.batch();
         marker.insert(&self.parts.extraction_incomplete, op_key.clone(), b"1");
         marker.commit()?;
 
@@ -127,7 +127,7 @@ impl ContextStore<'_> {
                 match batch.commit() {
                     Ok(()) => Ok(receipt),
                     Err(error) => {
-                        let _ = self.parts.extraction_incomplete.remove(op_key)?;
+                        self.clear_extraction_marker(&op_key)?;
                         Err(ContextError::from(error))
                     }
                 }
@@ -136,12 +136,18 @@ impl ContextStore<'_> {
         }
     }
 
+    fn clear_extraction_marker(&self, key: &[u8]) -> ContextResult<()> {
+        let mut batch = self.scoped.batch();
+        batch.remove(&self.parts.extraction_incomplete, key);
+        Ok(batch.commit()?)
+    }
+
     fn build_extraction_batch(
         &self,
         operation_id: Ulid,
         ops: &[ExtractionOp],
-    ) -> ContextResult<(ExtractionReceipt, fjall::Batch)> {
-        let mut batch = self.db.durable_batch();
+    ) -> ContextResult<(ExtractionReceipt, mmdb_kernel::Batch)> {
+        let mut batch = self.scoped.batch();
         let mut receipt = ExtractionReceipt {
             operation_id,
             created_objects: Vec::new(),
@@ -160,14 +166,14 @@ impl ContextStore<'_> {
                     let type_def = self.type_definition_locked(type_ref)?;
                     self.validate_properties(&type_def, properties, &type_def.scope)?;
                     if !sources.is_empty() {
-                        self.validate_sources(
+                        self.scoped.validate_sources(
                             &type_def.scope,
                             sources,
                             InformationKind::Observation,
                             None,
                         )?;
                     }
-                    let pin = self.fresh_pin(RecordKind::Object);
+                    let pin = self.scoped.fresh_pin(RecordKind::Object);
                     self.write_record(
                         &mut batch,
                         &pin,
@@ -184,14 +190,14 @@ impl ContextStore<'_> {
                     properties,
                     sources,
                 } => {
-                    let (previous, pin) = self.next_revision(expected)?;
+                    let (previous, pin) = self.scoped.next_revision(expected)?;
                     let type_ref = previous.type_pin.clone().ok_or_else(|| {
                         ContextError::InvalidInput("revised record has no type".into())
                     })?;
                     let type_def = self.type_definition_locked(&type_ref)?;
                     self.validate_properties(&type_def, properties, &previous.scope)?;
                     if !sources.is_empty() {
-                        self.validate_sources(
+                        self.scoped.validate_sources(
                             &previous.scope,
                             sources,
                             InformationKind::Observation,
@@ -226,14 +232,14 @@ impl ContextStore<'_> {
                     let mut properties: Properties = BTreeMap::new();
                     properties.insert("weight".into(), serde_json::json!(*weight));
                     if !sources.is_empty() {
-                        self.validate_sources(
+                        self.scoped.validate_sources(
                             &type_def.scope,
                             sources,
                             InformationKind::Observation,
                             None,
                         )?;
                     }
-                    let pin = self.fresh_pin(RecordKind::Relation);
+                    let pin = self.scoped.fresh_pin(RecordKind::Relation);
                     self.write_record(
                         &mut batch,
                         &pin,
@@ -251,7 +257,7 @@ impl ContextStore<'_> {
                     evidence: _,
                     sources,
                 } => {
-                    let (previous, pin) = self.next_revision(expected)?;
+                    let (previous, pin) = self.scoped.next_revision(expected)?;
                     let type_ref = previous.type_pin.clone().ok_or_else(|| {
                         ContextError::InvalidInput("revised relation has no type".into())
                     })?;
@@ -260,7 +266,7 @@ impl ContextStore<'_> {
                         properties.insert("weight".into(), serde_json::json!(*weight));
                     }
                     if !sources.is_empty() {
-                        self.validate_sources(
+                        self.scoped.validate_sources(
                             &previous.scope,
                             sources,
                             InformationKind::Observation,
@@ -280,6 +286,9 @@ impl ContextStore<'_> {
                 }
             }
         }
+        if !receipt.revised_objects.is_empty() || !receipt.revised_relations.is_empty() {
+            self.scoped.advance_epoch(&mut batch)?;
+        }
         Ok((receipt, batch))
     }
 
@@ -287,7 +296,7 @@ impl ContextStore<'_> {
     #[allow(clippy::too_many_arguments)]
     fn write_record(
         &self,
-        batch: &mut fjall::Batch,
+        batch: &mut mmdb_kernel::Batch,
         pin: &RecordPin,
         scope: Scope,
         type_pin: Option<RecordPin>,
@@ -303,21 +312,17 @@ impl ContextStore<'_> {
             state: RecordState::Active,
             type_pin,
             sources,
-            provenance: self.provenance(),
+            source_scopes: Vec::new(),
+            provenance: self.scoped.provenance(),
             information: InformationKind::Observation,
             temporal: TemporalFacts::observed_at(now),
             recorded_at_ms: now,
-            payload: crate::context::PayloadDescriptor {
-                revision: pin.revision,
-                bytes: bytes.len() as u64,
-                digest: self.content_digest(&bytes),
-            },
+            payload: self.scoped.put_payload(batch, pin, &bytes),
             endpoints,
-            history: None,
+            event: None,
             checkpoint: None,
         };
-        self.put_payload(batch, pin, &bytes);
-        self.put_header(batch, &header)?;
+        self.scoped.put_header(batch, &header)?;
         self.replace_postings(batch, &header, Some(properties))?;
         self.replace_adjacency(batch, None, &header)?;
         Ok(())

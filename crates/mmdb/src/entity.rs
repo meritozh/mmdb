@@ -16,7 +16,8 @@ use crate::context::{
     ContextError, ContextRef, ContextResult, ContextStore, InformationKind, Properties,
     RecordHeader, RecordKind, RecordPin, TypeKind,
 };
-use crate::native_memory::{OperationId, RecordState, Scope, TemporalFacts};
+use crate::StoreModule;
+use crate::{OperationId, RecordState, Scope, TemporalFacts};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -165,40 +166,38 @@ impl ContextStore<'_> {
         op: OperationId,
         entity_ref: EntityRef,
     ) -> ContextResult<EntityIdentity> {
-        let _guard = self.db.lock_write();
+        let _guard = self.scoped.lock();
         self.check_entity_ref(&entity_ref)?;
         if let Some(existing) = self.identity_locked(&entity_ref)? {
             return Ok(existing);
         }
-        let digest = self.digest("entity-resolve", &entity_ref)?;
-        if let Some(stored) = self.replay(op, digest)? {
+        let digest = self.scoped.digest("entity-resolve", &entity_ref)?;
+        if let Some(stored) = self.scoped.replay(op, digest)? {
             return self.identity_from_pin(&stored.pin);
         }
         let type_pin = self.ensure_entity_type(&entity_ref.entity_type)?;
         let now = crate::now_ms();
-        let pin = self.fresh_pin(RecordKind::Object);
+        let pin = self.scoped.fresh_pin(RecordKind::Object);
         let mut properties: Properties = BTreeMap::new();
         properties.insert("namespace".into(), json!(entity_ref.namespace));
         properties.insert("entity_type".into(), json!(entity_ref.entity_type));
         properties.insert("external_key".into(), json!(entity_ref.external_key));
         let bytes = encode(&properties)?;
+        let mut batch = self.scoped.batch();
         let header = RecordHeader {
             pin: pin.clone(),
             scope: Scope::Personal,
             state: RecordState::Active,
             type_pin: Some(type_pin),
             sources: Vec::new(),
-            provenance: self.provenance(),
+            source_scopes: Vec::new(),
+            provenance: self.scoped.provenance(),
             information: InformationKind::Observation,
             temporal: TemporalFacts::observed_at(now),
             recorded_at_ms: now,
-            payload: crate::context::PayloadDescriptor {
-                revision: pin.revision,
-                bytes: bytes.len() as u64,
-                digest: self.content_digest(&bytes),
-            },
+            payload: self.scoped.put_payload(&mut batch, &pin, &bytes),
             endpoints: None,
-            history: None,
+            event: None,
             checkpoint: None,
         };
         let stored = StoredEntityIdentity {
@@ -210,23 +209,21 @@ impl ContextStore<'_> {
             created_at_ms: now,
             source_operation: Some(op.0),
         };
-        let mut batch = self.db.durable_batch();
-        self.put_payload(&mut batch, &pin, &bytes);
-        self.put_header(&mut batch, &header)?;
+        self.scoped.put_header(&mut batch, &header)?;
         self.replace_postings(&mut batch, &header, Some(&properties))?;
         self.replace_adjacency(&mut batch, None, &header)?;
         batch.insert(
             &self.parts.entity_identity,
-            identity_key(&self.access.owner, &entity_ref),
+            identity_key(&self.scoped.access().owner, &entity_ref),
             encode(&stored)?,
         );
-        self.commit_operation(
+        self.scoped.commit_operation(
             batch,
             op,
             digest,
             crate::context::WriteReceipt {
                 pin,
-                history_sequence: None,
+                sequence: None,
             },
         )?;
         Ok(stored.into())
@@ -234,7 +231,7 @@ impl ContextStore<'_> {
 
     /// Look up an entity without creating it.
     pub fn get_entity(&self, entity_ref: &EntityRef) -> ContextResult<Option<EntityIdentity>> {
-        let _guard = self.db.lock_write();
+        let _guard = self.scoped.lock();
         self.identity_locked(entity_ref)
     }
 
@@ -246,7 +243,7 @@ impl ContextStore<'_> {
         primary: &EntityRef,
         alias: EntityRef,
     ) -> ContextResult<EntityIdentity> {
-        let _guard = self.db.lock_write();
+        let _guard = self.scoped.lock();
         self.check_entity_ref(primary)?;
         self.check_entity_ref(&alias)?;
         if primary == &alias {
@@ -254,14 +251,13 @@ impl ContextStore<'_> {
                 "alias must differ from the primary reference".into(),
             ));
         }
-        let primary_row = self.identity_locked(primary)?.ok_or_else(|| {
-            ContextError::NotFound(ContextRef {
-                era: self.db.era_id(),
-                owner: self.access.owner.clone(),
-                kind: RecordKind::Object,
-                id: Ulid::nil(),
-            })
-        })?;
+        let digest = self.scoped.digest("entity-alias", &(primary, &alias))?;
+        if self.scoped.replay(op, digest)?.is_some() {
+            return self
+                .identity_locked(&alias)?
+                .ok_or_else(|| self.missing_entity());
+        }
+        let primary_row = self.identity_locked(primary)?.ok_or_else(|| self.missing_entity())?;
         if self.identity_locked(&alias)?.is_some() {
             return Err(ContextError::IdempotencyConflict);
         }
@@ -275,19 +271,19 @@ impl ContextStore<'_> {
             created_at_ms: now,
             source_operation: Some(op.0),
         };
-        let mut batch = self.db.durable_batch();
+        let mut batch = self.scoped.batch();
         batch.insert(
             &self.parts.entity_identity,
-            identity_key(&self.access.owner, &alias),
+            identity_key(&self.scoped.access().owner, &alias),
             encode(&stored)?,
         );
-        self.commit_operation(
+        self.scoped.commit_operation(
             batch,
             op,
-            self.digest("entity-alias", &(primary, &alias))?,
+            digest,
             crate::context::WriteReceipt {
-                pin: self.fresh_pin(RecordKind::Object),
-                history_sequence: None,
+                pin: self.node_pin(primary_row.node_id)?,
+                sequence: None,
             },
         )?;
         Ok(stored.into())
@@ -302,25 +298,15 @@ impl ContextStore<'_> {
         source: &EntityRef,
         target: &EntityRef,
     ) -> ContextResult<()> {
-        let _guard = self.db.lock_write();
+        let _guard = self.scoped.lock();
         self.check_entity_ref(source)?;
         self.check_entity_ref(target)?;
-        let source_row = self.identity_locked(source)?.ok_or_else(|| {
-            ContextError::NotFound(ContextRef {
-                era: self.db.era_id(),
-                owner: self.access.owner.clone(),
-                kind: RecordKind::Object,
-                id: Ulid::nil(),
-            })
-        })?;
-        let target_row = self.identity_locked(target)?.ok_or_else(|| {
-            ContextError::NotFound(ContextRef {
-                era: self.db.era_id(),
-                owner: self.access.owner.clone(),
-                kind: RecordKind::Object,
-                id: Ulid::nil(),
-            })
-        })?;
+        let digest = self.scoped.digest("entity-merge", &(source, target))?;
+        if self.scoped.replay(op, digest)?.is_some() {
+            return Ok(());
+        }
+        let source_row = self.identity_locked(source)?.ok_or_else(|| self.missing_entity())?;
+        let target_row = self.identity_locked(target)?.ok_or_else(|| self.missing_entity())?;
         if source_row.entity_ref.entity_type != target_row.entity_ref.entity_type {
             return Err(ContextError::TypeConflict(format!(
                 "cannot merge entities of different types: {} vs {}",
@@ -333,9 +319,9 @@ impl ContextStore<'_> {
         {
             return Ok(());
         }
-        let mut batch = self.db.durable_batch();
+        let mut batch = self.scoped.batch();
         let mut rewritten = 0usize;
-        let prefix = owner_key(&self.access.owner);
+        let prefix = owner_key(&self.scoped.access().owner);
         for entry in self.parts.entity_identity.range(prefix.clone()..) {
             let (key, value) = entry?;
             if !key.starts_with(&prefix) {
@@ -352,16 +338,17 @@ impl ContextStore<'_> {
         if rewritten == 0 {
             return Ok(());
         }
-        self.commit_operation(
-            batch,
-            op,
-            self.digest("entity-merge", &(source, target))?,
-            crate::context::WriteReceipt {
-                pin: self.fresh_pin(RecordKind::Object),
-                history_sequence: None,
-            },
-        )
-        .map(|_| ())
+        self.scoped
+            .commit_operation(
+                batch,
+                op,
+                digest,
+                crate::context::WriteReceipt {
+                    pin: self.node_pin(target_row.node_id)?,
+                    sequence: None,
+                },
+            )
+            .map(|_| ())
     }
 
     /// List entity identities under `(namespace, entity_type)`, optionally
@@ -378,8 +365,8 @@ impl ContextStore<'_> {
                 "entity list limit must be 1..={MAX_ENTITY_LIST}"
             )));
         }
-        let _guard = self.db.lock_write();
-        let prefix = identity_prefix(&self.access.owner, namespace, entity_type);
+        let _guard = self.scoped.lock();
+        let prefix = identity_prefix(&self.scoped.access().owner, namespace, entity_type);
         let start = match after {
             Some(key) => {
                 let mut start = prefix.clone();
@@ -397,7 +384,7 @@ impl ContextStore<'_> {
             if out.len() >= limit {
                 break;
             }
-            if after.is_some() && row_key == start {
+            if after.is_some() && row_key.as_ref() == start.as_slice() {
                 continue;
             }
             out.push(decode_identity(&value)?.into());
@@ -425,16 +412,36 @@ impl ContextStore<'_> {
         let Some(bytes) = self
             .parts
             .entity_identity
-            .get(identity_key(&self.access.owner, entity_ref))?
+            .get(identity_key(&self.scoped.access().owner, entity_ref))?
         else {
             return Ok(None);
         };
         Ok(Some(decode_identity(&bytes)?.into()))
     }
 
+    fn missing_entity(&self) -> ContextError {
+        ContextError::NotFound(ContextRef {
+            era: self.scoped.era(StoreModule::Memory),
+            owner: self.scoped.access().owner.clone(),
+            kind: RecordKind::Object,
+            id: Ulid::nil(),
+        })
+    }
+
+    /// The current pin of an entity's node, recorded as the receipt of an identity write.
+    fn node_pin(&self, node_id: Ulid) -> ContextResult<RecordPin> {
+        let node = ContextRef {
+            era: self.scoped.era(StoreModule::Memory),
+            owner: self.scoped.access().owner.clone(),
+            kind: RecordKind::Object,
+            id: node_id,
+        };
+        Ok(self.scoped.head_locked(&node)?.pin)
+    }
+
     fn identity_from_pin(&self, pin: &RecordPin) -> ContextResult<EntityIdentity> {
         // Replay path: locate the identity row that points at this node.
-        let prefix = owner_key(&self.access.owner);
+        let prefix = owner_key(&self.scoped.access().owner);
         for entry in self.parts.entity_identity.range(prefix.clone()..) {
             let (key, value) = entry?;
             if !key.starts_with(&prefix) {

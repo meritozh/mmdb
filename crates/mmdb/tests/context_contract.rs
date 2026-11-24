@@ -1,36 +1,38 @@
 use mmdb::context::*;
-use mmdb::native_memory::{Actor, MemoryDatabase, OperationId, RecordState, Scope, TemporalFacts};
+use mmdb::session::*;
+use mmdb::{Actor, OperationId, RecordState, Scope, TemporalFacts};
+use mmdb::{Store, StoreError, STORE_FORMAT_ID};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn access(owner: &str) -> ContextAccess {
     ContextAccess::new(owner, Actor::System)
 }
 
-fn history_input(session: &str, event: &str) -> HistoryInput {
-    HistoryInput {
+fn event_input(session: &str, event: &str) -> EventInput {
+    EventInput {
         sources: Vec::new(),
         session: session.into(),
         event_id: event.into(),
         scope: Scope::Personal,
-        kind: HistoryKind::UserMessage,
+        kind: EventKind::UserMessage,
         media_type: "text/plain; charset=utf-8".into(),
         occurred_at_ms: 10,
         expected_sequence: None,
     }
 }
 
-fn source(context: &ContextStore<'_>, event: &str, text: &str) -> RecordPin {
-    context
-        .append_history(
-            OperationId::new(),
-            history_input("session-a", event),
-            text.as_bytes(),
-        )
-        .unwrap()
-        .pin
+fn source(log: &SessionLog<'_>, event: &str, text: &str) -> RecordPin {
+    log.append(
+        OperationId::new(),
+        event_input("session-a", event),
+        text.as_bytes(),
+    )
+    .unwrap()
+    .pin
 }
 
 fn definition(name: &str) -> TypeDefinition {
@@ -109,10 +111,11 @@ fn independent_harnesses_share_types_history_and_relations_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("context");
     let (paper, decision, link, type_pin, raw) = {
-        let db = MemoryDatabase::create_context(&root).unwrap();
+        let db = Store::create(&root).unwrap();
+        let research_log = db.session_log(access("owner")).unwrap();
         let research = db.context(access("owner")).unwrap();
         let raw = source(
-            &research,
+            &research_log,
             "original",
             "Research found a capacity constraint that affects the decision.",
         );
@@ -144,11 +147,12 @@ fn independent_harnesses_share_types_history_and_relations_after_reopen() {
             .pin;
         (paper, decision, link, type_pin, raw)
     };
-    let db = MemoryDatabase::open_context(&root).unwrap();
+    let db = Store::open(&root).unwrap();
     let mut trader_access = access("owner");
     trader_access.actor = Actor::Assistant;
     trader_access.agent = Some("trading".into());
     trader_access.session = Some("session-b".into());
+    let trading_log = db.session_log(trader_access.clone()).unwrap();
     let trading = db.context(trader_access).unwrap();
     assert_eq!(
         trading
@@ -174,21 +178,22 @@ fn independent_harnesses_share_types_history_and_relations_after_reopen() {
         InformationKind::Inference
     );
     assert_eq!(indirect.record.header.sources, vec![raw.clone()]);
-    let bytes = trading.read_payload(&raw, 0, 256).unwrap().bytes;
+    let bytes = trading_log.read_payload(&raw, 0, 256).unwrap().bytes;
     assert_eq!(
         String::from_utf8(bytes).unwrap(),
         "Research found a capacity constraint that affects the decision."
     );
-    assert_eq!(trading.history_position("session-a").unwrap(), 1);
-    assert_eq!(trading.history_position("session-b").unwrap(), 0);
+    assert_eq!(trading_log.position("session-a").unwrap(), 1);
+    assert_eq!(trading_log.position("session-b").unwrap(), 0);
 }
 
 #[test]
 fn type_versions_are_reused_and_old_instances_keep_their_schema() {
     let dir = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(dir.path().join("context")).unwrap();
+    let db = Store::create(dir.path().join("context")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
     let context = db.context(access("owner")).unwrap();
-    let raw = source(&context, "raw", "A bounded observation");
+    let raw = source(&log, "raw", "A bounded observation");
     let original = definition("observation");
     let first = context
         .define_type(OperationId::new(), original.clone())
@@ -245,10 +250,12 @@ fn type_versions_are_reused_and_old_instances_keep_their_schema() {
 #[test]
 fn source_and_property_validation_reject_cross_owner_or_wrong_type() {
     let dir = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(dir.path().join("context")).unwrap();
+    let db = Store::create(dir.path().join("context")).unwrap();
+    let alice_log = db.session_log(access("alice")).unwrap();
     let alice = db.context(access("alice")).unwrap();
+    let bob_log = db.session_log(access("bob")).unwrap();
     let bob = db.context(access("bob")).unwrap();
-    let raw = source(&alice, "a", "Alice's evidence");
+    let raw = source(&alice_log, "a", "Alice's evidence");
     let alice_type = alice
         .define_type(OperationId::new(), definition("note"))
         .unwrap()
@@ -257,7 +264,10 @@ fn source_and_property_validation_reject_cross_owner_or_wrong_type() {
         .define_type(OperationId::new(), definition("note"))
         .unwrap()
         .pin;
-    assert!(matches!(bob.read(&raw), Err(ContextError::AccessDenied)));
+    assert!(matches!(
+        bob_log.read_payload(&raw, 0, 100),
+        Err(ContextError::AccessDenied)
+    ));
     assert!(matches!(
         bob.save_object(OperationId::new(), object(&bob_type, &raw, "copied")),
         Err(ContextError::AccessDenied)
@@ -287,15 +297,16 @@ fn source_and_property_validation_reject_cross_owner_or_wrong_type() {
 #[test]
 fn private_sources_do_not_become_public_through_objects_or_relations() {
     let dir = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(dir.path().join("context")).unwrap();
+    let db = Store::create(dir.path().join("context")).unwrap();
     let private = Scope::Session(ulid::Ulid::new());
     let mut permitted = access("owner");
     permitted.scopes.push(private.clone());
+    let all_log = db.session_log(permitted.clone()).unwrap();
     let all = db.context(permitted).unwrap();
-    let mut raw_input = history_input("private", "raw");
+    let mut raw_input = event_input("private", "raw");
     raw_input.scope = private.clone();
-    let raw = all
-        .append_history(OperationId::new(), raw_input, b"private fact".as_slice())
+    let raw = all_log
+        .append(OperationId::new(), raw_input, b"private fact".as_slice())
         .unwrap()
         .pin;
     let type_pin = all
@@ -332,23 +343,23 @@ fn complete_large_history_is_searchable_across_chunks_and_query_pages() {
     let tail_at = bytes.len() - tail.len();
     bytes[tail_at..].copy_from_slice(tail);
     let pin = {
-        let db = MemoryDatabase::create_context(&root).unwrap();
-        db.context(access("owner"))
+        let db = Store::create(&root).unwrap();
+        db.session_log(access("owner"))
             .unwrap()
-            .append_history(
+            .append(
                 OperationId::new(),
-                history_input("long", "large"),
+                event_input("long", "large"),
                 bytes.as_slice(),
             )
             .unwrap()
             .pin
     };
-    let db = MemoryDatabase::open_context(&root).unwrap();
-    let context = db.context(access("owner")).unwrap();
+    let db = Store::open(&root).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
     let mut restored = Vec::new();
     let mut offset = 0;
     loop {
-        let page = context.read_payload(&pin, offset, 65_537).unwrap();
+        let page = log.read_payload(&pin, offset, 65_537).unwrap();
         restored.extend_from_slice(&page.bytes);
         match page.next_offset {
             Some(next) => offset = next,
@@ -360,8 +371,8 @@ fn complete_large_history_is_searchable_across_chunks_and_query_pages() {
         let mut cursor = None;
         let mut found = Vec::new();
         for _ in 0..100 {
-            let result = context
-                .search_history(HistoryQuery {
+            let result = log
+                .search(LogQuery {
                     text: text.into(),
                     session: None,
                     cursor,
@@ -387,60 +398,57 @@ fn complete_large_history_is_searchable_across_chunks_and_query_pages() {
 #[test]
 fn append_retries_preserve_identity_and_order_even_after_later_events() {
     let dir = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(dir.path().join("context")).unwrap();
-    let context = db.context(access("owner")).unwrap();
+    let db = Store::create(dir.path().join("context")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
     let operation = OperationId::new();
-    let mut input = history_input("session", "first");
+    let mut input = event_input("session", "first");
     input.expected_sequence = Some(0);
-    let first = context
-        .append_history(operation, input.clone(), b"first".as_slice())
+    let first = log
+        .append(operation, input.clone(), b"first".as_slice())
         .unwrap();
-    context
-        .append_history(
-            OperationId::new(),
-            history_input("session", "second"),
-            b"second".as_slice(),
-        )
-        .unwrap();
+    log.append(
+        OperationId::new(),
+        event_input("session", "second"),
+        b"second".as_slice(),
+    )
+    .unwrap();
     assert_eq!(
-        context
-            .append_history(operation, input.clone(), b"first".as_slice())
+        log.append(operation, input.clone(), b"first".as_slice())
             .unwrap(),
         first
     );
     input.expected_sequence = Some(2);
     assert_eq!(
-        context
-            .append_history(OperationId::new(), input.clone(), b"first".as_slice())
+        log.append(OperationId::new(), input.clone(), b"first".as_slice())
             .unwrap(),
         first
     );
     assert!(matches!(
-        context.append_history(OperationId::new(), input, b"different".as_slice()),
+        log.append(OperationId::new(), input, b"different".as_slice()),
         Err(ContextError::IdempotencyConflict)
     ));
-    let page = context.history("session", 0, 1).unwrap();
+    let page = log.events("session", 0, 1).unwrap();
     assert_eq!(page.entries[0].pin, first.pin);
     assert_eq!(page.next_sequence, Some(1));
-    let second = context.history("session", 1, 1).unwrap();
-    assert_eq!(second.entries[0].history.as_ref().unwrap().sequence, 2);
+    let second = log.events("session", 1, 1).unwrap();
+    assert_eq!(second.entries[0].event.as_ref().unwrap().sequence, 2);
     assert!(second.next_sequence.is_none());
-    assert_eq!(context.operation_receipt(operation).unwrap(), Some(first));
+    assert_eq!(log.operation_receipt(operation).unwrap(), Some(first));
 }
 
 #[test]
 fn concurrent_appends_allocate_one_session_order() {
     let dir = tempfile::tempdir().unwrap();
-    let db = Arc::new(MemoryDatabase::create_context(dir.path().join("context")).unwrap());
+    let db = Arc::new(Store::create(dir.path().join("context")).unwrap());
     let jobs: Vec<_> = (0..8)
         .map(|index| {
             let db = db.clone();
             std::thread::spawn(move || {
-                db.context(access("owner"))
+                db.session_log(access("owner"))
                     .unwrap()
-                    .append_history(
+                    .append(
                         OperationId::new(),
-                        history_input("shared", &format!("event-{index}")),
+                        event_input("shared", &format!("event-{index}")),
                         format!("item-{index}").as_bytes(),
                     )
                     .unwrap()
@@ -450,17 +458,17 @@ fn concurrent_appends_allocate_one_session_order() {
     let receipts: Vec<_> = jobs.into_iter().map(|job| job.join().unwrap()).collect();
     let positions: BTreeSet<_> = receipts
         .iter()
-        .map(|receipt| receipt.history_sequence.unwrap())
+        .map(|receipt| receipt.sequence.unwrap())
         .collect();
     assert_eq!(positions, (1..=8).collect());
-    let context = db.context(access("owner")).unwrap();
-    let history = context.history("shared", 0, 100).unwrap();
-    assert_eq!(history.entries.len(), 8);
-    let mut stale = history_input("shared", "stale");
+    let log = db.session_log(access("owner")).unwrap();
+    let page = log.events("shared", 0, 100).unwrap();
+    assert_eq!(page.entries.len(), 8);
+    let mut stale = event_input("shared", "stale");
     stale.expected_sequence = Some(0);
     assert!(matches!(
-        context.append_history(OperationId::new(), stale, b"stale".as_slice()),
-        Err(ContextError::HistoryConflict {
+        log.append(OperationId::new(), stale, b"stale".as_slice()),
+        Err(ContextError::PositionConflict {
             expected: 0,
             actual: 8
         })
@@ -470,38 +478,38 @@ fn concurrent_appends_allocate_one_session_order() {
 #[test]
 fn tool_results_require_their_call_and_follow_its_purge_state() {
     let dir = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(dir.path().join("context")).unwrap();
-    let context = db
-        .context(ContextAccess::new("owner", Actor::Operator))
+    let db = Store::create(dir.path().join("context")).unwrap();
+    let log = db
+        .session_log(ContextAccess::new("owner", Actor::Operator))
         .unwrap();
-    let mut result = history_input("session", "result");
-    result.kind = HistoryKind::ToolResult {
+    let mut result = event_input("session", "result");
+    result.kind = EventKind::ToolResult {
         call_id: "call-1".into(),
         outcome: ToolOutcome::Succeeded,
     };
     assert!(matches!(
-        context.append_history(OperationId::new(), result.clone(), b"response".as_slice()),
+        log.append(OperationId::new(), result.clone(), b"response".as_slice()),
         Err(ContextError::InvalidInput(_))
     ));
-    let mut call = history_input("session", "call");
-    call.kind = HistoryKind::ToolCall {
+    let mut call = event_input("session", "call");
+    call.kind = EventKind::ToolCall {
         message_id: None,
         call_id: "call-1".into(),
         tool_name: "research".into(),
     };
-    let call = context
-        .append_history(OperationId::new(), call, b"arguments".as_slice())
+    let call = log
+        .append(OperationId::new(), call, b"arguments".as_slice())
         .unwrap();
-    let result = context
-        .append_history(OperationId::new(), result, b"response".as_slice())
+    let result = log
+        .append(OperationId::new(), result, b"response".as_slice())
         .unwrap();
     assert_eq!(
-        context.read(&result.pin).unwrap().header.sources,
+        log.inspect_header(&result.pin).unwrap().sources,
         vec![call.pin.clone()]
     );
-    context.purge(OperationId::new(), call.pin).unwrap();
+    log.purge(OperationId::new(), call.pin).unwrap();
     assert!(matches!(
-        context.read_payload(&result.pin, 0, 10),
+        log.read_payload(&result.pin, 0, 10),
         Err(ContextError::Unavailable(_))
     ));
 }
@@ -512,34 +520,36 @@ fn purged_sources_stay_unavailable_after_reopen_recovery_and_replay() {
     let root = dir.path().join("context");
     let operation = OperationId::new();
     let (raw, note, input) = {
-        let db = MemoryDatabase::create_context(&root).unwrap();
+        let db = Store::create(&root).unwrap();
+        let log = db.session_log(access("owner")).unwrap();
         let context = db.context(access("owner")).unwrap();
-        let raw = source(&context, "raw", "sensitive observation");
+        let raw = source(&log, "raw", "sensitive observation");
         let type_pin = context
             .define_type(OperationId::new(), definition("note"))
             .unwrap()
             .pin;
         let input = object(&type_pin, &raw, "sensitive inference");
         let note = context.save_object(operation, input.clone()).unwrap().pin;
-        let operator = db
-            .context(ContextAccess::new("owner", Actor::Operator))
+        let operator_log = db
+            .session_log(ContextAccess::new("owner", Actor::Operator))
             .unwrap();
-        operator.purge(OperationId::new(), raw.clone()).unwrap();
+        operator_log.purge(OperationId::new(), raw.clone()).unwrap();
         assert!(matches!(
             context.read(&note),
             Err(ContextError::Unavailable(_))
         ));
         (raw, note, input)
     };
-    let db = MemoryDatabase::open_context(&root).unwrap();
+    let db = Store::open(&root).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
     let context = db.context(access("owner")).unwrap();
     assert_eq!(context.save_object(operation, input).unwrap().pin, note);
     assert!(context.recall(query("sensitive")).unwrap().hits.is_empty());
     assert!(matches!(
-        context.read_payload(&raw, 0, 10),
+        log.read_payload(&raw, 0, 10),
         Err(ContextError::Unavailable(_))
     ));
-    let report = context.recover_payloads(1, 1).unwrap();
+    let report = log.recover_payloads(1, 1).unwrap();
     assert_eq!(report.chunks_removed, 1);
     assert!(!report.more);
     assert!(matches!(
@@ -551,9 +561,10 @@ fn purged_sources_stay_unavailable_after_reopen_recovery_and_replay() {
 #[test]
 fn correction_replaces_postings_and_retains_explicit_history() {
     let dir = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(dir.path().join("context")).unwrap();
+    let db = Store::create(dir.path().join("context")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
     let context = db.context(access("owner")).unwrap();
-    let raw = source(&context, "raw", "A correction source");
+    let raw = source(&log, "raw", "A correction source");
     let type_pin = context
         .define_type(OperationId::new(), definition("note"))
         .unwrap()
@@ -599,9 +610,10 @@ fn correction_replaces_postings_and_retains_explicit_history() {
 #[test]
 fn revisions_cannot_introduce_self_dependent_source_chains() {
     let dir = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(dir.path().join("context")).unwrap();
+    let db = Store::create(dir.path().join("context")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
     let store = db.context(access("owner")).unwrap();
-    let raw = source(&store, "raw", "observation");
+    let raw = source(&log, "raw", "observation");
     let note = store
         .define_type(OperationId::new(), TypeDefinition::note(Scope::Personal))
         .unwrap()
@@ -644,9 +656,10 @@ fn revisions_cannot_introduce_self_dependent_source_chains() {
 #[test]
 fn relationship_cycles_are_bounded_and_inactive_endpoints_are_excluded() {
     let dir = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(dir.path().join("context")).unwrap();
+    let db = Store::create(dir.path().join("context")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
     let context = db.context(access("owner")).unwrap();
-    let raw = source(&context, "raw", "source");
+    let raw = source(&log, "raw", "source");
     let type_pin = context
         .define_type(OperationId::new(), definition("note"))
         .unwrap()
@@ -688,12 +701,13 @@ fn relationship_cycles_are_bounded_and_inactive_endpoints_are_excluded() {
 #[test]
 fn relation_pages_apply_direction_scope_time_and_type_filters_without_stalling() {
     let dir = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(dir.path().join("context")).unwrap();
+    let db = Store::create(dir.path().join("context")).unwrap();
     let private = Scope::Session(ulid::Ulid::new());
     let mut permitted = access("owner");
     permitted.scopes.push(private.clone());
+    let all_log = db.session_log(permitted.clone()).unwrap();
     let all = db.context(permitted).unwrap();
-    let raw = source(&all, "raw", "evidence");
+    let raw = source(&all_log, "raw", "evidence");
     let type_pin = all
         .define_type(OperationId::new(), TypeDefinition::note(Scope::Personal))
         .unwrap()
@@ -812,33 +826,68 @@ fn relation_pages_apply_direction_scope_time_and_type_filters_without_stalling()
 }
 
 #[test]
-fn reset_creates_a_new_context_era_without_importing_previous_history() {
+fn whole_store_reset_quarantines_the_directory_and_starts_new_eras() {
     use mmdb::store_format::{commit_reset, ResetPlan, ResetSafety, StoreEraId};
-    use std::time::{Duration, SystemTime};
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap().join("context");
-    let old = {
-        let db = MemoryDatabase::create_context(&root).unwrap();
-        source(&db.context(access("owner")).unwrap(), "old", "old source")
+    let (old, old_type, memory_plan) = {
+        let db = Store::create(&root).unwrap();
+        let old = source(
+            &db.session_log(access("owner")).unwrap(),
+            "old",
+            "old source",
+        );
+        let old_type = db
+            .context(access("owner"))
+            .unwrap()
+            .define_type(OperationId::new(), definition("old-type"))
+            .unwrap()
+            .pin;
+        (
+            old,
+            old_type,
+            db.plan_memory_reset(UNIX_EPOCH, Duration::from_secs(60))
+                .unwrap(),
+        )
     };
     let safety = ResetSafety::for_current_process(Vec::new()).unwrap();
     let plan = ResetPlan::build(
         std::slice::from_ref(&root),
-        CONTEXT_STORE_FORMAT_ID,
+        STORE_FORMAT_ID,
+        STORE_FORMAT_ID,
         SystemTime::now(),
         Duration::from_secs(60),
         &safety,
     )
     .unwrap();
     let receipt = commit_reset(&plan, plan.digest().as_str(), StoreEraId::new(), &[]).unwrap();
-    let db = MemoryDatabase::open_context(&root).unwrap();
-    let fresh = db.context(access("owner")).unwrap();
-    assert_eq!(fresh.history_position("session-a").unwrap(), 0);
-    assert!(matches!(fresh.read(&old), Err(ContextError::AccessDenied)));
-    let previous = MemoryDatabase::open_context(receipt.quarantine_path()).unwrap();
+    let mut db = Store::open(&root).unwrap();
+    assert_ne!(db.era(StoreModule::Session), old.record.era);
+    assert_ne!(db.era(StoreModule::Memory), old_type.record.era);
+    assert!(matches!(
+        db.reset_memory(&memory_plan, memory_plan.digest(), UNIX_EPOCH),
+        Err(StoreError::StaleResetPlan)
+    ));
+    assert!(matches!(
+        db.context(access("owner")).unwrap().read(&old_type),
+        Err(ContextError::AccessDenied)
+    ));
+    let fresh_log = db.session_log(access("owner")).unwrap();
+    assert_eq!(fresh_log.position("session-a").unwrap(), 0);
+    assert!(matches!(
+        fresh_log.read_payload(&old, 0, 100),
+        Err(ContextError::AccessDenied)
+    ));
+    let previous = Store::open(receipt.quarantine_path()).unwrap();
+    assert_eq!(previous.era(StoreModule::Memory), old_type.record.era);
+    assert!(previous
+        .context(access("owner"))
+        .unwrap()
+        .read(&old_type)
+        .is_ok());
     assert_eq!(
         previous
-            .context(access("owner"))
+            .session_log(access("owner"))
             .unwrap()
             .read_payload(&old, 0, 32)
             .unwrap()
@@ -850,9 +899,10 @@ fn reset_creates_a_new_context_era_without_importing_previous_history() {
 #[test]
 fn chinese_terms_find_curated_context_without_embeddings() {
     let dir = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(dir.path().join("context")).unwrap();
+    let db = Store::create(dir.path().join("context")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
     let context = db.context(access("owner")).unwrap();
-    let raw = source(&context, "raw", "项目需要考虑交易日窗口。");
+    let raw = source(&log, "raw", "项目需要考虑交易日窗口。");
     let type_pin = context
         .define_type(OperationId::new(), definition("决策"))
         .unwrap()
@@ -894,40 +944,37 @@ fn incomplete_uploads_never_advance_history_and_can_be_cleaned() {
     let root = dir.path().join("context");
     let operation = OperationId::new();
     {
-        let db = MemoryDatabase::create_context(&root).unwrap();
-        let context = db.context(access("owner")).unwrap();
+        let db = Store::create(&root).unwrap();
+        let log = db.session_log(access("owner")).unwrap();
         assert!(matches!(
-            context.append_history(
+            log.append(
                 operation,
-                history_input("session", "interrupted"),
+                event_input("session", "interrupted"),
                 FailingReader {
                     remaining: PAYLOAD_CHUNK_BYTES + 5
                 }
             ),
             Err(ContextError::Io(_))
         ));
-        assert_eq!(context.history_position("session").unwrap(), 0);
-        assert!(context.operation_receipt(operation).unwrap().is_none());
+        assert_eq!(log.position("session").unwrap(), 0);
+        assert!(log.operation_receipt(operation).unwrap().is_none());
     }
-    let db = MemoryDatabase::open_context(&root).unwrap();
+    let db = Store::open(&root).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
+    assert!(log.events("session", 0, 10).unwrap().entries.is_empty());
     let context = db.context(access("owner")).unwrap();
-    assert!(context
-        .history("session", 0, 10)
-        .unwrap()
-        .entries
-        .is_empty());
-    let report = context.recover_payloads(10, 10).unwrap();
+    assert_eq!(context.recover_payloads(10, 10).unwrap().chunks_removed, 0);
+    let report = log.recover_payloads(10, 10).unwrap();
     assert_eq!(report.chunks_removed, 1);
     assert_eq!(report.uploads_removed, 1);
     assert_eq!(
-        context
-            .append_history(
-                operation,
-                history_input("session", "interrupted"),
-                b"complete retry".as_slice()
-            )
-            .unwrap()
-            .history_sequence,
+        log.append(
+            operation,
+            event_input("session", "interrupted"),
+            b"complete retry".as_slice()
+        )
+        .unwrap()
+        .sequence,
         Some(1)
     );
 }
@@ -948,12 +995,12 @@ fn history_crash_child() {
             Ok(buffer.len())
         }
     }
-    let db = MemoryDatabase::create_context(root).unwrap();
-    db.context(access("owner"))
+    let db = Store::create(root).unwrap();
+    db.session_log(access("owner"))
         .unwrap()
-        .append_history(
+        .append(
             OperationId::new(),
-            history_input("session", "crashed"),
+            event_input("session", "crashed"),
             CrashReader(false),
         )
         .unwrap();
@@ -970,19 +1017,18 @@ fn actual_process_interruption_leaves_no_partial_visible_history() {
         .status()
         .unwrap();
     assert_eq!(status.code(), Some(77));
-    let db = MemoryDatabase::open_context(&root).unwrap();
-    let context = db.context(access("owner")).unwrap();
-    assert_eq!(context.history_position("session").unwrap(), 0);
-    assert_eq!(context.recover_payloads(10, 10).unwrap().chunks_removed, 1);
+    let db = Store::open(&root).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
+    assert_eq!(log.position("session").unwrap(), 0);
+    assert_eq!(log.recover_payloads(10, 10).unwrap().chunks_removed, 1);
     assert_eq!(
-        context
-            .append_history(
-                OperationId::new(),
-                history_input("session", "after-crash"),
-                b"resumed".as_slice()
-            )
-            .unwrap()
-            .history_sequence,
+        log.append(
+            OperationId::new(),
+            event_input("session", "after-crash"),
+            b"resumed".as_slice()
+        )
+        .unwrap()
+        .sequence,
         Some(1)
     );
 }
@@ -990,20 +1036,50 @@ fn actual_process_interruption_leaves_no_partial_visible_history() {
 #[test]
 fn format_and_store_identity_prevent_accidental_adoption() {
     let dir = tempfile::tempdir().unwrap();
-    let legacy = dir.path().join("legacy");
-    {
-        let db = MemoryDatabase::create(&legacy).unwrap();
+    use mmdb::store_format::{StoreEraId, StoreFormatError, StoreManifest};
+    use mmdb_kernel::KernelError;
+    for legacy_format in [
+        "mmdb-context-v1",
+        "mmdb-native-memory-v1",
+        "mmdb-context-dev7",
+        "mmdb-native-memory-dev7",
+        "mmdb-context-dev4",
+        "mmdb-store-dev9",
+        "mmdb-store-dev11",
+    ] {
+        let legacy = dir.path().join(legacy_format);
+        std::fs::create_dir(&legacy).unwrap();
+        StoreManifest::new(legacy_format, StoreEraId::new())
+            .unwrap()
+            .write_new(&legacy)
+            .unwrap();
         assert!(matches!(
-            db.context(access("owner")),
-            Err(ContextError::UnsupportedFormat)
+            Store::open(&legacy),
+            Err(StoreError::Kernel(KernelError::Format(StoreFormatError::FormatMismatch { expected, found, .. })))
+                if expected == STORE_FORMAT_ID && found == legacy_format
         ));
     }
-    assert!(MemoryDatabase::open_context(&legacy).is_err());
-    let first = MemoryDatabase::create_context(dir.path().join("first")).unwrap();
-    let pin = source(&first.context(access("owner")).unwrap(), "raw", "one era");
-    let second = MemoryDatabase::create_context(dir.path().join("second")).unwrap();
+    let first = Store::create(dir.path().join("first")).unwrap();
+    let log = first.session_log(access("owner")).unwrap();
+    let context = first.context(access("owner")).unwrap();
+    let pin = source(&log, "raw", "one era");
+    let type_pin = context
+        .define_type(OperationId::new(), definition("note"))
+        .unwrap()
+        .pin;
+    assert_eq!(pin.record.era, first.era(StoreModule::Session));
+    assert_eq!(type_pin.record.era, first.era(StoreModule::Memory));
+    assert_ne!(pin.record.era, type_pin.record.era);
+    assert_eq!(first.memory().era_id(), type_pin.record.era);
+    let second = Store::create(dir.path().join("second")).unwrap();
+    let foreign_log = second.session_log(access("owner")).unwrap();
+    let foreign = second.context(access("owner")).unwrap();
     assert!(matches!(
-        second.context(access("owner")).unwrap().read(&pin),
+        foreign_log.read_payload(&pin, 0, 32),
+        Err(ContextError::AccessDenied)
+    ));
+    assert!(matches!(
+        foreign.read(&type_pin),
         Err(ContextError::AccessDenied)
     ));
 }
@@ -1011,9 +1087,10 @@ fn format_and_store_identity_prevent_accidental_adoption() {
 #[test]
 fn source_validation_reserves_the_new_root_depth_and_aggregate_budget() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(tmp.path().join("context")).unwrap();
+    let db = Store::create(tmp.path().join("context")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
     let store = db.context(access("owner")).unwrap();
-    let root = source(&store, "source", "evidence");
+    let root = source(&log, "source", "evidence");
     let kind = store
         .define_type(OperationId::new(), definition("test.depth"))
         .unwrap()
@@ -1047,14 +1124,15 @@ fn source_validation_reserves_the_new_root_depth_and_aggregate_budget() {
 #[test]
 fn action_discovery_and_preparation_share_the_same_target_scope() {
     let d = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(d.path().join("db")).unwrap();
+    let db = Store::create(d.path().join("db")).unwrap();
     let a = Scope::Session(ulid::Ulid::new());
     let b = Scope::Session(ulid::Ulid::new());
     let mut access = access("owner");
     access.scopes.extend([a.clone(), b.clone()]);
+    let host_log = db.session_log(access.clone()).unwrap();
     let host = db.context(access.clone()).unwrap();
     let other = db.context(access).unwrap();
-    let raw = source(&host, "scope-evidence", "bounded");
+    let raw = source(&host_log, "scope-evidence", "bounded");
     let t = host
         .define_type(OperationId::new(), definition("example.task"))
         .unwrap()
@@ -1102,9 +1180,10 @@ fn action_discovery_and_preparation_share_the_same_target_scope() {
 #[test]
 fn action_contract_enforces_authority_versions_conditions_and_one_preparation() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = Arc::new(MemoryDatabase::create_context(tmp.path().join("context")).unwrap());
+    let db = Arc::new(Store::create(tmp.path().join("context")).unwrap());
+    let log = db.session_log(access("owner")).unwrap();
     let store = db.context(access("owner")).unwrap();
-    let evidence = source(&store, "source", "milestone instruction");
+    let evidence = source(&log, "source", "milestone instruction");
     let kind = store
         .define_type(OperationId::new(), definition("pmo.milestone"))
         .unwrap()
@@ -1264,41 +1343,45 @@ fn action_contract_enforces_authority_versions_conditions_and_one_preparation() 
 #[test]
 fn copied_history_tracks_source_availability_and_session_catalog_pages() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(tmp.path().join("context")).unwrap();
+    let db = Store::create(tmp.path().join("context")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
     let store = db.context(access("owner")).unwrap();
-    let original = source(&store, "source", "withdrawable-secret");
-    let mut copied = history_input("model-session", "model-request");
-    copied.kind = HistoryKind::Notice;
+    let original = source(&log, "source", "withdrawable-secret");
+    let mut copied = event_input("model-session", "model-request");
+    copied.kind = EventKind::Notice;
     copied.sources = vec![original.clone()];
-    let copy = store
-        .append_history(
+    let copy = log
+        .append(
             OperationId::new(),
             copied,
             b"withdrawable-secret copied".as_slice(),
         )
         .unwrap();
-    assert!(store.read_payload(&copy.pin, 0, 100).is_ok());
-    db.context(ContextAccess::new("owner", Actor::User))
+    assert!(log.read_payload(&copy.pin, 0, 100).is_ok());
+    db.session_log(ContextAccess::new("owner", Actor::User))
         .unwrap()
         .purge(OperationId::new(), original)
         .unwrap();
+    assert_eq!(
+        log.read_payload(&copy.pin, 0, 100).unwrap().bytes,
+        b"withdrawable-secret copied"
+    );
     assert!(matches!(
-        store.read_payload(&copy.pin, 0, 100),
+        store.validate_current(&[copy.pin], None),
         Err(ContextError::Unavailable(_))
     ));
     for index in 0..7 {
-        store
-            .append_history(
-                OperationId::new(),
-                history_input(&format!("session-{index}"), "input"),
-                b"original".as_slice(),
-            )
-            .unwrap();
+        log.append(
+            OperationId::new(),
+            event_input(&format!("session-{index}"), "input"),
+            b"original".as_slice(),
+        )
+        .unwrap();
     }
     let mut sessions = BTreeSet::new();
     let mut after = None;
     loop {
-        let page = store.history_sessions(2, after.as_deref()).unwrap();
+        let page = log.sessions(2, after.as_deref()).unwrap();
         for session in page.sessions {
             assert!(sessions.insert(session));
         }
@@ -1309,16 +1392,16 @@ fn copied_history_tracks_source_availability_and_session_catalog_pages() {
     }
     assert_eq!(sessions.len(), 9);
     assert!(db
-        .context(access("another-owner"))
+        .session_log(access("another-owner"))
         .unwrap()
-        .history_sessions(2, None)
+        .sessions(2, None)
         .unwrap()
         .sessions
         .is_empty());
     assert!(matches!(
-        db.context(ContextAccess::new("owner", Actor::Assistant))
+        db.session_log(ContextAccess::new("owner", Actor::Assistant))
             .unwrap()
-            .history_sessions(2, None),
+            .sessions(2, None),
         Err(ContextError::AccessDenied)
     ));
 }
@@ -1326,9 +1409,10 @@ fn copied_history_tracks_source_availability_and_session_catalog_pages() {
 #[test]
 fn current_validation_rejects_changed_dependencies_without_breaking_historical_reads() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(tmp.path().join("context")).unwrap();
+    let db = Store::create(tmp.path().join("context")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
     let store = db.context(access("owner")).unwrap();
-    let root = source(&store, "original", "original instruction");
+    let root = source(&log, "original", "original instruction");
     let kind = store
         .define_type(OperationId::new(), definition("test.current"))
         .unwrap()
@@ -1365,45 +1449,43 @@ fn current_validation_rejects_changed_dependencies_without_breaking_historical_r
 fn checkpoint_parent_and_epoch_are_compared_atomically_and_survive_reopen() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("context");
-    let db = MemoryDatabase::create_context(&path).unwrap();
+    let db = Store::create(&path).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
     let store = db.context(access("owner")).unwrap();
-    let anchor = source(&store, "event", "original");
+    let anchor = source(&log, "event", "original");
     let input = CheckpointInput {
         scope: CheckpointScope::Session,
         session: "session-a".into(),
         run: "run".into(),
-        history_sequence: 1,
+        sequence: 1,
         expected_previous: None,
         expected_availability_epoch: store.availability_epoch().unwrap(),
         sources: vec![anchor.clone()],
         payload: json!({"goal":"continue"}),
     };
-    let first = store
+    let first = log
         .save_checkpoint(OperationId::new(), input.clone())
         .unwrap();
-    assert!(store.save_checkpoint(OperationId::new(), input).is_err());
-    let tail = source(&store, "tail", "new message");
-    assert_eq!(
-        store.history("session-a", 1, 10).unwrap().entries[0].pin,
-        tail
-    );
+    assert!(log.save_checkpoint(OperationId::new(), input).is_err());
+    let tail = source(&log, "tail", "new message");
+    assert_eq!(log.events("session-a", 1, 10).unwrap().entries[0].pin, tail);
     let old_epoch = store.availability_epoch().unwrap();
-    db.context(ContextAccess::new("owner", Actor::User))
+    db.session_log(ContextAccess::new("owner", Actor::User))
         .unwrap()
         .purge(OperationId::new(), anchor)
         .unwrap();
     assert!(matches!(
-        store.read(&first.pin),
+        log.read_checkpoint(&first.pin),
         Err(ContextError::Unavailable(_))
     ));
-    assert!(store
+    assert!(log
         .save_checkpoint(
             OperationId::new(),
             CheckpointInput {
                 scope: CheckpointScope::Session,
                 session: "session-a".into(),
                 run: "run".into(),
-                history_sequence: 2,
+                sequence: 2,
                 expected_previous: Some(first.pin.clone()),
                 expected_availability_epoch: old_epoch,
                 sources: vec![tail],
@@ -1413,26 +1495,27 @@ fn checkpoint_parent_and_epoch_are_compared_atomically_and_survive_reopen() {
         .is_err());
     drop(store);
     drop(db);
-    let reopened = MemoryDatabase::open_context(path).unwrap();
-    let store = reopened.context(access("owner")).unwrap();
+    let reopened = Store::open(path).unwrap();
+    let log = reopened.session_log(access("owner")).unwrap();
     assert_eq!(
-        store.latest_checkpoint("session-a").unwrap().unwrap().pin,
+        log.latest_checkpoint("session-a").unwrap().unwrap().pin,
         first.pin
     );
     assert!(matches!(
-        store.read(&first.pin),
+        log.read_checkpoint(&first.pin),
         Err(ContextError::Unavailable(_))
     ));
-    assert_eq!(store.history_position("session-a").unwrap(), 2);
+    assert_eq!(log.position("session-a").unwrap(), 2);
 }
 
 #[test]
 fn live_revision_keeps_checkpoint_derived_originals_and_pairs_the_completed_tool() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("context");
-    let db = MemoryDatabase::create_context(&path).unwrap();
+    let db = Store::create(&path).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
     let store = db.context(access("owner")).unwrap();
-    let raw = source(&store, "original", "SQLite source text");
+    let raw = source(&log, "original", "SQLite source text");
     let kind = store
         .define_type(OperationId::new(), definition("note"))
         .unwrap()
@@ -1444,14 +1527,14 @@ fn live_revision_keeps_checkpoint_derived_originals_and_pairs_the_completed_tool
         )
         .unwrap()
         .pin;
-    let checkpoint = store
+    let checkpoint = log
         .save_checkpoint(
             OperationId::new(),
             CheckpointInput {
                 scope: CheckpointScope::Session,
                 session: "session-a".into(),
                 run: "run".into(),
-                history_sequence: 1,
+                sequence: 1,
                 expected_previous: None,
                 expected_availability_epoch: store.availability_epoch().unwrap(),
                 sources: vec![raw.clone(), note.clone()],
@@ -1467,15 +1550,15 @@ fn live_revision_keeps_checkpoint_derived_originals_and_pairs_the_completed_tool
         )
         .unwrap()
         .pin;
-    let mut call_input = history_input("session-a", "revise-call");
-    call_input.kind = HistoryKind::ToolCall {
+    let mut call_input = event_input("session-a", "revise-call");
+    call_input.kind = EventKind::ToolCall {
         call_id: "revise-call".into(),
         tool_name: "context".into(),
         message_id: None,
     };
     call_input.sources = vec![derived.clone()];
-    let call = store
-        .append_history(
+    let call = log
+        .append(
             OperationId::new(),
             call_input,
             b"revise the original note".as_slice(),
@@ -1503,7 +1586,7 @@ fn live_revision_keeps_checkpoint_derived_originals_and_pairs_the_completed_tool
         "derived knowledge must be revalidated before current recall"
     );
     assert!(
-        store.read(&checkpoint).is_ok(),
+        log.read_checkpoint(&checkpoint).is_ok(),
         "a correction must preserve the exact historical snapshot"
     );
     assert!(
@@ -1511,17 +1594,17 @@ fn live_revision_keeps_checkpoint_derived_originals_and_pairs_the_completed_tool
         "a correction must preserve derived original payloads"
     );
     assert!(
-        store.read(&call).is_ok(),
+        log.read_payload(&call, 0, 100).is_ok(),
         "the already dispatched call must remain readable"
     );
-    let mut result_input = history_input("session-a", "revise-result");
-    result_input.kind = HistoryKind::ToolResult {
+    let mut result_input = event_input("session-a", "revise-result");
+    result_input.kind = EventKind::ToolResult {
         call_id: "revise-call".into(),
         outcome: ToolOutcome::Succeeded,
     };
     result_input.sources = vec![changed.clone()];
-    let result = store
-        .append_history(
+    let result = log
+        .append(
             OperationId::new(),
             result_input,
             b"revision 2 committed".as_slice(),
@@ -1529,8 +1612,7 @@ fn live_revision_keeps_checkpoint_derived_originals_and_pairs_the_completed_tool
         .unwrap()
         .pin;
     assert_eq!(
-        store
-            .tool_history("session-a", "revise-call")
+        log.tool_pair("session-a", "revise-call")
             .unwrap()
             .1
             .unwrap()
@@ -1539,42 +1621,58 @@ fn live_revision_keeps_checkpoint_derived_originals_and_pairs_the_completed_tool
     );
     drop(store);
     drop(db);
-    let db = MemoryDatabase::open_context(&path).unwrap();
+    let db = Store::open(&path).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
     let store = db.context(access("owner")).unwrap();
-    for pin in [&checkpoint, &derived, &call, &result] {
-        assert!(store.read(pin).is_ok());
+    assert!(log.read_checkpoint(&checkpoint).is_ok());
+    assert!(store.read(&derived).is_ok());
+    for pin in [&call, &result] {
+        assert!(log.read_payload(pin, 0, 100).is_ok());
     }
-    db.context(ContextAccess::new("owner", Actor::User))
+    db.session_log(ContextAccess::new("owner", Actor::User))
         .unwrap()
         .purge(OperationId::new(), raw)
         .unwrap();
-    for pin in [&checkpoint, &derived, &call, &result] {
-        assert!(
-            matches!(store.read(pin), Err(ContextError::Unavailable(_))),
-            "purge must still hide every copied original"
-        );
+    assert!(matches!(
+        log.read_checkpoint(&checkpoint),
+        Err(ContextError::Unavailable(_))
+    ));
+    assert!(matches!(
+        store.read(&derived),
+        Err(ContextError::Unavailable(_))
+    ));
+    for (pin, payload) in [
+        (&call, b"revise the original note".as_slice()),
+        (&result, b"revision 2 committed".as_slice()),
+    ] {
+        assert_eq!(log.read_payload(pin, 0, 100).unwrap().bytes, payload);
+        assert!(matches!(
+            store.validate_current(std::slice::from_ref(pin), None),
+            Err(ContextError::Unavailable(_))
+        ));
     }
 }
 
 #[test]
 fn checkpoint_history_redaction_remains_conservative_for_unlisted_summary_input() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(tmp.path().join("context")).unwrap();
+    let db = Store::create(tmp.path().join("context")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
     let store = db.context(access("owner")).unwrap();
     let omitted = source(
-        &store,
+        &log,
         "earlier",
         "detail summarized but not individually pinned",
     );
-    let anchor = source(&store, "anchor", "last event");
-    let checkpoint = store
+    let anchor = source(&log, "anchor", "last event");
+    let checkpoint = log
         .save_checkpoint(
             OperationId::new(),
             CheckpointInput {
                 scope: CheckpointScope::Session,
                 session: "session-a".into(),
                 run: "run".into(),
-                history_sequence: 2,
+                sequence: 2,
                 expected_previous: None,
                 expected_availability_epoch: store.availability_epoch().unwrap(),
                 sources: vec![anchor],
@@ -1583,12 +1681,12 @@ fn checkpoint_history_redaction_remains_conservative_for_unlisted_summary_input(
         )
         .unwrap()
         .pin;
-    db.context(ContextAccess::new("owner", Actor::User))
+    db.session_log(ContextAccess::new("owner", Actor::User))
         .unwrap()
         .retract(OperationId::new(), omitted)
         .unwrap();
     assert!(matches!(
-        store.read(&checkpoint),
+        log.read_checkpoint(&checkpoint),
         Err(ContextError::Unavailable(_))
     ));
 }
@@ -1610,23 +1708,24 @@ fn session_and_child_run_checkpoints_keep_independent_cas_chains_across_reopen()
         (CheckpointScope::Run, child),
         (CheckpointScope::Run, sibling),
     ];
-    let latest = |store: &ContextStore<'_>, scope, run: &str| {
+    let latest = |log: &SessionLog<'_>, scope, run: &str| {
         match scope {
-            CheckpointScope::Session => store.latest_checkpoint("session-a"),
-            CheckpointScope::Run => store.latest_run_checkpoint("session-a", run),
+            CheckpointScope::Session => log.latest_checkpoint("session-a"),
+            CheckpointScope::Run => log.latest_run_checkpoint("session-a", run),
         }
         .unwrap()
     };
 
     let (base, first) = {
-        let db = MemoryDatabase::create_context(&path).unwrap();
+        let db = Store::create(&path).unwrap();
+        let log = db.session_log(access("owner")).unwrap();
         let store = db.context(access("owner")).unwrap();
-        let anchor = source(&store, "anchor", "committed parent history");
+        let anchor = source(&log, "anchor", "committed parent history");
         let base = CheckpointInput {
             scope: CheckpointScope::Session,
             session: "session-a".into(),
             run: "parent-run".into(),
-            history_sequence: 1,
+            sequence: 1,
             expected_previous: None,
             expected_availability_epoch: store.availability_epoch().unwrap(),
             sources: vec![anchor],
@@ -1634,10 +1733,10 @@ fn session_and_child_run_checkpoints_keep_independent_cas_chains_across_reopen()
         };
         let mut first = Vec::new();
         for (scope, profile) in &cases {
-            let context = db.context(profile.clone()).unwrap();
+            let profile_log = db.session_log(profile.clone()).unwrap();
             let run = profile.run.as_deref().unwrap();
-            assert!(latest(&context, *scope, run).is_none());
-            let pin = context
+            assert!(latest(&profile_log, *scope, run).is_none());
+            let pin = profile_log
                 .save_checkpoint(
                     OperationId::new(),
                     CheckpointInput {
@@ -1649,9 +1748,9 @@ fn session_and_child_run_checkpoints_keep_independent_cas_chains_across_reopen()
                 .unwrap()
                 .pin;
             first.push(pin.clone());
-            assert_eq!(latest(&context, *scope, run).unwrap().pin, pin);
+            assert_eq!(latest(&profile_log, *scope, run).unwrap().pin, pin);
             assert_eq!(
-                store.latest_checkpoint("session-a").unwrap().unwrap().pin,
+                log.latest_checkpoint("session-a").unwrap().unwrap().pin,
                 first[0]
             );
         }
@@ -1660,11 +1759,11 @@ fn session_and_child_run_checkpoints_keep_independent_cas_chains_across_reopen()
 
     // Every handle and the database have dropped before acquiring a new lease.
     let second = {
-        let db = MemoryDatabase::open_context(&path).unwrap();
+        let db = Store::open(&path).unwrap();
         for ((scope, profile), pin) in cases.iter().zip(&first) {
-            let store = db.context(profile.clone()).unwrap();
+            let log = db.session_log(profile.clone()).unwrap();
             let run = profile.run.as_deref().unwrap();
-            let header = latest(&store, *scope, run).unwrap();
+            let header = latest(&log, *scope, run).unwrap();
             assert_eq!(&header.pin, pin);
             assert_eq!(
                 header.checkpoint,
@@ -1673,7 +1772,7 @@ fn session_and_child_run_checkpoints_keep_independent_cas_chains_across_reopen()
                     session: "session-a".into(),
                     run: run.into(),
                     window: 1,
-                    history_sequence: 1,
+                    sequence: 1,
                     previous: None,
                     availability_epoch: base.expected_availability_epoch,
                 })
@@ -1683,7 +1782,7 @@ fn session_and_child_run_checkpoints_keep_independent_cas_chains_across_reopen()
             if profile.parent_run.is_some() {
                 let operation = OperationId::new();
                 assert!(matches!(
-                    store.save_checkpoint(
+                    log.save_checkpoint(
                         operation,
                         CheckpointInput {
                             run: run.into(),
@@ -1693,18 +1792,18 @@ fn session_and_child_run_checkpoints_keep_independent_cas_chains_across_reopen()
                     ),
                     Err(ContextError::AccessDenied)
                 ));
-                assert!(store.operation_receipt(operation).unwrap().is_none());
+                assert!(log.operation_receipt(operation).unwrap().is_none());
                 assert_eq!(
-                    store.latest_checkpoint("session-a").unwrap().unwrap().pin,
+                    log.latest_checkpoint("session-a").unwrap().unwrap().pin,
                     first[0]
                 );
-                assert_eq!(&latest(&store, *scope, run).unwrap().pin, pin);
+                assert_eq!(&latest(&log, *scope, run).unwrap().pin, pin);
             }
         }
 
         let mut second = Vec::new();
         for (index, (scope, profile)) in cases.iter().enumerate() {
-            let store = db.context(profile.clone()).unwrap();
+            let log = db.session_log(profile.clone()).unwrap();
             let run = profile.run.as_deref().unwrap();
             let input = CheckpointInput {
                 scope: *scope,
@@ -1715,7 +1814,7 @@ fn session_and_child_run_checkpoints_keep_independent_cas_chains_across_reopen()
             for wrong_previous in [None, Some(first[(index + 1) % cases.len()].clone())] {
                 let operation = OperationId::new();
                 assert!(matches!(
-                    store.save_checkpoint(
+                    log.save_checkpoint(
                         operation,
                         CheckpointInput {
                             expected_previous: wrong_previous,
@@ -1724,43 +1823,42 @@ fn session_and_child_run_checkpoints_keep_independent_cas_chains_across_reopen()
                     ),
                     Err(ContextError::InvalidInput(_))
                 ));
-                assert!(store.operation_receipt(operation).unwrap().is_none());
-                assert_eq!(latest(&store, *scope, run).unwrap().pin, first[index]);
+                assert!(log.operation_receipt(operation).unwrap().is_none());
+                assert_eq!(latest(&log, *scope, run).unwrap().pin, first[index]);
             }
-            let next = store
+            let next = log
                 .save_checkpoint(OperationId::new(), input.clone())
                 .unwrap()
                 .pin;
             let stale = OperationId::new();
             assert!(matches!(
-                store.save_checkpoint(stale, input),
+                log.save_checkpoint(stale, input),
                 Err(ContextError::InvalidInput(_))
             ));
-            assert!(store.operation_receipt(stale).unwrap().is_none());
-            assert_eq!(latest(&store, *scope, run).unwrap().pin, next);
+            assert!(log.operation_receipt(stale).unwrap().is_none());
+            assert_eq!(latest(&log, *scope, run).unwrap().pin, next);
             second.push(next);
         }
         second
     };
 
-    let db = MemoryDatabase::open_context(&path).unwrap();
+    let db = Store::open(&path).unwrap();
     for (index, (scope, profile)) in cases.iter().enumerate() {
-        let store = db.context(profile.clone()).unwrap();
-        let header = latest(&store, *scope, profile.run.as_deref().unwrap()).unwrap();
+        let log = db.session_log(profile.clone()).unwrap();
+        let header = latest(&log, *scope, profile.run.as_deref().unwrap()).unwrap();
         assert_eq!(header.pin, second[index]);
         let metadata = header.checkpoint.unwrap();
         assert_eq!(metadata.scope, *scope);
         assert_eq!(metadata.window, 2);
         assert_eq!(metadata.previous, Some(first[index].clone()));
-        assert_eq!(metadata.history_sequence, 1);
+        assert_eq!(metadata.sequence, 1);
         assert_eq!(header.provenance.parent_run, profile.parent_run);
         assert_eq!(
-            store.read(&second[index]).unwrap().body,
-            RecordBody::Checkpoint(base.payload.clone())
+            log.read_checkpoint(&second[index]).unwrap().payload,
+            base.payload
         );
         assert_eq!(
-            store
-                .read(&first[index])
+            log.read_checkpoint(&first[index])
                 .unwrap()
                 .header
                 .checkpoint
@@ -1768,16 +1866,17 @@ fn session_and_child_run_checkpoints_keep_independent_cas_chains_across_reopen()
                 .window,
             1
         );
-        assert_eq!(store.history_position("session-a").unwrap(), 1);
+        assert_eq!(log.position("session-a").unwrap(), 1);
     }
 }
 
 #[test]
-fn history_copies_old_object_and_type_pins_but_purge_blocks_object_copies() {
+fn log_copies_stay_readable_after_their_sources_change() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(tmp.path().join("context")).unwrap();
+    let db = Store::create(tmp.path().join("context")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
     let store = db.context(access("owner")).unwrap();
-    let raw = source(&store, "evidence", "original observation");
+    let raw = source(&log, "evidence", "original observation");
     let old_type = store
         .define_type(OperationId::new(), definition("test.history-snapshot"))
         .unwrap()
@@ -1820,20 +1919,19 @@ fn history_copies_old_object_and_type_pins_but_purge_blocks_object_copies() {
             .unwrap()
             .bytes;
         assert!(!payload.is_empty());
-        let mut input = history_input("snapshot-session", &format!("copy-{index}"));
-        input.kind = HistoryKind::Notice;
+        let mut input = event_input("snapshot-session", &format!("copy-{index}"));
+        input.kind = EventKind::Notice;
         input.sources = vec![original.clone()];
-        let copy = store
-            .append_history(OperationId::new(), input, payload.as_slice())
+        let copy = log
+            .append(OperationId::new(), input, payload.as_slice())
             .unwrap();
-        assert_eq!(copy.history_sequence, Some(index as u64 + 1));
+        assert_eq!(copy.sequence, Some(index as u64 + 1));
         assert_eq!(
-            store.read(&copy.pin).unwrap().header.sources,
+            log.inspect_header(&copy.pin).unwrap().sources,
             vec![original.clone()]
         );
         assert_eq!(
-            store
-                .read_payload(&copy.pin, 0, MAX_RECORD_BYTES)
+            log.read_payload(&copy.pin, 0, MAX_RECORD_BYTES)
                 .unwrap()
                 .bytes,
             payload
@@ -1849,35 +1947,30 @@ fn history_copies_old_object_and_type_pins_but_purge_blocks_object_copies() {
         store.read(&old_object),
         Err(ContextError::Unavailable(_))
     ));
-    assert!(matches!(
-        store.read(&copies[0].0),
-        Err(ContextError::Unavailable(_))
-    ));
-    assert!(matches!(
-        store.read_payload(&copies[0].0, 0, MAX_RECORD_BYTES),
-        Err(ContextError::Unavailable(_))
-    ));
-    assert_eq!(
-        store
-            .read_payload(&copies[1].0, 0, MAX_RECORD_BYTES)
-            .unwrap()
-            .bytes,
-        copies[1].1
-    );
+    for (pin, payload) in &copies {
+        assert_eq!(
+            log.read_payload(pin, 0, MAX_RECORD_BYTES).unwrap().bytes,
+            *payload
+        );
+        assert!(matches!(
+            store.validate_current(std::slice::from_ref(pin), None),
+            Err(ContextError::Unavailable(_))
+        ));
+    }
 
-    let mut blocked = history_input("snapshot-session", "copy-after-purge");
-    blocked.kind = HistoryKind::Notice;
+    let mut blocked = event_input("snapshot-session", "copy-after-purge");
+    blocked.kind = EventKind::Notice;
     blocked.sources = vec![old_object.clone(), old_type];
     blocked.expected_sequence = Some(2);
     let operation = OperationId::new();
     assert!(matches!(
-        store.append_history(operation, blocked, copies[0].1.as_slice()),
+        log.append(operation, blocked, copies[0].1.as_slice()),
         Err(ContextError::Unavailable(record)) if record == old_object.record
     ));
-    assert!(store.operation_receipt(operation).unwrap().is_none());
-    assert_eq!(store.history_position("snapshot-session").unwrap(), 2);
-    assert!(store
-        .history("snapshot-session", 2, 10)
+    assert!(log.operation_receipt(operation).unwrap().is_none());
+    assert_eq!(log.position("snapshot-session").unwrap(), 2);
+    assert!(log
+        .events("snapshot-session", 2, 10)
         .unwrap()
         .entries
         .is_empty());
@@ -1886,68 +1979,69 @@ fn history_copies_old_object_and_type_pins_but_purge_blocks_object_copies() {
 #[test]
 fn history_copy_reserves_new_root_depth_before_committing_an_unreadable_record() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(tmp.path().join("context")).unwrap();
-    let store = db.context(access("owner")).unwrap();
-    let mut chain = vec![source(&store, "root", "original evidence")];
+    let db = Store::create(tmp.path().join("context")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
+    let mut chain = vec![source(&log, "root", "original evidence")];
     for depth in 1..=32 {
-        let mut input = history_input("depth-session", &format!("depth-{depth}"));
-        input.kind = HistoryKind::Notice;
+        let mut input = event_input("depth-session", &format!("depth-{depth}"));
+        input.kind = EventKind::Notice;
         input.sources = vec![chain.last().unwrap().clone()];
         input.expected_sequence = Some(depth - 1);
-        let copy = store
-            .append_history(OperationId::new(), input, b"copied evidence".as_slice())
+        let copy = log
+            .append(OperationId::new(), input, b"copied evidence".as_slice())
             .unwrap();
-        assert_eq!(copy.history_sequence, Some(depth));
+        assert_eq!(copy.sequence, Some(depth));
         chain.push(copy.pin);
     }
     assert_eq!(
-        store.read(&chain[32]).unwrap().header.sources,
+        log.inspect_header(&chain[32]).unwrap().sources,
         vec![chain[31].clone()]
     );
     assert_eq!(
-        store.read_payload(&chain[32], 0, 100).unwrap().bytes,
+        log.read_payload(&chain[32], 0, 100).unwrap().bytes,
         b"copied evidence"
     );
 
-    let mut input = history_input("depth-session", "overflow");
-    input.kind = HistoryKind::Notice;
+    let mut input = event_input("depth-session", "overflow");
+    input.kind = EventKind::Notice;
     input.sources = vec![chain[32].clone()];
     input.expected_sequence = Some(32);
     let operation = OperationId::new();
     assert!(matches!(
-        store.append_history(operation, input.clone(), b"too deep".as_slice()),
+        log.append(operation, input.clone(), b"too deep".as_slice()),
         Err(ContextError::BudgetExceeded)
     ));
-    assert!(store.operation_receipt(operation).unwrap().is_none());
-    assert_eq!(store.history_position("depth-session").unwrap(), 32);
-    assert!(store
-        .history("depth-session", 32, 10)
+    assert!(log.operation_receipt(operation).unwrap().is_none());
+    assert_eq!(log.position("depth-session").unwrap(), 32);
+    assert!(log
+        .events("depth-session", 32, 10)
         .unwrap()
         .entries
         .is_empty());
 
     // A rejected copy consumes neither its event identity nor its operation.
     input.sources = vec![chain[31].clone()];
-    let accepted = store
-        .append_history(operation, input, b"within limit".as_slice())
+    let accepted = log
+        .append(operation, input, b"within limit".as_slice())
         .unwrap();
-    assert_eq!(accepted.history_sequence, Some(33));
+    assert_eq!(accepted.sequence, Some(33));
     assert_eq!(
-        store.operation_receipt(operation).unwrap(),
+        log.operation_receipt(operation).unwrap(),
         Some(accepted.clone())
     );
     assert_eq!(
-        store.read_payload(&accepted.pin, 0, 100).unwrap().bytes,
+        log.read_payload(&accepted.pin, 0, 100).unwrap().bytes,
         b"within limit"
     );
 }
 
 #[test]
-fn tool_results_link_historical_call_sources_and_still_follow_purge() {
+fn tool_results_stay_readable_after_their_call_source_is_purged() {
     let temp = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(temp.path().join("context")).unwrap();
+    let db = Store::create(temp.path().join("context")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
     let store = db.context(access("owner")).unwrap();
-    let raw = source(&store, "source", "old observation");
+    let raw = source(&log, "source", "old observation");
     let kind = store
         .define_type(OperationId::new(), definition("test.revision-result"))
         .unwrap()
@@ -1956,15 +2050,15 @@ fn tool_results_link_historical_call_sources_and_still_follow_purge() {
         .save_object(OperationId::new(), object(&kind, &raw, "old value"))
         .unwrap()
         .pin;
-    let mut call = history_input("session-a", "update-call");
-    call.kind = HistoryKind::ToolCall {
+    let mut call = event_input("session-a", "update-call");
+    call.kind = EventKind::ToolCall {
         message_id: None,
         call_id: "update-object".into(),
         tool_name: "context".into(),
     };
     call.sources = vec![old.clone()];
-    let call = store
-        .append_history(
+    let call = log
+        .append(
             OperationId::new(),
             call,
             b"update to a new revision".as_slice(),
@@ -1974,25 +2068,39 @@ fn tool_results_link_historical_call_sources_and_still_follow_purge() {
         .revise_object(OperationId::new(), old, object(&kind, &raw, "new value"))
         .unwrap()
         .pin;
-    assert!(store.read(&call.pin).is_ok());
-    let mut result = history_input("session-a", "update-result");
-    result.kind = HistoryKind::ToolResult {
+    assert!(log.read_payload(&call.pin, 0, 100).is_ok());
+    let mut result = event_input("session-a", "update-result");
+    result.kind = EventKind::ToolResult {
         call_id: "update-object".into(),
         outcome: ToolOutcome::Succeeded,
     };
-    let result = store
-        .append_history(OperationId::new(), result, b"revision committed".as_slice())
+    let result = log
+        .append(OperationId::new(), result, b"revision committed".as_slice())
         .unwrap();
     assert_eq!(
-        store.read_payload(&result.pin, 0, 100).unwrap().bytes,
+        log.read_payload(&result.pin, 0, 100).unwrap().bytes,
         b"revision committed"
     );
-    db.context(ContextAccess::new("owner", Actor::User))
-        .unwrap()
-        .purge(OperationId::new(), current)
+    let user_log = db
+        .session_log(ContextAccess::new("owner", Actor::User))
         .unwrap();
+    let user = db
+        .context(ContextAccess::new("owner", Actor::User))
+        .unwrap();
+    user.purge(OperationId::new(), current).unwrap();
+    for (pin, payload) in [
+        (&call.pin, b"update to a new revision".as_slice()),
+        (&result.pin, b"revision committed".as_slice()),
+    ] {
+        assert_eq!(log.read_payload(pin, 0, 100).unwrap().bytes, payload);
+        assert!(matches!(
+            store.validate_current(std::slice::from_ref(pin), None),
+            Err(ContextError::Unavailable(_))
+        ));
+    }
+    user_log.purge(OperationId::new(), call.pin).unwrap();
     assert!(matches!(
-        store.read(&result.pin),
+        log.read_payload(&result.pin, 0, 100),
         Err(ContextError::Unavailable(_))
     ));
 }
@@ -2000,44 +2108,1082 @@ fn tool_results_link_historical_call_sources_and_still_follow_purge() {
 #[test]
 fn history_copy_shares_the_aggregate_source_budget_including_its_new_root() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(tmp.path().join("context")).unwrap();
-    let store = db.context(access("owner")).unwrap();
-    let raw = source(&store, "root", "original evidence");
-    let mut wide = history_input("budget-session", "wide");
-    wide.kind = HistoryKind::Notice;
+    let db = Store::create(tmp.path().join("context")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
+    let raw = source(&log, "root", "original evidence");
+    let mut wide = event_input("budget-session", "wide");
+    wide.kind = EventKind::Notice;
     wide.sources = vec![raw.clone(); 64];
-    let wide = store
-        .append_history(OperationId::new(), wide, b"wide snapshot".as_slice())
+    let wide = log
+        .append(OperationId::new(), wide, b"wide snapshot".as_slice())
         .unwrap()
         .pin;
 
     // Each branch visits 65 records; 1 + 63 * 65 is exactly 4096.
-    let mut boundary = history_input("budget-session", "boundary");
-    boundary.kind = HistoryKind::Notice;
+    let mut boundary = event_input("budget-session", "boundary");
+    boundary.kind = EventKind::Notice;
     boundary.sources = vec![wide.clone(); 63];
-    let boundary = store
-        .append_history(OperationId::new(), boundary, b"at limit".as_slice())
+    let boundary = log
+        .append(OperationId::new(), boundary, b"at limit".as_slice())
         .unwrap();
     assert_eq!(
-        store.read_payload(&boundary.pin, 0, 100).unwrap().bytes,
+        log.read_payload(&boundary.pin, 0, 100).unwrap().bytes,
         b"at limit"
     );
 
-    let mut overflow = history_input("budget-session", "overflow");
-    overflow.kind = HistoryKind::Notice;
+    let mut overflow = event_input("budget-session", "overflow");
+    overflow.kind = EventKind::Notice;
     overflow.sources = vec![wide; 63];
     overflow.sources.push(raw);
     overflow.expected_sequence = Some(2);
     let operation = OperationId::new();
     assert!(matches!(
-        store.append_history(operation, overflow, b"over limit".as_slice()),
+        log.append(operation, overflow, b"over limit".as_slice()),
         Err(ContextError::BudgetExceeded)
     ));
-    assert!(store.operation_receipt(operation).unwrap().is_none());
-    assert_eq!(store.history_position("budget-session").unwrap(), 2);
-    assert!(store
-        .history("budget-session", 2, 10)
+    assert!(log.operation_receipt(operation).unwrap().is_none());
+    assert_eq!(log.position("budget-session").unwrap(), 2);
+    assert!(log
+        .events("budget-session", 2, 10)
         .unwrap()
         .entries
         .is_empty());
+}
+
+#[test]
+fn a_log_copy_needs_the_scopes_of_its_sources() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Store::create(tmp.path().join("context")).unwrap();
+    let workspace = Scope::Workspace(ulid::Ulid::new());
+    let mut authorized = access("owner");
+    authorized.scopes.push(workspace.clone());
+    let log = db.session_log(authorized.clone()).unwrap();
+    let store = db.context(authorized).unwrap();
+    let raw = source(&log, "raw", "personal detail");
+    let mut input = event_input("work", "copy");
+    input.scope = workspace.clone();
+    input.sources = vec![raw];
+    let copy = log
+        .append(OperationId::new(), input.clone(), b"first".as_slice())
+        .unwrap()
+        .pin;
+    input.event_id = "second".into();
+    input.sources = vec![copy];
+    let nested = log
+        .append(OperationId::new(), input, b"second".as_slice())
+        .unwrap()
+        .pin;
+    let checkpoint = log
+        .save_checkpoint(
+            OperationId::new(),
+            CheckpointInput {
+                session: "work".into(),
+                run: "run".into(),
+                scope: CheckpointScope::Session,
+                sequence: 2,
+                expected_previous: None,
+                expected_availability_epoch: store.availability_epoch().unwrap(),
+                sources: vec![],
+                payload: json!("summary"),
+            },
+        )
+        .unwrap()
+        .pin;
+    let mut restricted = access("owner");
+    restricted.scopes = vec![workspace];
+    let restricted_log = db.session_log(restricted.clone()).unwrap();
+    let restricted = db.context(restricted).unwrap();
+    for pin in [&nested, &checkpoint] {
+        assert_eq!(
+            log.inspect_header(pin).unwrap().source_scopes,
+            vec![Scope::Personal]
+        );
+        assert!(matches!(
+            restricted_log.read_payload(pin, 0, 100),
+            Err(ContextError::Unavailable(_))
+        ));
+        assert!(matches!(
+            restricted.validate_current(std::slice::from_ref(pin), None),
+            Err(ContextError::Unavailable(_))
+        ));
+    }
+}
+
+#[test]
+fn purging_a_log_event_hides_what_was_derived_from_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Store::create(tmp.path().join("context")).unwrap();
+    let log = db
+        .session_log(ContextAccess::new("owner", Actor::Operator))
+        .unwrap();
+    let store = db
+        .context(ContextAccess::new("owner", Actor::Operator))
+        .unwrap();
+    let raw = source(&log, "raw", "original");
+    let independent = source(&log, "other", "another observation");
+    let kind = store
+        .define_type(OperationId::new(), definition("note"))
+        .unwrap()
+        .pin;
+    let a = store
+        .save_object(OperationId::new(), object(&kind, &raw, "derived"))
+        .unwrap()
+        .pin;
+    let b = store
+        .save_object(
+            OperationId::new(),
+            object(&kind, &independent, "independent"),
+        )
+        .unwrap()
+        .pin;
+    let link = store
+        .save_relation(
+            OperationId::new(),
+            relation(&relation_type(&store, &kind), &a, &b, &raw),
+        )
+        .unwrap()
+        .pin;
+    let checkpoint = log
+        .save_checkpoint(
+            OperationId::new(),
+            CheckpointInput {
+                scope: CheckpointScope::Session,
+                session: "session-a".into(),
+                run: "run".into(),
+                sequence: 2,
+                expected_previous: None,
+                expected_availability_epoch: store.availability_epoch().unwrap(),
+                sources: vec![raw.clone()],
+                payload: json!("summary"),
+            },
+        )
+        .unwrap()
+        .pin;
+    log.purge(OperationId::new(), raw).unwrap();
+    for pin in [&a, &link] {
+        assert!(matches!(
+            store.read_payload(pin, 0, 100),
+            Err(ContextError::Unavailable(_))
+        ));
+    }
+    assert!(matches!(
+        log.read_checkpoint(&checkpoint),
+        Err(ContextError::Unavailable(_))
+    ));
+    assert!(store.read(&b).is_ok());
+}
+
+#[test]
+fn a_withdrawn_fragment_hides_its_whole_message() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Store::create(tmp.path().join("context")).unwrap();
+    let log = db
+        .session_log(ContextAccess::new("owner", Actor::Operator))
+        .unwrap();
+    let message_id = "message".to_string();
+    let kinds = [
+        EventKind::AssistantStarted {
+            message_id: message_id.clone(),
+        },
+        EventKind::AssistantFragment {
+            message_id: message_id.clone(),
+            ordinal: 0,
+        },
+        EventKind::AssistantFragment {
+            message_id: message_id.clone(),
+            ordinal: 1,
+        },
+        EventKind::ToolCall {
+            message_id: Some(message_id.clone()),
+            call_id: "call".into(),
+            tool_name: "read".into(),
+        },
+        EventKind::ToolResult {
+            call_id: "call".into(),
+            outcome: ToolOutcome::Succeeded,
+        },
+        EventKind::AssistantTerminal {
+            message_id,
+            status: MessageStatus::Completed,
+        },
+    ];
+    let mut pins = Vec::new();
+    for (index, kind) in kinds.into_iter().enumerate() {
+        let mut input = event_input("session-a", &index.to_string());
+        input.kind = kind;
+        pins.push(
+            log.append(OperationId::new(), input, b"event".as_slice())
+                .unwrap()
+                .pin,
+        );
+    }
+    log.retract(OperationId::new(), pins[1].clone()).unwrap();
+    for pin in pins {
+        assert!(matches!(
+            log.read_payload(&pin, 0, 100),
+            Err(ContextError::Unavailable(_))
+        ));
+    }
+}
+
+#[test]
+fn a_legacy_directory_resets_into_an_empty_store() {
+    use mmdb::store_format::{commit_reset, ResetPlan, ResetSafety, StoreEraId, StoreManifest};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap().join("legacy");
+    std::fs::create_dir(&root).unwrap();
+    let legacy = "mmdb-context-v1";
+    StoreManifest::new(legacy, StoreEraId::new())
+        .unwrap()
+        .write_new(&root)
+        .unwrap();
+    std::fs::write(root.join("old-data"), b"previous contents").unwrap();
+    let safety = ResetSafety::for_current_process(Vec::new()).unwrap();
+    let plan = ResetPlan::build(
+        std::slice::from_ref(&root),
+        legacy,
+        STORE_FORMAT_ID,
+        SystemTime::now(),
+        Duration::from_secs(60),
+        &safety,
+    )
+    .unwrap();
+    let receipt = commit_reset(&plan, plan.digest().as_str(), StoreEraId::new(), &[]).unwrap();
+    let store = Store::open(&root).unwrap();
+    let log = store.session_log(access("owner")).unwrap();
+    let context = store.context(access("owner")).unwrap();
+    assert!(log.sessions(10, None).unwrap().sessions.is_empty());
+    assert!(context
+        .query_current_valid(None, None, 10)
+        .unwrap()
+        .is_empty());
+    assert_eq!(context.availability_epoch().unwrap(), 0);
+    assert!(!root.join("old-data").exists());
+    assert_eq!(
+        std::fs::read(receipt.quarantine_path().join("old-data")).unwrap(),
+        b"previous contents"
+    );
+}
+
+#[test]
+fn session_log_and_context_reject_the_same_invalid_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::create(dir.path().join("store")).unwrap();
+    let mut empty_scopes = access("owner");
+    empty_scopes.scopes.clear();
+    let mut bad_parent = access("owner");
+    bad_parent.parent_run = Some("without-run".into());
+    for invalid in [access(" "), empty_scopes, bad_parent] {
+        let (Err(ContextError::InvalidInput(context)), Err(ContextError::InvalidInput(log))) =
+            (store.context(invalid.clone()), store.session_log(invalid))
+        else {
+            panic!("both handles must reject invalid access");
+        };
+        assert_eq!(context, log);
+    }
+}
+
+#[test]
+fn access_bound_to_a_session_appends_only_to_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::create(dir.path().join("store")).unwrap();
+    let mut profile = access("owner");
+    profile.session = Some("bound".into());
+    let log = store.session_log(profile).unwrap();
+    let id = OperationId::new();
+    assert!(matches!(
+        log.append(id, event_input("other", "event"), &b"text"[..]),
+        Err(ContextError::AccessDenied)
+    ));
+    assert_eq!(log.position("other").unwrap(), 0);
+    assert!(log.operation_receipt(id).unwrap().is_none());
+    let receipt = log
+        .append(id, event_input("bound", "event"), &b"text"[..])
+        .unwrap();
+    assert_eq!(receipt.sequence, Some(1));
+}
+
+#[test]
+fn log_permissions_follow_the_actor() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::create(dir.path().join("store")).unwrap();
+    for actor in [
+        Actor::User,
+        Actor::Assistant,
+        Actor::System,
+        Actor::Operator,
+    ] {
+        let owner = format!("{actor:?}");
+        let log = store
+            .session_log(ContextAccess::new(&owner, actor))
+            .unwrap();
+        let message = log.append(OperationId::new(), event_input("s", "user"), &b"said"[..]);
+        if actor == Actor::Assistant {
+            assert!(matches!(message, Err(ContextError::AccessDenied)));
+        } else {
+            message.unwrap();
+        }
+        let sessions = log.sessions(5, None);
+        if matches!(actor, Actor::System | Actor::Operator) {
+            assert_eq!(sessions.unwrap().sessions, ["s"]);
+        } else {
+            assert!(matches!(sessions, Err(ContextError::AccessDenied)));
+        }
+        let writer = store.session_log(access(&owner)).unwrap();
+        let first = source(&writer, "retract", "first");
+        let second = source(&writer, "purge", "second");
+        for result in [
+            log.retract(OperationId::new(), first),
+            log.purge(OperationId::new(), second),
+        ] {
+            if matches!(actor, Actor::User | Actor::Operator) {
+                result.unwrap();
+            } else {
+                assert!(matches!(result, Err(ContextError::AccessDenied)));
+            }
+        }
+    }
+}
+
+fn log_query() -> LogQuery {
+    LogQuery {
+        text: "hit".into(),
+        session: None,
+        cursor: None,
+        max_events: 4096,
+        max_bytes: 16 * 1024 * 1024,
+        limit: 100,
+    }
+}
+
+#[test]
+fn log_reads_and_searches_refuse_budgets_over_their_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::create(dir.path().join("store")).unwrap();
+    let log = store.session_log(access("owner")).unwrap();
+    let pin = source(&log, "event", "hit");
+    assert_eq!(
+        log.read_payload(&pin, 0, MAX_PAYLOAD_PAGE_BYTES)
+            .unwrap()
+            .bytes,
+        b"hit"
+    );
+    assert!(matches!(
+        log.read_payload(&pin, 0, MAX_PAYLOAD_PAGE_BYTES + 1),
+        Err(ContextError::InvalidInput(_))
+    ));
+    assert_eq!(log.search(log_query()).unwrap().matches.len(), 1);
+    for invalid in [
+        LogQuery {
+            max_events: 4097,
+            ..log_query()
+        },
+        LogQuery {
+            max_bytes: 16 * 1024 * 1024 + 1,
+            ..log_query()
+        },
+        LogQuery {
+            limit: 101,
+            ..log_query()
+        },
+    ] {
+        assert!(matches!(
+            log.search(invalid),
+            Err(ContextError::InvalidInput(_))
+        ));
+    }
+}
+
+#[test]
+fn search_walks_sessions_in_key_order_and_events_in_sequence() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::create(dir.path().join("store")).unwrap();
+    let log = store.session_log(access("owner")).unwrap();
+    for session in ["bb", "z", "aa", "z", "bb", "aa"] {
+        let seq = log.position(session).unwrap() + 1;
+        log.append(
+            OperationId::new(),
+            event_input(session, &seq.to_string()),
+            &b"hit"[..],
+        )
+        .unwrap();
+    }
+    let mut query = LogQuery {
+        limit: 1,
+        ..log_query()
+    };
+    let mut positions = Vec::new();
+    loop {
+        let page = log.search(query.clone()).unwrap();
+        assert_eq!(page.matches.len(), 1);
+        let entry = page
+            .matches
+            .into_iter()
+            .next()
+            .unwrap()
+            .header
+            .event
+            .unwrap();
+        positions.push((entry.session, entry.sequence));
+        if page.cursor.is_none() {
+            break;
+        }
+        query.cursor = page.cursor;
+        assert!(positions.len() < 6);
+    }
+    // Session keys contain a length prefix before the session bytes.
+    assert_eq!(
+        positions,
+        ["z", "aa", "bb"]
+            .into_iter()
+            .flat_map(|s| [(s.into(), 1), (s.into(), 2)])
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn recall_reaches_through_log_events_but_returns_memory_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::create(dir.path().join("store")).unwrap();
+    let log = store.session_log(access("owner")).unwrap();
+    let context = store.context(access("owner")).unwrap();
+    let event = source(&log, "event", "raw");
+    let ty = context
+        .define_type(OperationId::new(), definition("note"))
+        .unwrap()
+        .pin;
+    let a = context
+        .save_object(OperationId::new(), object(&ty, &event, "alpha"))
+        .unwrap()
+        .pin;
+    let b = context
+        .save_object(OperationId::new(), object(&ty, &event, "beta"))
+        .unwrap()
+        .pin;
+    let edge_type = context
+        .define_type(
+            OperationId::new(),
+            TypeDefinition {
+                name: "link".into(),
+                scope: Scope::Personal,
+                kind: TypeKind::Relation {
+                    from_types: vec![],
+                    to_types: vec![],
+                },
+                properties: BTreeMap::new(),
+            },
+        )
+        .unwrap()
+        .pin;
+    let edge = |from, to| {
+        context
+            .save_relation(OperationId::new(), relation(&edge_type, from, to, &event))
+            .unwrap()
+            .pin
+    };
+    let first = edge(&a, &event);
+    let second = edge(&event, &b);
+    for (seed, path) in [(&a, vec![first, second.clone()]), (&event, vec![second])] {
+        let found = context
+            .recall(ContextQuery {
+                seeds: vec![seed.record.clone()],
+                ..query("")
+            })
+            .unwrap();
+        assert!(found
+            .hits
+            .iter()
+            .all(|hit| hit.record.header.pin.record.kind.module() == StoreModule::Memory));
+        assert_eq!(
+            found
+                .hits
+                .iter()
+                .find(|hit| hit.record.header.pin == b)
+                .unwrap()
+                .path,
+            path
+        );
+    }
+}
+
+#[test]
+fn one_operation_id_names_one_write_across_the_log_and_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::create(dir.path().join("store")).unwrap();
+    let log = store.session_log(access("owner")).unwrap();
+    let context = store.context(access("owner")).unwrap();
+    let id = OperationId::new();
+    let receipt = log
+        .append(id, event_input("s", "first"), &b"text"[..])
+        .unwrap();
+    assert!(matches!(
+        context.define_type(id, definition("note")),
+        Err(ContextError::IdempotencyConflict)
+    ));
+    assert_eq!(context.operation_receipt(id).unwrap(), Some(receipt));
+    let id = OperationId::new();
+    let receipt = context.define_type(id, definition("note")).unwrap();
+    assert!(matches!(
+        log.append(id, event_input("s", "second"), &b"text"[..]),
+        Err(ContextError::IdempotencyConflict)
+    ));
+    assert_eq!(log.operation_receipt(id).unwrap(), Some(receipt));
+    assert_eq!(log.position("s").unwrap(), 1);
+}
+
+#[test]
+fn record_handles_reject_another_kind_before_checking_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::create(dir.path().join("store")).unwrap();
+    let log = store.session_log(access("owner")).unwrap();
+    let context = store.context(access("owner")).unwrap();
+    let event = source(&log, "event", "text");
+    let memory = context
+        .define_type(OperationId::new(), definition("note"))
+        .unwrap()
+        .pin;
+    let foreign = store.context(access("another-owner")).unwrap();
+    let foreign_log = store.session_log(access("another-owner")).unwrap();
+    for rejected in [
+        foreign.head(&event.record).map(|_| ()),
+        foreign.inspect_header(&event).map(|_| ()),
+        foreign.read(&event).map(|_| ()),
+        foreign.read_payload(&event, 0, 32).map(|_| ()),
+        foreign
+            .retract(OperationId::new(), event.clone())
+            .map(|_| ()),
+        foreign.purge(OperationId::new(), event.clone()).map(|_| ()),
+        foreign_log.head(&memory.record).map(|_| ()),
+        foreign_log.inspect_header(&memory).map(|_| ()),
+        foreign_log.read_payload(&memory, 0, 32).map(|_| ()),
+        foreign_log.read_checkpoint(&event).map(|_| ()),
+        foreign_log.read_checkpoint(&memory).map(|_| ()),
+        foreign_log
+            .retract(OperationId::new(), memory.clone())
+            .map(|_| ()),
+        foreign_log
+            .purge(OperationId::new(), memory.clone())
+            .map(|_| ()),
+    ] {
+        assert!(matches!(rejected, Err(ContextError::InvalidInput(_))));
+    }
+}
+
+fn reset_memory(store: &mut Store) -> mmdb::MemoryResetReceipt {
+    let plan = store
+        .plan_memory_reset(UNIX_EPOCH, Duration::from_secs(60))
+        .unwrap();
+    store
+        .reset_memory(&plan, plan.digest(), UNIX_EPOCH)
+        .unwrap()
+}
+
+fn checkpoint_input(scope: CheckpointScope, sequence: u64, epoch: u64) -> CheckpointInput {
+    CheckpointInput {
+        scope,
+        session: "session-a".into(),
+        run: "run".into(),
+        sequence,
+        expected_previous: None,
+        expected_availability_epoch: epoch,
+        sources: vec![],
+        payload: json!({"summary": "remember the task"}),
+    }
+}
+
+#[test]
+fn memory_reset_needs_the_exact_plan_digest() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("store");
+    let mut db = Store::create(&root).unwrap();
+    let old_memory = db.era(StoreModule::Memory);
+    let session = db.era(StoreModule::Session);
+    let plan = db
+        .plan_memory_reset(UNIX_EPOCH, Duration::from_secs(900))
+        .unwrap();
+    assert_eq!(plan.canonical_root(), root.canonicalize().unwrap());
+    assert_eq!(plan.memory_era(), old_memory);
+    assert_ne!(plan.new_memory_era(), old_memory);
+    assert_eq!(
+        (plan.issued_at_unix_ms(), plan.expires_at_unix_ms()),
+        (0, 900_000)
+    );
+    assert_eq!(plan.digest().len(), 64);
+    let other_plan = db
+        .plan_memory_reset(UNIX_EPOCH, Duration::from_secs(900))
+        .unwrap();
+    for digest in ["", &plan.digest()[..63], other_plan.digest()] {
+        assert!(matches!(
+            db.reset_memory(&plan, digest, UNIX_EPOCH),
+            Err(StoreError::ResetDigestMismatch)
+        ));
+        assert_eq!(db.era(StoreModule::Memory), old_memory);
+        assert_eq!(
+            db.context(access("owner"))
+                .unwrap()
+                .availability_epoch()
+                .unwrap(),
+            0
+        );
+    }
+    let receipt = db.reset_memory(&plan, plan.digest(), UNIX_EPOCH).unwrap();
+    assert_eq!(receipt.old_memory_era, old_memory);
+    assert_eq!(receipt.new_memory_era, plan.new_memory_era());
+    assert!(!receipt.cleanup_pending);
+    assert_eq!(db.era(StoreModule::Session), session);
+}
+
+#[test]
+fn memory_reset_refuses_a_plan_for_another_time_era_or_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("store");
+    let moved = dir.path().join("same-eras-elsewhere");
+    let mut db = Store::create(&root).unwrap();
+    let issued = UNIX_EPOCH + Duration::from_secs(10);
+    let ttl = Duration::from_millis(2);
+    assert!(matches!(
+        db.plan_memory_reset(issued, Duration::ZERO),
+        Err(StoreError::ResetPlanTtl)
+    ));
+    assert!(matches!(
+        db.plan_memory_reset(issued, Duration::from_secs(900) + Duration::from_nanos(1)),
+        Err(StoreError::ResetPlanTtl)
+    ));
+    let plan = db.plan_memory_reset(issued, ttl).unwrap();
+    let old = db.era(StoreModule::Memory);
+    assert!(matches!(
+        db.reset_memory(&plan, "", issued - Duration::from_millis(1)),
+        Err(StoreError::ResetPlanNotYetValid)
+    ));
+    assert!(matches!(
+        db.reset_memory(&plan, "", issued + ttl),
+        Err(StoreError::ResetPlanExpired)
+    ));
+    assert_eq!(db.era(StoreModule::Memory), old);
+    drop(db);
+    std::fs::rename(&root, &moved).unwrap();
+    let mut same_data = Store::open(&moved).unwrap();
+    assert_eq!(same_data.era(StoreModule::Memory), old);
+    assert!(matches!(
+        same_data.reset_memory(&plan, plan.digest(), issued),
+        Err(StoreError::ResetPlanForAnotherStore)
+    ));
+    assert_eq!(same_data.era(StoreModule::Memory), old);
+    drop(same_data);
+    std::fs::rename(moved, &root).unwrap();
+    let mut db = Store::open(&root).unwrap();
+    let other_plan = db.plan_memory_reset(issued, ttl).unwrap();
+    db.reset_memory(&plan, plan.digest(), issued + Duration::from_millis(1))
+        .unwrap();
+    assert!(matches!(
+        db.reset_memory(&other_plan, other_plan.digest(), issued),
+        Err(StoreError::StaleResetPlan)
+    ));
+    assert_eq!(db.era(StoreModule::Memory), plan.new_memory_era());
+    assert_eq!(
+        db.context(access("owner"))
+            .unwrap()
+            .availability_epoch()
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn memory_reset_keeps_the_session_log_and_hides_old_memory() {
+    use mmdb::native_memory::{
+        EvidenceClass, EvidenceLifecycle, NewEvidence, OperationContext, RecallQuery,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("store");
+    let mut db = Store::create(&root).unwrap();
+    let native_query = RecallQuery {
+        text: "native evidence".into(),
+        scopes: vec![Scope::Personal],
+        observed_from_ms: None,
+        observed_to_ms: None,
+        valid_at_ms: None,
+        limit: 10,
+    };
+    let evidence = db
+        .memory()
+        .capture_evidence(
+            OperationContext::new(Actor::User),
+            NewEvidence {
+                class: EvidenceClass::UserAssertion,
+                scope: Scope::Personal,
+                temporal: TemporalFacts::observed_at(10),
+                lifecycle: EvidenceLifecycle::Direct,
+                text: native_query.text.clone(),
+            },
+        )
+        .unwrap();
+    assert!(!db
+        .memory()
+        .recall(native_query.clone())
+        .unwrap()
+        .citations
+        .is_empty());
+    let ctx = db.context(access("owner")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
+    let original = source(&log, "original", "observation");
+    let type_pin = ctx
+        .define_type(OperationId::new(), definition("note"))
+        .unwrap()
+        .pin;
+    let first = ctx
+        .save_object(OperationId::new(), object(&type_pin, &original, "first"))
+        .unwrap()
+        .pin;
+    let second = ctx
+        .save_object(OperationId::new(), object(&type_pin, &original, "second"))
+        .unwrap()
+        .pin;
+    let edge_type = relation_type(&ctx, &type_pin);
+    let edge = ctx
+        .save_relation(
+            OperationId::new(),
+            relation(&edge_type, &first, &second, &original),
+        )
+        .unwrap()
+        .pin;
+    let action = ctx
+        .define_action(
+            OperationId::new(),
+            ActionDefinition {
+                name: "act".into(),
+                description: "Inspect a note".into(),
+                scope: Scope::Personal,
+                target_type: type_pin.clone(),
+                inputs: BTreeMap::new(),
+                preconditions: vec![],
+                sources: vec![original.clone()],
+            },
+        )
+        .unwrap()
+        .pin;
+    let execution = ctx
+        .prepare_action(
+            OperationId::new(),
+            ActionInvocation {
+                action: action.clone(),
+                target: first.clone(),
+                inputs: BTreeMap::new(),
+                sources: vec![],
+            },
+        )
+        .unwrap()
+        .pin;
+    let operation = OperationId::new();
+    let mut input = event_input("session-a", "copy");
+    input.sources = vec![first.clone()];
+    let copy = log
+        .append(operation, input, b"snapshot".as_slice())
+        .unwrap();
+    let epoch = ctx.availability_epoch().unwrap();
+    let checkpoint = |scope| {
+        log.save_checkpoint(OperationId::new(), checkpoint_input(scope, 2, epoch))
+            .unwrap()
+            .pin
+    };
+    let (session_cp, run_cp) = (
+        checkpoint(CheckpointScope::Session),
+        checkpoint(CheckpointScope::Run),
+    );
+    let retired = [type_pin, first, second, edge_type, edge, action, execution];
+    let reset = reset_memory(&mut db);
+    assert_eq!(db.memory().era_id(), reset.new_memory_era);
+    assert!(matches!(
+        db.context(access("owner")).unwrap().read(&retired[0]),
+        Err(ContextError::Reset(_))
+    ));
+    drop(db);
+    let db = Store::open(&root).unwrap();
+    assert_eq!(db.memory().era_id(), reset.new_memory_era);
+    assert!(db.memory().inspect_evidence(evidence.id).unwrap().is_none());
+    assert!(db
+        .memory()
+        .recall(native_query)
+        .unwrap()
+        .citations
+        .is_empty());
+    let ctx = db.context(access("owner")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
+    for pin in &retired {
+        assert!(matches!(ctx.read(pin), Err(ContextError::Reset(record)) if record == pin.record));
+    }
+    assert!(ctx.find_type(&Scope::Personal, "note").unwrap().is_none());
+    assert!(ctx.find_action(&Scope::Personal, "act").unwrap().is_none());
+    assert!(ctx.query_current_valid(None, None, 100).unwrap().is_empty());
+    assert_eq!(
+        log.events("session-a", 0, 10)
+            .unwrap()
+            .entries
+            .iter()
+            .map(|entry| &entry.pin)
+            .collect::<Vec<_>>(),
+        [&original, &copy.pin]
+    );
+    assert_eq!(
+        log.read_payload(&copy.pin, 0, 100).unwrap().bytes,
+        b"snapshot"
+    );
+    assert_eq!(log.operation_receipt(operation).unwrap(), Some(copy));
+    assert_eq!(
+        log.latest_checkpoint("session-a").unwrap().unwrap().pin,
+        session_cp
+    );
+    assert_eq!(
+        log.latest_run_checkpoint("session-a", "run")
+            .unwrap()
+            .unwrap()
+            .pin,
+        run_cp
+    );
+    for pin in [&session_cp, &run_cp] {
+        assert_eq!(
+            log.read_checkpoint(pin).unwrap().payload,
+            json!({"summary":"remember the task"})
+        );
+    }
+    assert_eq!(
+        log.append(
+            OperationId::new(),
+            event_input("session-a", "next"),
+            b"new".as_slice()
+        )
+        .unwrap()
+        .sequence,
+        Some(3)
+    );
+}
+
+#[test]
+fn log_events_that_copied_reset_memory_stay_readable_and_current() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Store::create(dir.path().join("store")).unwrap();
+    let ctx = db.context(access("owner")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
+    let anchor = source(&log, "raw", "raw");
+    let ty = ctx
+        .define_type(OperationId::new(), definition("note"))
+        .unwrap()
+        .pin;
+    let old = ctx
+        .save_object(OperationId::new(), object(&ty, &anchor, "text"))
+        .unwrap()
+        .pin;
+    let mut input = event_input("session-a", "copy");
+    // The shared retired source is a terminal on both edges.
+    input.sources = vec![old.clone(), old.clone()];
+    let copy = log
+        .append(OperationId::new(), input, b"copy".as_slice())
+        .unwrap()
+        .pin;
+    reset_memory(&mut db);
+    let ctx = db.context(access("owner")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
+    assert_eq!(log.read_payload(&copy, 0, 20).unwrap().bytes, b"copy");
+    ctx.validate_current(std::slice::from_ref(&copy), None)
+        .unwrap();
+    assert!(
+        matches!(ctx.validate_current(std::slice::from_ref(&old), None), Err(ContextError::Reset(record)) if record == old.record)
+    );
+    let ty = ctx
+        .define_type(OperationId::new(), definition("rebuild"))
+        .unwrap()
+        .pin;
+    let rebuilt = ctx
+        .save_object(OperationId::new(), object(&ty, &copy, "rebuilt"))
+        .unwrap()
+        .pin;
+    ctx.validate_current(&[rebuilt], None).unwrap();
+    assert!(
+        matches!(ctx.save_object(OperationId::new(), object(&ty, &old, "stale")), Err(ContextError::Reset(record)) if record == old.record)
+    );
+    let mut input = event_input("session-a", "after");
+    input.sources = vec![copy];
+    log.append(OperationId::new(), input.clone(), b"after".as_slice())
+        .unwrap();
+    input.event_id = "stale".into();
+    input.sources = vec![old.clone()];
+    assert!(
+        matches!(log.append(OperationId::new(), input, b"old".as_slice()), Err(ContextError::Reset(record)) if record == old.record)
+    );
+}
+
+#[test]
+fn checkpoints_saved_before_a_memory_reset_cannot_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Store::create(dir.path().join("store")).unwrap();
+    let mut checkpoints = Vec::new();
+    for owner in ["first", "second"] {
+        let log = db.session_log(access(owner)).unwrap();
+        source(&log, "original", "original");
+        let cp = log
+            .save_checkpoint(
+                OperationId::new(),
+                checkpoint_input(CheckpointScope::Session, 1, 0),
+            )
+            .unwrap()
+            .pin;
+        checkpoints.push((owner, cp));
+    }
+    reset_memory(&mut db);
+    let mut refreshed = Vec::new();
+    for (owner, cp) in checkpoints {
+        let log = db.session_log(access(owner)).unwrap();
+        let ctx = db.context(access(owner)).unwrap();
+        assert_eq!(ctx.availability_epoch().unwrap(), 1);
+        let saved = log.read_checkpoint(&cp).unwrap();
+        assert_eq!(saved.header.checkpoint.unwrap().sequence, 1);
+        assert_eq!(saved.payload, json!({"summary":"remember the task"}));
+        assert!(
+            matches!(ctx.validate_current(std::slice::from_ref(&cp), None), Err(ContextError::Unavailable(record)) if record == cp.record)
+        );
+        let mut fresh = checkpoint_input(CheckpointScope::Session, 1, 1);
+        fresh.expected_previous = Some(cp);
+        let fresh = log.save_checkpoint(OperationId::new(), fresh).unwrap();
+        ctx.validate_current(std::slice::from_ref(&fresh.pin), None)
+            .unwrap();
+        refreshed.push(fresh.pin);
+    }
+
+    // An erasure after the first reset uses the same clock as the checkpoints.
+    // The next reset must preserve that owner's redaction boundary.
+    let first = db
+        .session_log(ContextAccess::new("first", Actor::User))
+        .unwrap();
+    let private = source(&first, "private", "private");
+    first.purge(OperationId::new(), private).unwrap();
+    reset_memory(&mut db);
+    let first_ctx = db.context(access("first")).unwrap();
+    let second_ctx = db.context(access("second")).unwrap();
+    assert_eq!(first_ctx.availability_epoch().unwrap(), 3);
+    assert_eq!(second_ctx.availability_epoch().unwrap(), 2);
+    let first = db.session_log(access("first")).unwrap();
+    let second = db.session_log(access("second")).unwrap();
+    assert!(matches!(
+        first.read_checkpoint(&refreshed[0]),
+        Err(ContextError::Unavailable(_))
+    ));
+    assert!(second.read_checkpoint(&refreshed[1]).is_ok());
+}
+
+#[test]
+fn a_checkpoint_generated_before_a_memory_reset_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Store::create(dir.path().join("store")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
+    source(&log, "event", "before");
+    let epoch = db
+        .context(access("owner"))
+        .unwrap()
+        .availability_epoch()
+        .unwrap();
+    let pending = checkpoint_input(CheckpointScope::Run, 1, epoch);
+    reset_memory(&mut db);
+    let log = db.session_log(access("owner")).unwrap();
+    let op = OperationId::new();
+    assert!(matches!(
+        log.save_checkpoint(op, pending),
+        Err(ContextError::InvalidInput(_))
+    ));
+    assert!(log
+        .latest_run_checkpoint("session-a", "run")
+        .unwrap()
+        .is_none());
+    assert!(log.operation_receipt(op).unwrap().is_none());
+}
+
+#[test]
+fn a_log_retry_after_a_memory_reset_returns_the_original_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("store");
+    let mut db = Store::create(&root).unwrap();
+    let ctx = db.context(access("owner")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
+    let memory_op = OperationId::new();
+    let ty = ctx.define_type(memory_op, definition("old")).unwrap();
+    let op = OperationId::new();
+    let mut original = event_input("session-a", "copy");
+    original.expected_sequence = Some(0);
+    original.sources = vec![ty.pin.clone()];
+    let receipt = log
+        .append(op, original.clone(), b"copy".as_slice())
+        .unwrap();
+    source(&log, "later", "later");
+    reset_memory(&mut db);
+    drop(db);
+    let db = Store::open(&root).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
+    assert_eq!(
+        log.append(op, original.clone(), b"copy".as_slice())
+            .unwrap(),
+        receipt
+    );
+    let another = OperationId::new();
+    assert_eq!(
+        log.append(another, original.clone(), b"copy".as_slice())
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(log.operation_receipt(another).unwrap(), Some(receipt));
+    assert!(matches!(
+        log.append(op, original, b"changed".as_slice()),
+        Err(ContextError::IdempotencyConflict)
+    ));
+    assert_eq!(log.position("session-a").unwrap(), 2);
+    let ctx = db.context(access("owner")).unwrap();
+    assert!(
+        matches!(ctx.define_type(memory_op, definition("old")), Err(ContextError::Reset(record)) if record == ty.pin.record)
+    );
+    assert!(
+        matches!(ctx.operation_receipt(memory_op), Err(ContextError::Reset(record)) if record == ty.pin.record)
+    );
+}
+
+#[test]
+fn reset_purged_and_foreign_refs_fail_differently() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Store::create(dir.path().join("store")).unwrap();
+    let old = db
+        .context(access("owner"))
+        .unwrap()
+        .define_type(OperationId::new(), definition("old"))
+        .unwrap()
+        .pin;
+    reset_memory(&mut db);
+    let ctx = db
+        .context(ContextAccess::new("owner", Actor::User))
+        .unwrap();
+    let source = source(
+        &db.session_log(access("owner")).unwrap(),
+        "original",
+        "original",
+    );
+    let ty = ctx
+        .define_type(OperationId::new(), definition("new"))
+        .unwrap()
+        .pin;
+    let purged = ctx
+        .save_object(OperationId::new(), object(&ty, &source, "purge"))
+        .unwrap()
+        .pin;
+    ctx.purge(OperationId::new(), purged.clone()).unwrap();
+    assert!(
+        matches!(ctx.read(&purged), Err(ContextError::Unavailable(record)) if record == purged.record)
+    );
+    assert!(matches!(ctx.read(&old), Err(ContextError::Reset(record)) if record == old.record));
+    let other = db.context(access("other")).unwrap();
+    assert!(matches!(other.read(&old), Err(ContextError::AccessDenied)));
+    assert!(matches!(
+        other.read(&purged),
+        Err(ContextError::AccessDenied)
+    ));
+    let foreign = Store::create(dir.path().join("foreign")).unwrap();
+    assert!(matches!(
+        foreign.context(access("owner")).unwrap().read(&old),
+        Err(ContextError::AccessDenied)
+    ));
 }

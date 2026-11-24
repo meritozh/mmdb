@@ -2,11 +2,11 @@
 
 Status: shipped
 
-research harness 可以先保存一段观察，再定义「决策」对象和「支持」关系。trading harness 用同一 owner 重开库，就能找到决策、沿关系读取观察，并辨认哪些内容来自模型推断。日常召回使用整理过的记录，原始材料可以按引用展开。[可运行示例](../../crates/mmdb/examples/context_harness.rs)
+research harness 可以先保存一段观察，再定义「决策」对象和「支持」关系。trading harness 用同一 owner 重开存储，就能找到决策、沿关系读取观察，并辨认哪些内容来自模型推断。日常召回使用整理过的记录，原始材料可以按引用展开。[可运行示例](../../crates/mmdb/examples/context_harness.rs)
 
 ## 打开与共享
 
-用 `MemoryDatabase::create_context(path)` 创建新目录，用 `open_context(path)` 重开 `mmdb-context-v1`，再以 `context(ContextAccess::new(owner, actor))` 取得句柄。同一目录一次由一个数据库实例持有租约，同进程可共享实例。普通打开会拒绝错误格式。显式 reset 隔离旧目录并生成新 era，旧引用无法解析为新库中的记录。
+用 `Store::create(path)` 创建新存储，用 `Store::open(path)` 重开，再以 `store.context(ContextAccess::new(owner, actor))` 取得句柄。同一存储一次由一个实例持有租约，同进程可共享实例。普通打开会拒绝错误格式。领域上下文属于记忆模块：重置记忆时它换新 era，旧引用读作已重置，会话日志不受影响，见[连续会话日志与原文搜索](session-log.md)。整库重置隔离旧目录，所有模块换新 era。
 
 可信 harness 提供 owner、actor、允许的 scope 及来源 agent、session、run。默认范围是该 owner 的 `Personal`。不同 agent 和 session 可以共享这个范围内的资料；这两个身份用于追溯来源。MMDB 在读取、扩展关系和写入时检查权限范围。harness 负责鉴权、规划、工具执行与模型窗口选择。
 
@@ -19,7 +19,7 @@ research harness 可以先保存一段观察，再定义「决策」对象和「
 | `save_object`、`revise_object` | 校验必填与未知属性、类型、引用目标、来源及预期版本。属性支持文本、布尔、整数、有限数值、时间、记录引用和列表。保存时保留观察、推断或指示的身份。 |
 | `save_relation`、`revise_relation` | 关系有自己的类型版本、两端、有效时间与依据。写入校验端点，更新邻接和词项索引。 |
 | `head`、`inspect_header`、`read` | 稳定引用定位记录，固定版本用于审计。修订不会覆盖旧修订；清除来源后，派生载荷不可展开，记录头仍可解释原因。 |
-| `retract`、`purge` | 撤回改变当前可用性，清除传播到依赖载荷。旧版本更新及把自身直接或间接作为来源会被拒绝。 |
+| `retract`、`purge` | 撤回改变当前可用性，清除传播到依赖它的对象、关系和检查点载荷；日志事件写入后只读，不受影响。旧版本更新及把自身直接或间接作为来源会被拒绝。 |
 
 普通对象和关系写入需要 1 至 64 个可用来源。类型定义用于校验 schema，不能充当观察证据。只有 User 或 Operator 可以把内容标记为指示。观察和推断经校验即可参与召回；原生记忆的提案另有显式裁决流程。
 

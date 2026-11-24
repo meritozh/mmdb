@@ -1,7 +1,8 @@
 //! Independent, read-only acceptance of a real harness-created context store.
 //! Usage: cargo run -p mmdb --example inspect_context_quality -- STORE REPORT
 use mmdb::context::*;
-use mmdb::native_memory::{Actor, MemoryDatabase};
+use mmdb::Actor;
+use mmdb::Store;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -13,15 +14,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.next().is_some() {
         return Err("expected STORE REPORT".into());
     }
-    let database = MemoryDatabase::open_context(&path)?;
+    let database = Store::open(&path)?;
     let mut access = ContextAccess::new("local-user", Actor::System);
     access.agent = Some("independent-mmdb-quality-reader".into());
     access.session = Some("independent-quality-session".into());
+    let log = database.session_log(access.clone())?;
     let store = database.context(access)?;
+    let read_source = |pin: &RecordPin| -> ContextResult<()> {
+        match pin.record.kind {
+            RecordKind::Event => {
+                log.read_payload(pin, 0, MAX_PAYLOAD_PAGE_BYTES)?;
+            }
+            RecordKind::Checkpoint => {
+                log.read_checkpoint(pin)?;
+            }
+            _ => {
+                store.read(pin)?;
+            }
+        }
+        Ok(())
+    };
     let mut sessions = Vec::new();
     let mut after = None;
     loop {
-        let page = store.history_sessions(100, after.as_deref())?;
+        let page = log.sessions(100, after.as_deref())?;
         sessions.extend(page.sessions);
         after = page.next;
         if after.is_none() {
@@ -43,25 +59,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut runs = BTreeSet::new();
         let mut records = Vec::new();
         loop {
-            let page = store.history(&session, sequence, 100)?;
+            let page = log.events(&session, sequence, 100)?;
             if page.entries.is_empty() {
                 break;
             }
             for header in page.entries {
-                let history = header.history.as_ref().ok_or("missing history metadata")?;
-                if history.sequence != sequence + 1 || !event_ids.insert(history.event_id.clone()) {
-                    return Err("non-contiguous or duplicate history".into());
+                let event = header.event.as_ref().ok_or("missing event metadata")?;
+                if event.sequence != sequence + 1 || !event_ids.insert(event.event_id.clone()) {
+                    return Err("non-contiguous or duplicate session events".into());
                 }
-                sequence = history.sequence;
+                sequence = event.sequence;
                 agents.insert(header.provenance.agent.clone());
                 runs.insert(header.provenance.run.clone());
-                match &history.kind {
-                    HistoryKind::ToolCall { call_id, .. } => {
+                match &event.kind {
+                    EventKind::ToolCall { call_id, .. } => {
                         if calls.insert(call_id.clone(), header.pin.clone()).is_some() {
                             return Err("duplicate tool call".into());
                         }
                     }
-                    HistoryKind::ToolResult { call_id, .. }
+                    EventKind::ToolResult { call_id, .. }
                         if !calls.contains_key(call_id) || !results.insert(call_id.clone()) =>
                     {
                         return Err("orphan or duplicate tool result".into());
@@ -72,7 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut hash = blake3::Hasher::new();
                 let mut read_bytes = 0u64;
                 loop {
-                    let payload = store.read_payload(&header.pin, offset, 65536)?;
+                    let payload = log.read_payload(&header.pin, offset, 65536)?;
                     hash.update(&payload.bytes);
                     read_bytes += payload.bytes.len() as u64;
                     total_bytes += payload.bytes.len() as u64;
@@ -89,7 +105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Err("original payload length mismatch".into());
                 }
                 for source in &header.sources {
-                    store.read(source)?;
+                    read_source(source)?;
                 }
                 total_events += 1;
                 if total_events > 100_000 || total_bytes > 1024 * 1024 * 1024 {
@@ -101,7 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if calls.len() != results.len() {
             return Err(format!("session {session} has unresolved tool calls").into());
         }
-        let checkpoint = store.latest_checkpoint(&session)?;
+        let checkpoint = log.latest_checkpoint(&session)?;
         let mut checkpoints = Vec::new();
         let mut cursor = checkpoint.clone();
         let mut expected_window = None;
@@ -120,7 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cursor = metadata
                 .previous
                 .as_ref()
-                .map(|pin| store.inspect_header(pin))
+                .map(|pin| log.inspect_header(pin))
                 .transpose()?;
             checkpoints.push(header);
         }
@@ -144,7 +160,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for hit in &recalled.hits {
         store.read(&hit.record.header.pin)?;
         for source in &hit.record.header.sources {
-            store.read(source)?;
+            read_source(source)?;
         }
     }
     let foreign = database.context(ContextAccess::new("other-owner", Actor::System))?;
