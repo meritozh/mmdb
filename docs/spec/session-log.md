@@ -711,15 +711,14 @@ reconcile_runtime_memory_era(&runtime, &receipt.new_memory_era.to_string())?;
    - After: 4, 5. Check: `cargo test --workspace --locked`
 7. 让原生记忆和领域上下文经由内核打开。
    - `MemoryDatabase` 的四个打开函数改走 `Kernel`，只有一个 `memory` 模块，内部经 `MemoryDatabase::on_era` 打开。
-   - 原生元数据分区交给内核。
+   - 原生元数据分区交给内核。原生记忆和上下文里直接使用摘要密钥的地方（`blake3::keyed_hash`、`Hasher::new_keyed`）一起改用 `Kernel::keyed_hasher`，每种用途取一个固定的 domain 名；摘要值因此改变，由本步的新格式 ID 隔开。
    - 格式改为 `mmdb-context-dev7` 和 `mmdb-native-memory-dev7`，同步原生测试里的格式断言。
-   - `native_memory`、`context`、`entity`、`extraction` 里的 fjall 类型全部换成内核类型。crate 内部测试里直接写分区的地方（注入损坏、模拟旧写入者）改用 `Batch`。
+   - `native_memory`、`context`、`entity`、`extraction` 里的 fjall 类型全部换成内核类型；`MemoryError` 与 `ContextError` 中包住 fjall 错误的变体改为包住 `KernelError`。crate 内部测试里直接写分区的地方（注入损坏、模拟旧写入者）改用 `Batch`。
    - After: 6. Check: `cargo test --workspace --locked`
 8. 从领域上下文抽出记录层，只重构。
    - 新增 `records::{Records, RecordTable, Scoped, Gate, Availability, StreamedPayload, HeadPage}`，此时仍只有一张表。
    - 日志与检查点的可读规则放到 `Gate` 后面，按 `kind.module()` 选择要检查的记录；实现暂时留在 `context`。
    - 列表和当前查询改用 `scan_heads`，追加改用 `stream_payload` 与 `publish`。
-   - 上下文和原生记忆的摘要改用 `keyed_hasher`。
    - `Scoped` 持有自己的 `ContextAccess`。
    - After: 7. Check: `cargo test --workspace --locked`
 9. 加入带两个模块的 `Store`。
