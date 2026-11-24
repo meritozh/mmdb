@@ -11,6 +11,5 @@ harness 在切换窗口或恢复中断任务时，用检查点定位同一 sessi
 | 来源普通修订 | 可用性 epoch 推进，旧检查点不能用于当前恢复。旧 pin 的载荷仍可用于核对已经发生的操作。 |
 | 记录清除或日志事件撤回 | 脱敏 epoch 同批次推进，较早检查点的日志载荷也不可再读，覆盖未逐项列出的摘要输入。 |
 | 重置记忆 | 重置前保存的检查点不能用于当前恢复，载荷和日志位置仍可读，harness 从该位置重新生成。 |
-| 旧 writer 缺少匹配的脱敏 marker | 按当前可用性 epoch 保守处理，避免重新暴露旧摘要。 |
 
 [检查点实现](../../crates/mmdb/src/session/checkpoints.rs) · [会话与子运行重开测试](../../crates/mmdb/tests/context_contract.rs)
