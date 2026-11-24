@@ -437,6 +437,19 @@ fn module_reset_refuses_a_current_or_retired_era() {
 }
 
 #[test]
+fn an_unregistered_module_has_no_known_era_and_cannot_be_reset() {
+    const OTHER: ModuleId = ModuleId("other");
+    let parent = tempfile::tempdir().unwrap();
+    let kernel = create(&parent.path().join("store"));
+    let era = kernel.era(SESSION);
+    assert_eq!(kernel.era_state(OTHER, era), EraState::Unknown);
+    assert!(matches!(
+        kernel.prepare_module_reset(OTHER, EraId::new()),
+        Err(KernelError::UnknownModule("other"))
+    ));
+}
+
+#[test]
 fn a_batch_refuses_partitions_of_a_stale_era() {
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("store");

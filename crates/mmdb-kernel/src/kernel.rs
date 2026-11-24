@@ -76,6 +76,8 @@ pub enum KernelError {
     Corrupt(String),
     #[error("invalid module specification: {0}")]
     InvalidModuleSpec(String),
+    #[error("unknown module {0}")]
+    UnknownModule(&'static str),
     #[error("unknown partition {module}.{name}")]
     UnknownPartition {
         module: &'static str,
@@ -295,7 +297,7 @@ impl ModuleEras {
     }
 
     fn state(&self, module: ModuleId, era: EraId) -> EraState {
-        if self.current[module.0] == era {
+        if self.current.get(module.0) == Some(&era) {
             EraState::Current
         } else if self.retired.contains(&(module, era)) {
             EraState::Retired
@@ -401,14 +403,24 @@ impl Kernel {
         &self.0.store_era
     }
 
+    /// # Panics
+    ///
+    /// When `module` is not one of the kernel's module specifications.
     pub fn era(&self, module: ModuleId) -> EraId {
-        self.0.eras.read().current[module.0]
+        let eras = self.0.eras.read();
+        let Some(&era) = eras.current.get(module.0) else {
+            panic!("module {} is not registered with this kernel", module.0);
+        };
+        era
     }
 
     pub fn era_state(&self, module: ModuleId, era: EraId) -> EraState {
         self.0.eras.read().state(module, era)
     }
 
+    /// # Panics
+    ///
+    /// When `module` is not one of the kernel's module specifications.
     pub fn module(&self, module: ModuleId) -> EraPartitions {
         EraPartitions {
             kernel: self.clone(),
@@ -446,6 +458,9 @@ impl Kernel {
     ) -> KernelResult<EraPartitions> {
         let eras = self.0.eras.read();
         eras.ensure_usable()?;
+        if !self.0.schema.0.contains_key(module.0) {
+            return Err(KernelError::UnknownModule(module.0));
+        }
         eras.ensure_new(module, new_era)?;
         self.0
             .schema
