@@ -87,8 +87,8 @@ impl AuditStore {
         let (lo, hi) = tenant_range(tenant);
         let mut records = Vec::new();
         for item in self.records.range(lo..hi) {
-            let (_, value) = item
-                .into_inner()
+            let value = item
+                .value()
                 .map_err(|e| Error::Storage(e.to_string()))?;
             let record: AuditRecord = serde_json::from_slice(&value)?;
             if filter

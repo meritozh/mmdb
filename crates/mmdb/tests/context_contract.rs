@@ -951,7 +951,7 @@ fn incomplete_uploads_never_advance_history_and_can_be_cleaned() {
                 operation,
                 event_input("session", "interrupted"),
                 FailingReader {
-                    remaining: PAYLOAD_CHUNK_BYTES + 5
+                    remaining: PAYLOAD_CHUNK_BYTES * 3 + 5
                 }
             ),
             Err(ContextError::Io(_))
@@ -964,9 +964,18 @@ fn incomplete_uploads_never_advance_history_and_can_be_cleaned() {
     assert!(log.events("session", 0, 10).unwrap().entries.is_empty());
     let context = db.context(access("owner")).unwrap();
     assert_eq!(context.recover_payloads(10, 10).unwrap().chunks_removed, 0);
-    let report = log.recover_payloads(10, 10).unwrap();
+    let first = log.recover_payloads(2, 1).unwrap();
+    assert_eq!((first.chunks_removed, first.uploads_removed), (2, 0));
+    assert!(first.more);
+    let report = log.recover_payloads(2, 1).unwrap();
+    assert!(!report.more);
     assert_eq!(report.chunks_removed, 1);
     assert_eq!(report.uploads_removed, 1);
+    let empty = log.recover_payloads(2, 1).unwrap();
+    assert_eq!(
+        (empty.chunks_removed, empty.uploads_removed, empty.more),
+        (0, 0, false)
+    );
     assert_eq!(
         log.append(
             operation,

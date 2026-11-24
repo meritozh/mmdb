@@ -1,5 +1,7 @@
 use super::*;
 
+mod payload_layout;
+
 const SESSION: ModuleId = ModuleId("session");
 const MEMORY: ModuleId = ModuleId("memory");
 const MODULES: &[ModuleSpec] = &[
@@ -445,6 +447,105 @@ fn an_unregistered_module_has_no_known_era_and_cannot_be_reset() {
 }
 
 #[test]
+fn key_scans_report_a_retired_era_once_in_either_direction() {
+    let parent = tempfile::tempdir().unwrap();
+    let kernel = create(&parent.path().join("store"));
+    let memory = kernel.module(MEMORY);
+    let entries = memory.partition("entries").unwrap();
+    let mut batch = kernel.batch();
+    for key in ["a1", "a2", "a3", "b1"] {
+        batch.insert(&entries, key, "body");
+    }
+    batch.commit().unwrap();
+    let mut forward = entries.prefix_keys("a");
+    let mut reverse = entries.prefix_keys("a").rev();
+    assert_eq!(&*forward.next().unwrap().unwrap(), b"a1");
+    assert_eq!(&*reverse.next().unwrap().unwrap(), b"a3");
+    let prepared = kernel.prepare_module_reset(MEMORY, EraId::new()).unwrap();
+    kernel
+        .commit_module_reset(prepared, kernel.batch())
+        .unwrap();
+    for result in [forward.next(), reverse.next()] {
+        assert!(
+            matches!(result, Some(Err(KernelError::StaleEra { era, .. })) if era == memory.era())
+        );
+    }
+    assert!(forward.next_back().is_none());
+    assert!(reverse.next_back().is_none());
+}
+
+#[test]
+fn flushed_chunk_keys_remain_readable_when_separated_values_fail() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("store");
+    let rows = [8191, 8192, 8193, 32768].map(|len| vec![len as u8; len]);
+    let kernel = create(&root);
+    let entries = kernel.module(MEMORY).partition("entries").unwrap();
+    let mut batch = kernel.batch();
+    for (id, value) in rows.iter().enumerate() {
+        batch.insert(&entries, [b'p', id as u8], value);
+    }
+    batch.commit().unwrap();
+    entries.raw.rotate_memtable_and_wait().unwrap();
+    assert!(entries.raw.blob_file_count() > 0);
+    drop((entries, kernel));
+
+    let entries = open(&root)
+        .unwrap()
+        .module(MEMORY)
+        .partition("entries")
+        .unwrap();
+    for (id, value) in rows.iter().enumerate() {
+        assert_eq!(
+            entries.get([b'p', id as u8]).unwrap().as_deref(),
+            Some(value.as_slice())
+        );
+    }
+    drop(entries);
+
+    // Reopen with an empty engine cache, then inject an I/O failure only
+    // into this fixture's value files. The index and inline tail stay intact.
+    let entries = open(&root)
+        .unwrap()
+        .module(MEMORY)
+        .partition("entries")
+        .unwrap();
+    for file in fs::read_dir(entries.raw.path().join("blobs")).unwrap() {
+        let file = file.unwrap();
+        if file.file_type().unwrap().is_file() {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(file.path())
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        entries.get([b'p', 0]).unwrap().as_deref(),
+        Some(rows[0].as_slice())
+    );
+    let keys = [[b'p', 0], [b'p', 1], [b'p', 2], [b'p', 3]];
+    let forward: Vec<_> = entries
+        .prefix_keys(b"p")
+        .map(|row| row.unwrap().to_vec())
+        .collect();
+    assert_eq!(forward, keys);
+    let reverse: Vec<_> = entries
+        .prefix_keys(b"p")
+        .rev()
+        .map(|row| row.unwrap().to_vec())
+        .collect();
+    assert_eq!(reverse, keys.into_iter().rev().collect::<Vec<_>>());
+    let mut pairs = entries.prefix(b"p");
+    assert!(matches!(
+        pairs.next_back(),
+        Some(Err(KernelError::Storage(_)))
+    ));
+    assert!(pairs.next().is_none());
+}
+
+#[test]
 fn a_batch_refuses_partitions_of_a_stale_era() {
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("store");
@@ -492,6 +593,7 @@ fn an_unknown_reset_outcome_poisons_the_kernel() {
         let mut batch = kernel.batch();
         batch.insert(&receipts, "reset", "done");
         let mut pending_read = receipts.iter();
+        let mut pending_keys = receipts.prefix_keys("reset");
         let digest = kernel.keyed_hasher("test").finalize();
         *kernel.0.reset_fault.lock() = Some(if applied {
             ResetFault::LostCommitAck
@@ -522,6 +624,11 @@ fn an_unknown_reset_outcome_poisons_the_kernel() {
         ));
         assert!(pending_read.next_back().is_none());
         assert!(matches!(
+            pending_keys.next_back(),
+            Some(Err(KernelError::Poisoned))
+        ));
+        assert!(pending_keys.next().is_none());
+        assert!(matches!(
             receipts.iter().next(),
             Some(Err(KernelError::Poisoned))
         ));
@@ -546,7 +653,7 @@ fn an_unknown_reset_outcome_poisons_the_kernel() {
             Err(KernelError::Poisoned)
         ));
         let old = memory.era();
-        drop(pending_read);
+        drop((pending_read, pending_keys));
         drop((kernel, receipts, memory));
 
         let kernel = open(&root).unwrap();

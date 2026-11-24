@@ -4543,8 +4543,8 @@ impl MemoryDatabase {
     ) -> MemoryResult<Vec<ProposalRevisionHeader>> {
         let limit = limit.min(MAX_OPERATOR_LIST_LIMIT);
         let mut proposals = Vec::with_capacity(limit);
-        for item in self.pending_proposals.iter().rev().take(limit) {
-            let (key, _) = item?;
+        for item in self.pending_proposals.prefix_keys([]).rev().take(limit) {
+            let key = item?;
             let id = ProposalId(ulid_from_id_key(&key)?);
             let proposal = self.inspect_proposal(id)?.ok_or_else(|| {
                 MemoryError::Corrupt(format!("pending proposal index points to missing {id}"))
@@ -4570,8 +4570,8 @@ impl MemoryDatabase {
     ) -> MemoryResult<Vec<ProposalRevisionHeader>> {
         let limit = limit.min(MAX_OPERATOR_LIST_LIMIT);
         let mut proposals = Vec::with_capacity(limit);
-        for item in self.awaiting_adjudication.iter().rev().take(limit) {
-            let (key, _) = item?;
+        for item in self.awaiting_adjudication.prefix_keys([]).rev().take(limit) {
+            let key = item?;
             let id = ProposalId(ulid_from_id_key(&key)?);
             let proposal = self.inspect_proposal(id)?.ok_or_else(|| {
                 MemoryError::Corrupt(format!(
@@ -6102,8 +6102,8 @@ impl MemoryDatabase {
             return Ok(Vec::new());
         }
         let mut events = Vec::new();
-        for item in self.audit.iter() {
-            let (_, value) = item?;
+        for item in self.audit.prefix_values([]) {
+            let value = item?;
             events.push(decode(&value)?);
             if events.len() == limit {
                 break;
@@ -6365,8 +6365,8 @@ impl MemoryDatabase {
         let mut upper = prefix.clone();
         upper.push(0xff);
         let mut records = Vec::new();
-        for item in self.lexical_postings.range(prefix.clone()..upper) {
-            let (key, _) = item?;
+        for item in self.lexical_postings.range_keys(prefix.clone()..upper) {
+            let key = item?;
             if key.len() != prefix.len() + 17 {
                 return Err(MemoryError::Corrupt("invalid lexical posting key".into()));
             }
@@ -6396,8 +6396,8 @@ impl MemoryDatabase {
             .map(|to| ordered_time(to).to_be_bytes().to_vec())
             .unwrap_or_else(|| vec![0xff; 26]);
         let mut records = Vec::new();
-        for item in self.time_index.range(lower..upper).rev() {
-            let (key, _) = item?;
+        for item in self.time_index.range_keys(lower..upper).rev() {
+            let key = item?;
             if key.len() != 25 {
                 return Err(MemoryError::Corrupt("invalid observed-time key".into()));
             }
@@ -6618,9 +6618,9 @@ impl MemoryDatabase {
             upper.push(0xff);
             for item in self
                 .activation_traces_by_record
-                .range(prefix.clone()..upper)
+                .range_keys(prefix.clone()..upper)
             {
-                let (key, _) = item?;
+                let key = item?;
                 if key.len() != prefix.len() + 16 {
                     return Err(MemoryError::Corrupt(
                         "invalid activation-trace record dependency key".into(),
@@ -6644,8 +6644,8 @@ impl MemoryDatabase {
             let prefix = record_key(*record);
             let mut upper = prefix.clone();
             upper.push(0xff);
-            for item in self.relation_signals_by_record.range(prefix.clone()..upper) {
-                let (key, _) = item?;
+            for item in self.relation_signals_by_record.range_keys(prefix.clone()..upper) {
+                let key = item?;
                 if key.len() != prefix.len() + 16 {
                     return Err(MemoryError::Corrupt(
                         "invalid relation-signal record dependency key".into(),
@@ -6699,8 +6699,8 @@ impl MemoryDatabase {
             let prefix = record_key(source);
             let mut upper = prefix.clone();
             upper.push(0xff);
-            for item in self.dependencies.range(prefix.clone()..upper) {
-                let (key, _) = item?;
+            for item in self.dependencies.range_keys(prefix.clone()..upper) {
+                let key = item?;
                 if key.len() != prefix.len() + 17 {
                     return Err(MemoryError::Corrupt("invalid dependency key".into()));
                 }
@@ -6790,8 +6790,8 @@ impl MemoryDatabase {
         let mut upper = prefix.clone();
         upper.push(0xff);
         let mut pins = Vec::new();
-        for item in index.range(prefix.clone()..upper) {
-            let (key, _) = item?;
+        for item in index.range_keys(prefix.clone()..upper) {
+            let key = item?;
             if key.len() != prefix.len() + 16 {
                 return Err(MemoryError::Corrupt(
                     "invalid relation-signal owner dependency key".into(),
@@ -6829,8 +6829,8 @@ impl MemoryDatabase {
         let mut upper = prefix.clone();
         upper.push(0xff);
         let mut ids = Vec::new();
-        for item in index.range(prefix.clone()..upper) {
-            let (key, _) = item?;
+        for item in index.range_keys(prefix.clone()..upper) {
+            let key = item?;
             if key.len() != prefix.len() + 16 {
                 return Err(MemoryError::Corrupt(
                     "invalid activation-trace owner dependency key".into(),

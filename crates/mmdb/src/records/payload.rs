@@ -226,12 +226,12 @@ impl Scoped<'_> {
             let remaining = max_chunks - report.chunks_removed;
             let mut batch = self.records.kernel.batch();
             let mut complete = true;
-            for (seen, chunk) in table.payloads.prefix(prefix).enumerate() {
+            for (seen, chunk) in table.payloads.prefix_keys(prefix).enumerate() {
+                let chunk_key = chunk?;
                 if seen == remaining {
                     complete = false;
                     break;
                 }
-                let (chunk_key, _) = chunk?;
                 batch.remove(&table.payloads, chunk_key);
                 report.chunks_removed += 1;
             }

@@ -10,6 +10,7 @@ use serde_json::Value;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
+use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::Path;
 
 const PART_STATE: &str = "app_state_v1";
@@ -317,29 +318,21 @@ impl StateStore {
         let after_storage = after_exclusive
             .map(|cursor| state_key(self.tenant, namespace, cursor))
             .transpose()?;
-        let start = after_storage
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| storage_prefix.clone());
+        let start = match after_storage.as_deref() {
+            Some(cursor) => Excluded(cursor),
+            None => Included(storage_prefix.as_slice()),
+        };
 
         let mut page = StatePage {
             entries: Vec::new(),
             next_after: None,
             examined: 0,
         };
-        for item in self.partition.range(start..) {
+        for item in self.partition.range::<&[u8], _>((start, Unbounded)) {
             let (key, value) = item
-                .into_inner()
+                .into_inner_if(|key| key.starts_with(&storage_prefix))
                 .map_err(|error| Error::Storage(error.to_string()))?;
-            if !key.starts_with(&storage_prefix) {
-                break;
-            }
-            if after_storage
-                .as_ref()
-                .is_some_and(|cursor| key.as_ref() <= cursor.as_slice())
-            {
-                continue;
-            }
+            let Some(value) = value else { break };
             page.examined += 1;
             let stored: StoredValue = serde_json::from_slice(&value)?;
             let logical_key = key[namespace_prefix.len()..].to_vec();

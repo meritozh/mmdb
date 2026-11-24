@@ -307,16 +307,16 @@ impl ContextStore<'_> {
         }
         'postings: for term in terms(&query.text) {
             for scope in &self.scoped.access().scopes {
-                for item in self.parts.postings.prefix(posting_prefix(
+                for item in self.parts.postings.prefix_values(posting_prefix(
                     &self.scoped.access().owner,
                     scope,
                     self.scoped.content_digest(term.as_bytes()),
                 )?) {
+                    let value = item?;
                     if candidates_examined >= budget.max_candidates {
                         truncated = true;
                         break 'postings;
                     }
-                    let (_, value) = item?;
                     let pin: RecordPin = decode(&value)?;
                     candidates_examined += 1;
                     if self
@@ -347,12 +347,12 @@ impl ContextStore<'_> {
             if path.len() >= budget.max_depth {
                 continue;
             }
-            for item in self.parts.adjacency.prefix(record_key(&reference)) {
+            for item in self.parts.adjacency.prefix_values(record_key(&reference)) {
+                let bytes = item?;
                 if edges_examined == budget.max_edges {
                     truncated = true;
                     break 'expand;
                 }
-                let (_, bytes) = item?;
                 edges_examined += 1;
                 let edge: RecordPin = decode(&bytes)?;
                 let Some(edge_header) =

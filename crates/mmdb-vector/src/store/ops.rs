@@ -247,7 +247,7 @@ impl VectorStore {
         let (lo, hi) = meta_range_bytes(tenant, model);
         let mut count = 0;
         for kv in self.meta.range(lo..hi) {
-            kv.into_inner().map_err(|e| Error::Storage(e.to_string()))?;
+            kv.key().map_err(|e| Error::Storage(e.to_string()))?;
             count += 1;
             if count >= stop_after {
                 break;
