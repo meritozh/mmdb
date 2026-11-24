@@ -92,7 +92,9 @@ pub use records::{
     MAX_ACCESS_SCOPES, MAX_CONTEXT_NAME_BYTES, MAX_CONTEXT_SOURCES, MAX_PAYLOAD_PAGE_BYTES,
     MAX_RECORD_BYTES, PAYLOAD_CHUNK_BYTES,
 };
-pub use store::{Store, StoreError, StoreResult, STORE_FORMAT_ID};
+pub use store::{
+    MemoryResetPlan, MemoryResetReceipt, Store, StoreError, StoreResult, STORE_FORMAT_ID,
+};
 #[cfg(test)]
 mod tests;
 

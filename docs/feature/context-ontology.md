@@ -1,6 +1,6 @@
 # 有来源的领域对象、关系与召回
 
-Status: decided
+Status: shipped
 
 research harness 可以先保存一段观察，再定义「决策」对象和「支持」关系。trading harness 用同一 owner 重开存储，就能找到决策、沿关系读取观察，并辨认哪些内容来自模型推断。日常召回使用整理过的记录，原始材料可以按引用展开。[可运行示例](../../crates/mmdb/examples/context_harness.rs)
 

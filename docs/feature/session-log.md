@@ -2,7 +2,7 @@
 
 可信 harness 把一个会话的用户消息、assistant 消息、工具调用与结果和通知按序追加到会话日志，之后可以翻页、搜索原文、固定版本并作为新对象的来源。即使 agent 当时没有整理某段交互，重置记忆后这段日志仍完整可读。
 
-Status: decided
+Status: shipped
 
 ## Behavior
 
@@ -83,4 +83,4 @@ Status: decided
 - 读取输入流期间释放写锁。
 - 迁移旧格式的数据。
 
-[日志读写](../../crates/mmdb/src/context/history.rs) · [搜索](../../crates/mmdb/src/context/search.rs) · [大载荷、中断与重开测试](../../crates/mmdb/tests/context_contract.rs)
+[日志读写](../../crates/mmdb/src/session/history.rs) · [搜索](../../crates/mmdb/src/session/search.rs) · [大载荷、中断与重开测试](../../crates/mmdb/tests/context_contract.rs)

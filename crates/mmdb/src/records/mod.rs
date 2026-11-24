@@ -123,6 +123,15 @@ pub enum StoreModule {
     Memory,
 }
 
+impl StoreModule {
+    pub(crate) const fn id(self) -> mmdb_kernel::ModuleId {
+        match self {
+            Self::Session => mmdb_kernel::ModuleId("session"),
+            Self::Memory => mmdb_kernel::ModuleId("memory"),
+        }
+    }
+}
+
 impl RecordKind {
     pub(crate) fn require_module(self, module: StoreModule) -> ContextResult<()> {
         if self.module() != module {

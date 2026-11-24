@@ -3,97 +3,82 @@ use super::*;
 use crate::OperationId;
 use mmdb_kernel::Batch;
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct CheckpointVisibility {
-    availability_epoch: u64,
-    redaction_epoch: u64,
+// Owner keys begin with a four-byte length. This store-wide key is disjoint
+// from every valid owner prefix.
+const MEMORY_RESETS: &[u8] = b"memory-resets";
+
+impl Records {
+    fn counter(&self, key: impl AsRef<[u8]>) -> ContextResult<u64> {
+        self.lifecycle
+            .get(key)?
+            .map(|bytes| decode(&bytes))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+
+    pub(crate) fn count_memory_reset(&self, batch: &mut Batch) -> ContextResult<()> {
+        let resets = self
+            .counter(MEMORY_RESETS)?
+            .checked_add(1)
+            .ok_or(ContextError::BudgetExceeded)?;
+        batch.insert(&self.lifecycle, MEMORY_RESETS, encode(&resets)?);
+        Ok(())
+    }
 }
 
 impl Scoped<'_> {
     pub(crate) fn availability_locked(&self) -> ContextResult<Availability> {
         let epoch = self.availability_epoch_locked()?;
+        let redaction_epoch = self.records.counter(self.checkpoint_redaction_key())?;
+        if redaction_epoch > epoch {
+            return Err(ContextError::Corrupt(
+                "checkpoint redaction epoch exceeds current epoch".into(),
+            ));
+        }
         Ok(Availability {
             epoch,
-            redaction_epoch: self.redaction_epoch_at(epoch)?,
+            redaction_epoch,
         })
     }
+
     pub(crate) fn availability_epoch_locked(&self) -> ContextResult<u64> {
-        self.records
-            .lifecycle
-            .get(owner_key(&self.access().owner))?
-            .map(|bytes| decode(&bytes))
-            .transpose()
-            .map(|epoch| epoch.unwrap_or(0))
+        let local = self.records.counter(owner_key(&self.access().owner))?;
+        self.effective_epoch(local)
     }
 
-    pub(crate) fn checkpoint_redaction_key(&self) -> Vec<u8> {
+    fn effective_epoch(&self, local: u64) -> ContextResult<u64> {
+        local
+            .checked_add(self.records.counter(MEMORY_RESETS)?)
+            .ok_or(ContextError::BudgetExceeded)
+    }
+
+    fn checkpoint_redaction_key(&self) -> Vec<u8> {
         let mut key = owner_key(&self.access().owner);
         key.extend_from_slice(b"checkpoint-redaction");
         key
     }
 
-    /// Old stores did not distinguish corrections from erasure. Their current
-    /// epoch is the conservative baseline: never revive an older summary whose
-    /// unlisted input may already have been purged by an older writer.
-    pub(crate) fn checkpoint_redaction_epoch_locked(&self) -> ContextResult<u64> {
-        self.redaction_epoch_at(self.availability_epoch_locked()?)
-    }
-
-    fn redaction_epoch_at(&self, current: u64) -> ContextResult<u64> {
-        let tracked = self
+    pub(crate) fn advance_epoch(&self, batch: &mut Batch) -> ContextResult<u64> {
+        let key = owner_key(&self.access().owner);
+        let local = self
             .records
-            .lifecycle
-            .get(self.checkpoint_redaction_key())?
-            .map(|bytes| decode::<CheckpointVisibility>(&bytes))
-            .transpose()?;
-        match tracked {
-            Some(tracked) if tracked.availability_epoch == current => {
-                if tracked.redaction_epoch > current {
-                    return Err(ContextError::Corrupt(
-                        "checkpoint redaction epoch exceeds current epoch".into(),
-                    ));
-                }
-                Ok(tracked.redaction_epoch)
-            }
-            // An older writer can advance the original epoch without updating
-            // this marker. Treat that gap as possible erasure, never as a safe
-            // correction merely because a marker already exists.
-            _ => Ok(current),
-        }
-    }
-
-    pub(crate) fn advance_epoch(&self, batch: &mut mmdb_kernel::Batch) -> ContextResult<u64> {
-        let current = self.availability_epoch_locked()?;
-        let next = current.checked_add(1).ok_or(ContextError::BudgetExceeded)?;
-        let redaction_epoch = self.checkpoint_redaction_epoch_locked()?;
-        batch.insert(
-            &self.records.lifecycle,
-            self.checkpoint_redaction_key(),
-            encode(&CheckpointVisibility {
-                availability_epoch: next,
-                redaction_epoch,
-            })?,
-        );
-        batch.insert(
-            &self.records.lifecycle,
-            owner_key(&self.access().owner),
-            encode(&next)?,
-        );
-        Ok(next)
+            .counter(&key)?
+            .checked_add(1)
+            .ok_or(ContextError::BudgetExceeded)?;
+        let epoch = self.effective_epoch(local)?;
+        batch.insert(&self.records.lifecycle, key, encode(&local)?);
+        Ok(epoch)
     }
 
     pub(crate) fn invalidate_checkpoint_payloads(
         &self,
-        batch: &mut mmdb_kernel::Batch,
+        batch: &mut Batch,
         epoch: u64,
     ) -> ContextResult<()> {
         batch.insert(
             &self.records.lifecycle,
             self.checkpoint_redaction_key(),
-            encode(&CheckpointVisibility {
-                availability_epoch: epoch,
-                redaction_epoch: epoch,
-            })?,
+            encode(&epoch)?,
         );
         Ok(())
     }

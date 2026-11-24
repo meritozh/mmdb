@@ -6,6 +6,7 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn access(owner: &str) -> ContextAccess {
     ContextAccess::new(owner, Actor::System)
@@ -825,17 +826,28 @@ fn relation_pages_apply_direction_scope_time_and_type_filters_without_stalling()
 }
 
 #[test]
-fn reset_creates_a_new_context_era_without_importing_previous_history() {
+fn whole_store_reset_quarantines_the_directory_and_starts_new_eras() {
     use mmdb::store_format::{commit_reset, ResetPlan, ResetSafety, StoreEraId};
-    use std::time::{Duration, SystemTime};
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap().join("context");
-    let old = {
+    let (old, old_type, memory_plan) = {
         let db = Store::create(&root).unwrap();
-        source(
+        let old = source(
             &db.session_log(access("owner")).unwrap(),
             "old",
             "old source",
+        );
+        let old_type = db
+            .context(access("owner"))
+            .unwrap()
+            .define_type(OperationId::new(), definition("old-type"))
+            .unwrap()
+            .pin;
+        (
+            old,
+            old_type,
+            db.plan_memory_reset(UNIX_EPOCH, Duration::from_secs(60))
+                .unwrap(),
         )
     };
     let safety = ResetSafety::for_current_process(Vec::new()).unwrap();
@@ -849,7 +861,17 @@ fn reset_creates_a_new_context_era_without_importing_previous_history() {
     )
     .unwrap();
     let receipt = commit_reset(&plan, plan.digest().as_str(), StoreEraId::new(), &[]).unwrap();
-    let db = Store::open(&root).unwrap();
+    let mut db = Store::open(&root).unwrap();
+    assert_ne!(db.era(StoreModule::Session), old.record.era);
+    assert_ne!(db.era(StoreModule::Memory), old_type.record.era);
+    assert!(matches!(
+        db.reset_memory(&memory_plan, memory_plan.digest(), UNIX_EPOCH),
+        Err(StoreError::StaleResetPlan)
+    ));
+    assert!(matches!(
+        db.context(access("owner")).unwrap().read(&old_type),
+        Err(ContextError::AccessDenied)
+    ));
     let fresh_log = db.session_log(access("owner")).unwrap();
     assert_eq!(fresh_log.position("session-a").unwrap(), 0);
     assert!(matches!(
@@ -857,6 +879,12 @@ fn reset_creates_a_new_context_era_without_importing_previous_history() {
         Err(ContextError::AccessDenied)
     ));
     let previous = Store::open(receipt.quarantine_path()).unwrap();
+    assert_eq!(previous.era(StoreModule::Memory), old_type.record.era);
+    assert!(previous
+        .context(access("owner"))
+        .unwrap()
+        .read(&old_type)
+        .is_ok());
     assert_eq!(
         previous
             .session_log(access("owner"))
@@ -1015,6 +1043,9 @@ fn format_and_store_identity_prevent_accidental_adoption() {
         "mmdb-native-memory-v1",
         "mmdb-context-dev7",
         "mmdb-native-memory-dev7",
+        "mmdb-context-dev4",
+        "mmdb-store-dev9",
+        "mmdb-store-dev11",
     ] {
         let legacy = dir.path().join(legacy_format);
         std::fs::create_dir(&legacy).unwrap();
@@ -2298,7 +2329,6 @@ fn a_withdrawn_fragment_hides_its_whole_message() {
 #[test]
 fn a_legacy_directory_resets_into_an_empty_store() {
     use mmdb::store_format::{commit_reset, ResetPlan, ResetSafety, StoreEraId, StoreManifest};
-    use std::time::{Duration, SystemTime};
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap().join("legacy");
     std::fs::create_dir(&root).unwrap();
@@ -2637,4 +2667,523 @@ fn record_handles_reject_another_kind_before_checking_access() {
     ] {
         assert!(matches!(rejected, Err(ContextError::InvalidInput(_))));
     }
+}
+
+fn reset_memory(store: &mut Store) -> mmdb::MemoryResetReceipt {
+    let plan = store
+        .plan_memory_reset(UNIX_EPOCH, Duration::from_secs(60))
+        .unwrap();
+    store
+        .reset_memory(&plan, plan.digest(), UNIX_EPOCH)
+        .unwrap()
+}
+
+fn checkpoint_input(scope: CheckpointScope, sequence: u64, epoch: u64) -> CheckpointInput {
+    CheckpointInput {
+        scope,
+        session: "session-a".into(),
+        run: "run".into(),
+        sequence,
+        expected_previous: None,
+        expected_availability_epoch: epoch,
+        sources: vec![],
+        payload: json!({"summary": "remember the task"}),
+    }
+}
+
+#[test]
+fn memory_reset_needs_the_exact_plan_digest() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("store");
+    let mut db = Store::create(&root).unwrap();
+    let old_memory = db.era(StoreModule::Memory);
+    let session = db.era(StoreModule::Session);
+    let plan = db
+        .plan_memory_reset(UNIX_EPOCH, Duration::from_secs(900))
+        .unwrap();
+    assert_eq!(plan.canonical_root(), root.canonicalize().unwrap());
+    assert_eq!(plan.memory_era(), old_memory);
+    assert_ne!(plan.new_memory_era(), old_memory);
+    assert_eq!(
+        (plan.issued_at_unix_ms(), plan.expires_at_unix_ms()),
+        (0, 900_000)
+    );
+    assert_eq!(plan.digest().len(), 64);
+    let other_plan = db
+        .plan_memory_reset(UNIX_EPOCH, Duration::from_secs(900))
+        .unwrap();
+    for digest in ["", &plan.digest()[..63], other_plan.digest()] {
+        assert!(matches!(
+            db.reset_memory(&plan, digest, UNIX_EPOCH),
+            Err(StoreError::ResetDigestMismatch)
+        ));
+        assert_eq!(db.era(StoreModule::Memory), old_memory);
+        assert_eq!(
+            db.context(access("owner"))
+                .unwrap()
+                .availability_epoch()
+                .unwrap(),
+            0
+        );
+    }
+    let receipt = db.reset_memory(&plan, plan.digest(), UNIX_EPOCH).unwrap();
+    assert_eq!(receipt.old_memory_era, old_memory);
+    assert_eq!(receipt.new_memory_era, plan.new_memory_era());
+    assert!(!receipt.cleanup_pending);
+    assert_eq!(db.era(StoreModule::Session), session);
+}
+
+#[test]
+fn memory_reset_refuses_a_plan_for_another_time_era_or_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("store");
+    let moved = dir.path().join("same-eras-elsewhere");
+    let mut db = Store::create(&root).unwrap();
+    let issued = UNIX_EPOCH + Duration::from_secs(10);
+    let ttl = Duration::from_millis(2);
+    assert!(matches!(
+        db.plan_memory_reset(issued, Duration::ZERO),
+        Err(StoreError::ResetPlanTtl)
+    ));
+    assert!(matches!(
+        db.plan_memory_reset(issued, Duration::from_secs(900) + Duration::from_nanos(1)),
+        Err(StoreError::ResetPlanTtl)
+    ));
+    let plan = db.plan_memory_reset(issued, ttl).unwrap();
+    let old = db.era(StoreModule::Memory);
+    assert!(matches!(
+        db.reset_memory(&plan, "", issued - Duration::from_millis(1)),
+        Err(StoreError::ResetPlanNotYetValid)
+    ));
+    assert!(matches!(
+        db.reset_memory(&plan, "", issued + ttl),
+        Err(StoreError::ResetPlanExpired)
+    ));
+    assert_eq!(db.era(StoreModule::Memory), old);
+    drop(db);
+    std::fs::rename(&root, &moved).unwrap();
+    let mut same_data = Store::open(&moved).unwrap();
+    assert_eq!(same_data.era(StoreModule::Memory), old);
+    assert!(matches!(
+        same_data.reset_memory(&plan, plan.digest(), issued),
+        Err(StoreError::ResetPlanForAnotherStore)
+    ));
+    assert_eq!(same_data.era(StoreModule::Memory), old);
+    drop(same_data);
+    std::fs::rename(moved, &root).unwrap();
+    let mut db = Store::open(&root).unwrap();
+    let other_plan = db.plan_memory_reset(issued, ttl).unwrap();
+    db.reset_memory(&plan, plan.digest(), issued + Duration::from_millis(1))
+        .unwrap();
+    assert!(matches!(
+        db.reset_memory(&other_plan, other_plan.digest(), issued),
+        Err(StoreError::StaleResetPlan)
+    ));
+    assert_eq!(db.era(StoreModule::Memory), plan.new_memory_era());
+    assert_eq!(
+        db.context(access("owner"))
+            .unwrap()
+            .availability_epoch()
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn memory_reset_keeps_the_session_log_and_hides_old_memory() {
+    use mmdb::native_memory::{
+        EvidenceClass, EvidenceLifecycle, NewEvidence, OperationContext, RecallQuery,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("store");
+    let mut db = Store::create(&root).unwrap();
+    let native_query = RecallQuery {
+        text: "native evidence".into(),
+        scopes: vec![Scope::Personal],
+        observed_from_ms: None,
+        observed_to_ms: None,
+        valid_at_ms: None,
+        limit: 10,
+    };
+    let evidence = db
+        .memory()
+        .capture_evidence(
+            OperationContext::new(Actor::User),
+            NewEvidence {
+                class: EvidenceClass::UserAssertion,
+                scope: Scope::Personal,
+                temporal: TemporalFacts::observed_at(10),
+                lifecycle: EvidenceLifecycle::Direct,
+                text: native_query.text.clone(),
+            },
+        )
+        .unwrap();
+    assert!(!db
+        .memory()
+        .recall(native_query.clone())
+        .unwrap()
+        .citations
+        .is_empty());
+    let ctx = db.context(access("owner")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
+    let original = source(&log, "original", "observation");
+    let type_pin = ctx
+        .define_type(OperationId::new(), definition("note"))
+        .unwrap()
+        .pin;
+    let first = ctx
+        .save_object(OperationId::new(), object(&type_pin, &original, "first"))
+        .unwrap()
+        .pin;
+    let second = ctx
+        .save_object(OperationId::new(), object(&type_pin, &original, "second"))
+        .unwrap()
+        .pin;
+    let edge_type = relation_type(&ctx, &type_pin);
+    let edge = ctx
+        .save_relation(
+            OperationId::new(),
+            relation(&edge_type, &first, &second, &original),
+        )
+        .unwrap()
+        .pin;
+    let action = ctx
+        .define_action(
+            OperationId::new(),
+            ActionDefinition {
+                name: "act".into(),
+                description: "Inspect a note".into(),
+                scope: Scope::Personal,
+                target_type: type_pin.clone(),
+                inputs: BTreeMap::new(),
+                preconditions: vec![],
+                sources: vec![original.clone()],
+            },
+        )
+        .unwrap()
+        .pin;
+    let execution = ctx
+        .prepare_action(
+            OperationId::new(),
+            ActionInvocation {
+                action: action.clone(),
+                target: first.clone(),
+                inputs: BTreeMap::new(),
+                sources: vec![],
+            },
+        )
+        .unwrap()
+        .pin;
+    let operation = OperationId::new();
+    let mut input = event_input("session-a", "copy");
+    input.sources = vec![first.clone()];
+    let copy = log
+        .append(operation, input, b"snapshot".as_slice())
+        .unwrap();
+    let epoch = ctx.availability_epoch().unwrap();
+    let checkpoint = |scope| {
+        log.save_checkpoint(OperationId::new(), checkpoint_input(scope, 2, epoch))
+            .unwrap()
+            .pin
+    };
+    let (session_cp, run_cp) = (
+        checkpoint(CheckpointScope::Session),
+        checkpoint(CheckpointScope::Run),
+    );
+    let retired = [type_pin, first, second, edge_type, edge, action, execution];
+    let reset = reset_memory(&mut db);
+    assert_eq!(db.memory().era_id(), reset.new_memory_era);
+    assert!(matches!(
+        db.context(access("owner")).unwrap().read(&retired[0]),
+        Err(ContextError::Reset(_))
+    ));
+    drop(db);
+    let db = Store::open(&root).unwrap();
+    assert_eq!(db.memory().era_id(), reset.new_memory_era);
+    assert!(db.memory().inspect_evidence(evidence.id).unwrap().is_none());
+    assert!(db
+        .memory()
+        .recall(native_query)
+        .unwrap()
+        .citations
+        .is_empty());
+    let ctx = db.context(access("owner")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
+    for pin in &retired {
+        assert!(matches!(ctx.read(pin), Err(ContextError::Reset(record)) if record == pin.record));
+    }
+    assert!(ctx.find_type(&Scope::Personal, "note").unwrap().is_none());
+    assert!(ctx.find_action(&Scope::Personal, "act").unwrap().is_none());
+    assert!(ctx.query_current_valid(None, None, 100).unwrap().is_empty());
+    assert_eq!(
+        log.events("session-a", 0, 10)
+            .unwrap()
+            .entries
+            .iter()
+            .map(|entry| &entry.pin)
+            .collect::<Vec<_>>(),
+        [&original, &copy.pin]
+    );
+    assert_eq!(
+        log.read_payload(&copy.pin, 0, 100).unwrap().bytes,
+        b"snapshot"
+    );
+    assert_eq!(log.operation_receipt(operation).unwrap(), Some(copy));
+    assert_eq!(
+        log.latest_checkpoint("session-a").unwrap().unwrap().pin,
+        session_cp
+    );
+    assert_eq!(
+        log.latest_run_checkpoint("session-a", "run")
+            .unwrap()
+            .unwrap()
+            .pin,
+        run_cp
+    );
+    for pin in [&session_cp, &run_cp] {
+        assert_eq!(
+            log.read_checkpoint(pin).unwrap().payload,
+            json!({"summary":"remember the task"})
+        );
+    }
+    assert_eq!(
+        log.append(
+            OperationId::new(),
+            event_input("session-a", "next"),
+            b"new".as_slice()
+        )
+        .unwrap()
+        .sequence,
+        Some(3)
+    );
+}
+
+#[test]
+fn log_events_that_copied_reset_memory_stay_readable_and_current() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Store::create(dir.path().join("store")).unwrap();
+    let ctx = db.context(access("owner")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
+    let anchor = source(&log, "raw", "raw");
+    let ty = ctx
+        .define_type(OperationId::new(), definition("note"))
+        .unwrap()
+        .pin;
+    let old = ctx
+        .save_object(OperationId::new(), object(&ty, &anchor, "text"))
+        .unwrap()
+        .pin;
+    let mut input = event_input("session-a", "copy");
+    // The shared retired source is a terminal on both edges.
+    input.sources = vec![old.clone(), old.clone()];
+    let copy = log
+        .append(OperationId::new(), input, b"copy".as_slice())
+        .unwrap()
+        .pin;
+    reset_memory(&mut db);
+    let ctx = db.context(access("owner")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
+    assert_eq!(log.read_payload(&copy, 0, 20).unwrap().bytes, b"copy");
+    ctx.validate_current(std::slice::from_ref(&copy), None)
+        .unwrap();
+    assert!(
+        matches!(ctx.validate_current(std::slice::from_ref(&old), None), Err(ContextError::Reset(record)) if record == old.record)
+    );
+    let ty = ctx
+        .define_type(OperationId::new(), definition("rebuild"))
+        .unwrap()
+        .pin;
+    let rebuilt = ctx
+        .save_object(OperationId::new(), object(&ty, &copy, "rebuilt"))
+        .unwrap()
+        .pin;
+    ctx.validate_current(&[rebuilt], None).unwrap();
+    assert!(
+        matches!(ctx.save_object(OperationId::new(), object(&ty, &old, "stale")), Err(ContextError::Reset(record)) if record == old.record)
+    );
+    let mut input = event_input("session-a", "after");
+    input.sources = vec![copy];
+    log.append(OperationId::new(), input.clone(), b"after".as_slice())
+        .unwrap();
+    input.event_id = "stale".into();
+    input.sources = vec![old.clone()];
+    assert!(
+        matches!(log.append(OperationId::new(), input, b"old".as_slice()), Err(ContextError::Reset(record)) if record == old.record)
+    );
+}
+
+#[test]
+fn checkpoints_saved_before_a_memory_reset_cannot_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Store::create(dir.path().join("store")).unwrap();
+    let mut checkpoints = Vec::new();
+    for owner in ["first", "second"] {
+        let log = db.session_log(access(owner)).unwrap();
+        source(&log, "original", "original");
+        let cp = log
+            .save_checkpoint(
+                OperationId::new(),
+                checkpoint_input(CheckpointScope::Session, 1, 0),
+            )
+            .unwrap()
+            .pin;
+        checkpoints.push((owner, cp));
+    }
+    reset_memory(&mut db);
+    let mut refreshed = Vec::new();
+    for (owner, cp) in checkpoints {
+        let log = db.session_log(access(owner)).unwrap();
+        let ctx = db.context(access(owner)).unwrap();
+        assert_eq!(ctx.availability_epoch().unwrap(), 1);
+        let saved = log.read_checkpoint(&cp).unwrap();
+        assert_eq!(saved.header.checkpoint.unwrap().sequence, 1);
+        assert_eq!(saved.payload, json!({"summary":"remember the task"}));
+        assert!(
+            matches!(ctx.validate_current(std::slice::from_ref(&cp), None), Err(ContextError::Unavailable(record)) if record == cp.record)
+        );
+        let mut fresh = checkpoint_input(CheckpointScope::Session, 1, 1);
+        fresh.expected_previous = Some(cp);
+        let fresh = log.save_checkpoint(OperationId::new(), fresh).unwrap();
+        ctx.validate_current(std::slice::from_ref(&fresh.pin), None)
+            .unwrap();
+        refreshed.push(fresh.pin);
+    }
+
+    // An erasure after the first reset uses the same clock as the checkpoints.
+    // The next reset must preserve that owner's redaction boundary.
+    let first = db
+        .session_log(ContextAccess::new("first", Actor::User))
+        .unwrap();
+    let private = source(&first, "private", "private");
+    first.purge(OperationId::new(), private).unwrap();
+    reset_memory(&mut db);
+    let first_ctx = db.context(access("first")).unwrap();
+    let second_ctx = db.context(access("second")).unwrap();
+    assert_eq!(first_ctx.availability_epoch().unwrap(), 3);
+    assert_eq!(second_ctx.availability_epoch().unwrap(), 2);
+    let first = db.session_log(access("first")).unwrap();
+    let second = db.session_log(access("second")).unwrap();
+    assert!(matches!(
+        first.read_checkpoint(&refreshed[0]),
+        Err(ContextError::Unavailable(_))
+    ));
+    assert!(second.read_checkpoint(&refreshed[1]).is_ok());
+}
+
+#[test]
+fn a_checkpoint_generated_before_a_memory_reset_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Store::create(dir.path().join("store")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
+    source(&log, "event", "before");
+    let epoch = db
+        .context(access("owner"))
+        .unwrap()
+        .availability_epoch()
+        .unwrap();
+    let pending = checkpoint_input(CheckpointScope::Run, 1, epoch);
+    reset_memory(&mut db);
+    let log = db.session_log(access("owner")).unwrap();
+    let op = OperationId::new();
+    assert!(matches!(
+        log.save_checkpoint(op, pending),
+        Err(ContextError::InvalidInput(_))
+    ));
+    assert!(log
+        .latest_run_checkpoint("session-a", "run")
+        .unwrap()
+        .is_none());
+    assert!(log.operation_receipt(op).unwrap().is_none());
+}
+
+#[test]
+fn a_log_retry_after_a_memory_reset_returns_the_original_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("store");
+    let mut db = Store::create(&root).unwrap();
+    let ctx = db.context(access("owner")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
+    let memory_op = OperationId::new();
+    let ty = ctx.define_type(memory_op, definition("old")).unwrap();
+    let op = OperationId::new();
+    let mut original = event_input("session-a", "copy");
+    original.expected_sequence = Some(0);
+    original.sources = vec![ty.pin.clone()];
+    let receipt = log
+        .append(op, original.clone(), b"copy".as_slice())
+        .unwrap();
+    source(&log, "later", "later");
+    reset_memory(&mut db);
+    drop(db);
+    let db = Store::open(&root).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
+    assert_eq!(
+        log.append(op, original.clone(), b"copy".as_slice())
+            .unwrap(),
+        receipt
+    );
+    let another = OperationId::new();
+    assert_eq!(
+        log.append(another, original.clone(), b"copy".as_slice())
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(log.operation_receipt(another).unwrap(), Some(receipt));
+    assert!(matches!(
+        log.append(op, original, b"changed".as_slice()),
+        Err(ContextError::IdempotencyConflict)
+    ));
+    assert_eq!(log.position("session-a").unwrap(), 2);
+    let ctx = db.context(access("owner")).unwrap();
+    assert!(
+        matches!(ctx.define_type(memory_op, definition("old")), Err(ContextError::Reset(record)) if record == ty.pin.record)
+    );
+    assert!(
+        matches!(ctx.operation_receipt(memory_op), Err(ContextError::Reset(record)) if record == ty.pin.record)
+    );
+}
+
+#[test]
+fn reset_purged_and_foreign_refs_fail_differently() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Store::create(dir.path().join("store")).unwrap();
+    let old = db
+        .context(access("owner"))
+        .unwrap()
+        .define_type(OperationId::new(), definition("old"))
+        .unwrap()
+        .pin;
+    reset_memory(&mut db);
+    let ctx = db
+        .context(ContextAccess::new("owner", Actor::User))
+        .unwrap();
+    let source = source(
+        &db.session_log(access("owner")).unwrap(),
+        "original",
+        "original",
+    );
+    let ty = ctx
+        .define_type(OperationId::new(), definition("new"))
+        .unwrap()
+        .pin;
+    let purged = ctx
+        .save_object(OperationId::new(), object(&ty, &source, "purge"))
+        .unwrap()
+        .pin;
+    ctx.purge(OperationId::new(), purged.clone()).unwrap();
+    assert!(
+        matches!(ctx.read(&purged), Err(ContextError::Unavailable(record)) if record == purged.record)
+    );
+    assert!(matches!(ctx.read(&old), Err(ContextError::Reset(record)) if record == old.record));
+    let other = db.context(access("other")).unwrap();
+    assert!(matches!(other.read(&old), Err(ContextError::AccessDenied)));
+    assert!(matches!(
+        other.read(&purged),
+        Err(ContextError::AccessDenied)
+    ));
+    let foreign = Store::create(dir.path().join("foreign")).unwrap();
+    assert!(matches!(
+        foreign.context(access("owner")).unwrap().read(&old),
+        Err(ContextError::AccessDenied)
+    ));
 }

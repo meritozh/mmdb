@@ -38,10 +38,18 @@ scope and tool permissions.
 `TypeDefinition::note(scope)` is an optional starting schema registered through
 the same catalog as custom types. Complete raw events stream into checksummed
 chunks. `SessionLog::search` uses bounded, resumable substring scans. Objects use
-lexical postings and explicit relation paths. This contract currently requires
-the `mmdb-store-dev11` format. Use an explicit whole-store reset to replace a
-legacy directory.
-One process holds the store lease at a time.
+lexical postings and explicit relation paths. One process holds the store lease
+at a time. The format is `mmdb-store-v1`. An explicit whole-store reset moves
+a legacy directory into quarantine and creates a fresh store.
+
+To reset native memory and domain context in place, call
+`store.plan_memory_reset(issued_at, ttl)`, then pass the plan, its full
+confirmation digest, and the current time to `store.reset_memory`. The commit
+switches the memory era and advances every owner's availability epoch together.
+Old memory references return `ContextError::Reset`. Session events, their
+receipts, and checkpoint payloads remain available under their existing read
+rules. Regenerate pre-reset checkpoints before resuming. When the receipt's
+`cleanup_pending` is true, reopening finishes removing the old partitions.
 
 ```sh
 cargo run -p mmdb --example context_harness
@@ -103,7 +111,7 @@ timeouts, and retries. `Database::ingest`, `Database::recall`, and
 |-------|-------------|-------------|
 | `mmdb` | High-level facade, `NodeBuilder`, vector/graph/hybrid/blob/query APIs | [Embedded multi-model memory](docs/feature/multi-model-memory.md) |
 | `mmdb-core` | Shared types, traits, and errors | [Memory nodes](docs/feature/memory-nodes.md) |
-| `mmdb-kernel` | Managed store manifests, leases, and whole-store reset | [Operational state](docs/feature/operational-state.md) |
+| `mmdb-kernel` | Managed store manifests, leases, module eras, and reset | [Operational state](docs/feature/operational-state.md) |
 | `mmdb-storage` | fjall node store, key encoding, time/kind/meta indexes | [Node persistence and indexes](docs/feature/memory-nodes.md) |
 | `mmdb-vector` | HNSW indexes, vector metadata, tombstones, snapshot reload | [Vector and hybrid search](docs/feature/vector-search.md) |
 | `mmdb-graph` | Bi-directional edges, BFS, label dictionary | [Graph traversal](docs/feature/graph-traversal.md) |

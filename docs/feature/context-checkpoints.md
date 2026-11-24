@@ -1,6 +1,6 @@
 # 会话和运行检查点
 
-Status: decided
+Status: shipped
 
 harness 在切换窗口或恢复中断任务时，用检查点定位同一 session 中已处理的会话日志位置，再读取其后的事件。检查点载荷不可变，固定 session/run、父版本、日志位置和来源。Session 与各 Run 分别比较父版本，子运行只能更新自己的 Run 检查点。检查点和会话日志同在会话模块，通过 `store.session_log(access)` 读写，重置记忆不会删除它们。
 
@@ -13,4 +13,4 @@ harness 在切换窗口或恢复中断任务时，用检查点定位同一 sessi
 | 重置记忆 | 重置前保存的检查点不能用于当前恢复，载荷和日志位置仍可读，harness 从该位置重新生成。 |
 | 旧 writer 缺少匹配的脱敏 marker | 按当前可用性 epoch 保守处理，避免重新暴露旧摘要。 |
 
-[检查点实现](../../crates/mmdb/src/context/checkpoints.rs) · [会话与子运行重开测试](../../crates/mmdb/tests/context_contract.rs)
+[检查点实现](../../crates/mmdb/src/session/checkpoints.rs) · [会话与子运行重开测试](../../crates/mmdb/tests/context_contract.rs)

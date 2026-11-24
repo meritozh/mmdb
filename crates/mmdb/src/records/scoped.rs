@@ -1,7 +1,7 @@
 use super::codec::*;
 use super::*;
 use crate::{EraId, OperationId};
-use mmdb_kernel::{Batch, EraPartitions, Kernel, KernelResult, Partition, WriteGuard};
+use mmdb_kernel::{Batch, EraPartitions, EraState, Kernel, KernelResult, Partition, WriteGuard};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use ulid::Ulid;
@@ -32,7 +32,6 @@ pub(crate) const SESSION_PARTITIONS: &[&str] =
     &[HEADERS, HEADS, PAYLOADS, PENDING, LIFECYCLE, OPERATIONS];
 
 pub(crate) struct RecordTable {
-    pub(super) era: EraId,
     headers: Partition,
     heads: Partition,
     pub(super) payloads: Partition,
@@ -42,7 +41,6 @@ pub(crate) struct RecordTable {
 impl RecordTable {
     pub(crate) fn open(era: &EraPartitions) -> KernelResult<Self> {
         Ok(Self {
-            era: era.era(),
             headers: era.partition(HEADERS)?,
             heads: era.partition(HEADS)?,
             payloads: era.partition(PAYLOADS)?,
@@ -80,6 +78,10 @@ impl Records {
             fail_commit_ack: Default::default(),
         })
     }
+    pub(crate) fn replace_memory_table(&mut self, table: RecordTable) {
+        self.memory = table;
+    }
+
     pub(crate) fn scoped(&self, access: ContextAccess) -> Scoped<'_> {
         Scoped {
             records: self,
@@ -124,7 +126,7 @@ impl Scoped<'_> {
     }
 
     pub(crate) fn era(&self, module: StoreModule) -> EraId {
-        self.table(module).era
+        self.records.kernel.era(module.id())
     }
 
     pub(crate) fn scan_heads(
@@ -192,10 +194,6 @@ impl Scoped<'_> {
         &self.table(kind.module()).payloads
     }
     #[cfg(test)]
-    pub(crate) fn test_lifecycle(&self) -> &Partition {
-        &self.records.lifecycle
-    }
-    #[cfg(test)]
     pub(crate) fn lose_next_commit_ack(&self) {
         self.records
             .fail_commit_ack
@@ -244,10 +242,18 @@ impl Scoped<'_> {
     }
 
     pub(crate) fn check_ref(&self, record: &ContextRef) -> ContextResult<()> {
-        if record.owner != self.access.owner || record.era != self.era(record.kind.module()) {
+        if record.owner != self.access.owner {
             return Err(ContextError::AccessDenied);
         }
-        Ok(())
+        match self
+            .records
+            .kernel
+            .era_state(record.kind.module().id(), record.era)
+        {
+            EraState::Current => Ok(()),
+            EraState::Retired => Err(ContextError::Reset(record.clone())),
+            EraState::Unknown => Err(ContextError::AccessDenied),
+        }
     }
 
     pub(crate) fn fresh_pin(&self, kind: RecordKind) -> RecordPin {
@@ -359,6 +365,12 @@ impl Scoped<'_> {
         }
         let header = match self.header_locked(pin) {
             Ok(header) => header,
+            // Only a transitive source can terminate at a retired era. Direct
+            // inputs are checked by the caller before their dependencies are walked.
+            Err(ContextError::Reset(_)) if depth > 0 => {
+                walk.path.remove(pin);
+                return Ok(true);
+            }
             Err(ContextError::NotFound(_) | ContextError::AccessDenied) => return Ok(false),
             Err(error) => return Err(error),
         };
@@ -435,12 +447,12 @@ impl Scoped<'_> {
         let mut walk = SourceWalk::for_new_record();
         let mut memo = BTreeMap::new();
         for source in sources {
+            let header = self.header_locked(source)?;
             if source.record.kind == RecordKind::Type {
                 return Err(ContextError::InvalidInput(
                     "type definitions are not observation sources".into(),
                 ));
             }
-            let header = self.header_locked(source)?;
             if header.scope != *scope && header.scope != Scope::Personal {
                 return Err(ContextError::AccessDenied);
             }
