@@ -6,5 +6,5 @@ mod kernel;
 
 pub use kernel::{
     Batch, Bytes, EraId, EraPartitions, EraState, Kernel, KernelError, KernelResult, ModuleId,
-    ModuleSpec, OperationId, Partition, WriteGuard,
+    ModuleResetReport, ModuleSpec, OperationId, Partition, WriteGuard,
 };

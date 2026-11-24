@@ -3,10 +3,10 @@ use crate::store_format::{
     StoreFormatError, StoreLease,
 };
 use fjall::{Config, Keyspace, PartitionHandle, PersistMode};
-use parking_lot::{Mutex, MutexGuard, RwLock};
+use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fmt, fs,
     ops::{Deref, RangeBounds},
     path::Path,
@@ -16,6 +16,7 @@ use ulid::Ulid;
 
 const KERNEL_PARTITION: &str = "kernel_v1";
 const STORE_KEY: &[u8] = b"store";
+const RETIRED_PREFIX: &str = "retired.";
 
 macro_rules! id_type {
     ($name:ident) => {
@@ -160,13 +161,15 @@ impl Schema {
         for name in obsolete {
             keyspace.delete_partition(keyspace.open_partition(&name, Default::default())?)?;
         }
-        for (&module, names) in &self.0 {
-            for name in names {
-                keyspace.open_partition(
-                    &partition_name(module, eras[module], name),
-                    Default::default(),
-                )?;
-            }
+        for &module in self.0.keys() {
+            self.open_module(keyspace, ModuleId(module), eras[module])?;
+        }
+        Ok(())
+    }
+
+    fn open_module(&self, keyspace: &Keyspace, module: ModuleId, era: EraId) -> KernelResult<()> {
+        for name in &self.0[module.0] {
+            keyspace.open_partition(&partition_name(module.0, era, name), Default::default())?;
         }
         Ok(())
     }
@@ -196,7 +199,7 @@ impl StoreMetadata {
         store_era: &StoreEraId,
         schema: &Schema,
         pristine: bool,
-    ) -> KernelResult<Self> {
+    ) -> KernelResult<(Self, PartitionHandle)> {
         if !pristine && !keyspace.partition_exists(KERNEL_PARTITION) {
             return Err(KernelError::Corrupt(
                 "kernel metadata partition is missing".into(),
@@ -221,7 +224,7 @@ impl StoreMetadata {
                     "kernel modules do not match the format".into(),
                 ));
             }
-            return Ok(metadata);
+            return Ok((metadata, partition));
         }
         if !pristine {
             return Err(KernelError::Corrupt(
@@ -240,11 +243,75 @@ impl StoreMetadata {
                 .collect(),
         };
         let mut batch = durable_batch(keyspace);
-        let encoded =
-            serde_json::to_vec(&metadata).map_err(|e| KernelError::Storage(e.to_string()))?;
-        batch.insert(&partition, STORE_KEY, encoded);
+        metadata.stage(&mut batch, &partition)?;
         batch.commit().map_err(|_| KernelError::CommitUnknown)?;
-        Ok(metadata)
+        Ok((metadata, partition))
+    }
+
+    fn stage(&self, batch: &mut fjall::Batch, partition: &PartitionHandle) -> KernelResult<()> {
+        let encoded = serde_json::to_vec(self).map_err(|e| KernelError::Storage(e.to_string()))?;
+        batch.insert(partition, STORE_KEY, encoded);
+        Ok(())
+    }
+}
+
+struct ModuleEras {
+    current: BTreeMap<String, EraId>,
+    retired: HashSet<(ModuleId, EraId)>,
+    poisoned: bool,
+}
+
+impl ModuleEras {
+    fn load(
+        current: BTreeMap<String, EraId>,
+        partition: &PartitionHandle,
+        schema: &Schema,
+    ) -> KernelResult<Self> {
+        let mut retired = HashSet::new();
+        for pair in partition.prefix(RETIRED_PREFIX) {
+            let (key, value) = pair?;
+            let corrupt = || KernelError::Corrupt(format!("invalid retired era key {key:?}"));
+            let key = std::str::from_utf8(&key).map_err(|_| corrupt())?;
+            let (module, era) = key
+                .strip_prefix(RETIRED_PREFIX)
+                .and_then(|suffix| suffix.split_once('.'))
+                .ok_or_else(corrupt)?;
+            let (&module, _) = schema.0.get_key_value(module).ok_or_else(corrupt)?;
+            let id = EraId(era.parse().map_err(|_| corrupt())?);
+            if !value.is_empty() || id.to_string() != era || current[module] == id {
+                return Err(corrupt());
+            }
+            retired.insert((ModuleId(module), id));
+        }
+        Ok(Self {
+            current,
+            retired,
+            poisoned: false,
+        })
+    }
+
+    fn state(&self, module: ModuleId, era: EraId) -> EraState {
+        if self.current[module.0] == era {
+            EraState::Current
+        } else if self.retired.contains(&(module, era)) {
+            EraState::Retired
+        } else {
+            EraState::Unknown
+        }
+    }
+
+    fn ensure_usable(&self) -> KernelResult<()> {
+        if self.poisoned {
+            return Err(KernelError::Poisoned);
+        }
+        Ok(())
+    }
+
+    fn ensure_new(&self, module: ModuleId, era: EraId) -> KernelResult<()> {
+        if self.state(module, era) != EraState::Unknown {
+            return Err(KernelError::InvalidEra(era));
+        }
+        Ok(())
     }
 }
 
@@ -256,12 +323,15 @@ fn durable_batch(keyspace: &Keyspace) -> fjall::Batch {
 pub struct Kernel(Arc<Inner>);
 
 struct Inner {
+    metadata: PartitionHandle,
     keyspace: Keyspace,
     schema: Schema,
-    eras: RwLock<BTreeMap<String, EraId>>,
+    eras: RwLock<ModuleEras>,
     store_era: StoreEraId,
     digest_key: [u8; 32],
     write_lock: Mutex<()>,
+    #[cfg(test)]
+    reset_fault: Mutex<Option<tests::ResetFault>>,
     // Keep the path leased until all engine handles have been dropped.
     lease: StoreLease,
 }
@@ -303,16 +373,20 @@ impl Kernel {
         let pristine = directory_contains_only_manifest(managed.canonical_root())?;
         let keyspace = Config::new(managed.canonical_root()).open()?;
         let store_era = managed.manifest().store_era_id().clone();
-        let metadata = StoreMetadata::load(&keyspace, &store_era, &schema, pristine)?;
-        schema.open_partitions(&keyspace, &metadata.eras)?;
+        let (metadata, partition) = StoreMetadata::load(&keyspace, &store_era, &schema, pristine)?;
+        let eras = ModuleEras::load(metadata.eras, &partition, &schema)?;
+        schema.open_partitions(&keyspace, &eras.current)?;
         Ok(Self(Arc::new(Inner {
+            metadata: partition,
             keyspace,
             schema,
             store_era,
             lease,
-            eras: RwLock::new(metadata.eras),
+            eras: RwLock::new(eras),
             digest_key: metadata.digest_key,
             write_lock: Mutex::new(()),
+            #[cfg(test)]
+            reset_fault: Mutex::new(None),
         })))
     }
 
@@ -325,15 +399,11 @@ impl Kernel {
     }
 
     pub fn era(&self, module: ModuleId) -> EraId {
-        self.0.eras.read()[module.0]
+        self.0.eras.read().current[module.0]
     }
 
     pub fn era_state(&self, module: ModuleId, era: EraId) -> EraState {
-        if self.era(module) == era {
-            EraState::Current
-        } else {
-            EraState::Unknown
-        }
+        self.0.eras.read().state(module, era)
     }
 
     pub fn module(&self, module: ModuleId) -> EraPartitions {
@@ -364,6 +434,114 @@ impl Kernel {
         hasher.update(domain.as_bytes());
         hasher
     }
+
+    /// Create empty partitions for the replacement era while the old era stays current.
+    pub fn prepare_module_reset(
+        &self,
+        module: ModuleId,
+        new_era: EraId,
+    ) -> KernelResult<EraPartitions> {
+        let eras = self.0.eras.read();
+        eras.ensure_usable()?;
+        eras.ensure_new(module, new_era)?;
+        self.0
+            .schema
+            .open_module(&self.0.keyspace, module, new_era)?;
+        Ok(EraPartitions {
+            kernel: self.clone(),
+            module,
+            era: new_era,
+        })
+    }
+
+    /// Durably switch eras and apply the caller's writes as one batch. Any remaining
+    /// old partitions are logically deleted on the next open.
+    pub fn commit_module_reset(
+        &self,
+        prepared: EraPartitions,
+        mut batch: Batch,
+    ) -> KernelResult<ModuleResetReport> {
+        let mut eras = self.0.eras.write();
+        eras.ensure_usable()?;
+        assert!(
+            Arc::ptr_eq(&self.0, &prepared.kernel.0),
+            "prepared era belongs to another kernel"
+        );
+        assert!(
+            Arc::ptr_eq(&self.0, &batch.kernel.0),
+            "batch belongs to another kernel"
+        );
+        let module = prepared.module;
+        let new_era = prepared.era;
+        eras.ensure_new(module, new_era)?;
+        batch.check_eras(&eras)?;
+        let mut current = eras.current.clone();
+        let old_era = std::mem::replace(
+            current.get_mut(module.0).expect("registered module"),
+            new_era,
+        );
+        let metadata = StoreMetadata {
+            store_era: self.0.store_era.to_string(),
+            digest_key: self.0.digest_key,
+            eras: current,
+        };
+        metadata.stage(&mut batch.raw, &self.0.metadata)?;
+        batch.raw.insert(
+            &self.0.metadata,
+            format!("{RETIRED_PREFIX}{}.{old_era}", module.0),
+            [],
+        );
+        if let Err(error) = self.commit_reset_batch(batch.raw) {
+            eras.poisoned = true;
+            return Err(error);
+        }
+        eras.current = metadata.eras;
+        eras.retired.insert((module, old_era));
+        drop(eras);
+        let cleanup_pending = self.delete_old_partitions(module, old_era).is_err();
+        Ok(ModuleResetReport {
+            old_era,
+            new_era,
+            cleanup_pending,
+        })
+    }
+
+    fn commit_reset_batch(&self, batch: fjall::Batch) -> KernelResult<()> {
+        #[cfg(test)]
+        if self.0.reset_fault.lock().as_ref() == Some(&tests::ResetFault::UnappliedCommit) {
+            return Err(KernelError::CommitUnknown);
+        }
+        batch.commit().map_err(|_| KernelError::CommitUnknown)?;
+        #[cfg(test)]
+        if self.0.reset_fault.lock().as_ref() == Some(&tests::ResetFault::LostCommitAck) {
+            return Err(KernelError::CommitUnknown);
+        }
+        Ok(())
+    }
+
+    fn delete_old_partitions(&self, module: ModuleId, era: EraId) -> KernelResult<()> {
+        for name in &self.0.schema.0[module.0] {
+            #[cfg(test)]
+            if self.0.reset_fault.lock().as_ref() == Some(&tests::ResetFault::DeletePartition(name))
+            {
+                return Err(KernelError::Storage("interrupted partition cleanup".into()));
+            }
+            let qualified = partition_name(module.0, era, name);
+            let handle = self
+                .0
+                .keyspace
+                .open_partition(&qualified, Default::default())?;
+            self.0.keyspace.delete_partition(handle)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct ModuleResetReport {
+    pub old_era: EraId,
+    pub new_era: EraId,
+    pub cleanup_pending: bool,
 }
 
 pub struct WriteGuard<'a> {
@@ -383,6 +561,7 @@ impl EraPartitions {
     }
 
     pub fn partition(&self, name: &'static str) -> KernelResult<Partition> {
+        let _eras = self.readable()?;
         if !self.kernel.0.schema.0[self.module.0].contains(name) {
             return Err(KernelError::UnknownPartition {
                 module: self.module.0,
@@ -399,6 +578,18 @@ impl EraPartitions {
             raw,
             owner: self.clone(),
         })
+    }
+
+    fn readable(&self) -> KernelResult<RwLockReadGuard<'_, ModuleEras>> {
+        let eras = self.kernel.0.eras.read();
+        eras.ensure_usable()?;
+        if eras.retired.contains(&(self.module, self.era)) {
+            return Err(KernelError::StaleEra {
+                module: self.module.0,
+                era: self.era,
+            });
+        }
+        Ok(eras)
     }
 }
 
@@ -431,29 +622,82 @@ fn read_pair(pair: fjall::Result<fjall::KvPair>) -> KernelResult<(Bytes, Bytes)>
 
 impl Partition {
     pub fn get(&self, key: impl AsRef<[u8]>) -> KernelResult<Option<Bytes>> {
+        let _eras = self.owner.readable()?;
         Ok(self.raw.get(key)?.map(Bytes))
     }
 
     pub fn contains_key(&self, key: impl AsRef<[u8]>) -> KernelResult<bool> {
+        let _eras = self.owner.readable()?;
         Ok(self.raw.contains_key(key)?)
     }
 
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = KernelResult<(Bytes, Bytes)>> + '_ {
-        self.raw.iter().map(read_pair)
+        self.scan(|| self.raw.iter())
     }
 
     pub fn range<K: AsRef<[u8]>, R: RangeBounds<K>>(
         &self,
         range: R,
     ) -> impl DoubleEndedIterator<Item = KernelResult<(Bytes, Bytes)>> + '_ {
-        self.raw.range(range).map(read_pair)
+        self.scan(|| self.raw.range(range))
     }
 
     pub fn prefix(
         &self,
         prefix: impl AsRef<[u8]>,
     ) -> impl DoubleEndedIterator<Item = KernelResult<(Bytes, Bytes)>> + '_ {
-        self.raw.prefix(prefix).map(read_pair)
+        self.scan(|| self.raw.prefix(prefix))
+    }
+
+    fn scan<I>(&self, open: impl FnOnce() -> I) -> PartitionScan<'_, I> {
+        PartitionScan {
+            owner: &self.owner,
+            rows: Some(self.owner.readable().map(|_eras| open())),
+        }
+    }
+}
+
+// A caller may retain a scan across a reset. Check each read without holding
+// the era lock while the caller processes a row.
+struct PartitionScan<'a, I> {
+    owner: &'a EraPartitions,
+    rows: Option<KernelResult<I>>,
+}
+
+impl<I: DoubleEndedIterator<Item = fjall::Result<fjall::KvPair>>> PartitionScan<'_, I> {
+    fn advance(
+        &mut self,
+        next: impl FnOnce(&mut I) -> Option<I::Item>,
+    ) -> Option<KernelResult<(Bytes, Bytes)>> {
+        let row = match self.rows.as_mut()? {
+            Err(_) => return self.rows.take()?.err().map(Err),
+            Ok(rows) => self
+                .owner
+                .readable()
+                .and_then(|_eras| next(rows).map(read_pair).transpose()),
+        };
+        if !matches!(row, Ok(Some(_))) {
+            self.rows = None;
+        }
+        row.transpose()
+    }
+}
+
+impl<I: DoubleEndedIterator<Item = fjall::Result<fjall::KvPair>>> Iterator
+    for PartitionScan<'_, I>
+{
+    type Item = KernelResult<(Bytes, Bytes)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.advance(Iterator::next)
+    }
+}
+
+impl<I: DoubleEndedIterator<Item = fjall::Result<fjall::KvPair>>> DoubleEndedIterator
+    for PartitionScan<'_, I>
+{
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.advance(DoubleEndedIterator::next_back)
     }
 }
 
@@ -489,16 +733,22 @@ impl Batch {
         self.raw.remove(&partition.raw, key.as_ref());
     }
 
-    pub fn commit(self) -> KernelResult<()> {
-        let eras = self.kernel.0.eras.read();
-        for (module, era) in self.touched {
-            if eras[module.0] != era {
+    fn check_eras(&self, eras: &ModuleEras) -> KernelResult<()> {
+        for &(module, era) in &self.touched {
+            if eras.current[module.0] != era {
                 return Err(KernelError::StaleEra {
                     module: module.0,
                     era,
                 });
             }
         }
+        Ok(())
+    }
+
+    pub fn commit(self) -> KernelResult<()> {
+        let eras = self.kernel.0.eras.read();
+        eras.ensure_usable()?;
+        self.check_eras(&eras)?;
         self.raw.commit().map_err(|_| KernelError::CommitUnknown)
     }
 }

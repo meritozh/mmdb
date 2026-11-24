@@ -9,9 +9,16 @@ const MODULES: &[ModuleSpec] = &[
     },
     ModuleSpec {
         id: MEMORY,
-        partitions: &["entries"],
+        partitions: &["entries", "index"],
     },
 ];
+
+#[derive(PartialEq, Eq)]
+pub(super) enum ResetFault {
+    UnappliedCommit,
+    LostCommitAck,
+    DeletePartition(&'static str),
+}
 
 fn format() -> StoreFormatDescriptor {
     StoreFormatDescriptor::new("test-v1").unwrap()
@@ -269,4 +276,273 @@ fn open_cleans_noncurrent_partitions_and_rejects_unrecognized_names() {
         .unwrap();
     drop(keyspace);
     assert!(matches!(open(&root), Err(KernelError::Corrupt(_))));
+}
+
+#[test]
+fn module_reset_deletes_the_old_era_partitions() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("store");
+    let kernel = create(&root);
+    let session = kernel.module(SESSION);
+    let memory = kernel.module(MEMORY);
+    let entries = memory.partition("entries").unwrap();
+    let receipts = session.partition("entries").unwrap();
+    let mut seed = kernel.batch();
+    seed.insert(&entries, "a", "old");
+    seed.commit().unwrap();
+
+    let replacement = EraId::new();
+    let prepared = kernel.prepare_module_reset(MEMORY, replacement).unwrap();
+    assert_eq!(memory.era(), kernel.era(MEMORY));
+    assert_eq!(kernel.era_state(MEMORY, replacement), EraState::Unknown);
+    assert!(entries.contains_key("a").unwrap());
+    assert!(!prepared
+        .partition("entries")
+        .unwrap()
+        .contains_key("a")
+        .unwrap());
+    let mut batch = kernel.batch();
+    batch.insert(&receipts, "reset", "done");
+    let report = kernel.commit_module_reset(prepared, batch).unwrap();
+    assert_eq!(report.old_era, memory.era());
+    assert_eq!(report.new_era, replacement);
+    assert!(!report.cleanup_pending);
+    assert_eq!(kernel.era(SESSION), session.era());
+    assert_eq!(kernel.era(MEMORY), replacement);
+    assert!(receipts.contains_key("reset").unwrap());
+    for name in &kernel.0.schema.0[MEMORY.0] {
+        assert!(!kernel
+            .0
+            .keyspace
+            .partition_exists(&partition_name(MEMORY.0, memory.era(), name)));
+        assert!(kernel
+            .0
+            .keyspace
+            .partition_exists(&partition_name(MEMORY.0, replacement, name)));
+    }
+    assert!(matches!(
+        memory.partition("entries"),
+        Err(KernelError::StaleEra { .. })
+    ));
+    drop((kernel, entries, memory, receipts, session));
+    let kernel = open(&root).unwrap();
+    assert!(kernel
+        .module(SESSION)
+        .partition("entries")
+        .unwrap()
+        .contains_key("reset")
+        .unwrap());
+    assert!(!kernel
+        .module(MEMORY)
+        .partition("entries")
+        .unwrap()
+        .contains_key("a")
+        .unwrap());
+    assert_eq!(kernel.era_state(MEMORY, report.old_era), EraState::Retired);
+}
+
+#[test]
+fn module_reset_cleanup_resumes_after_interruption() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("store");
+    let kernel = create(&root);
+    let old = kernel.era(MEMORY);
+    let replacement = EraId::new();
+    let abandoned = EraId::new();
+    kernel.prepare_module_reset(MEMORY, abandoned).unwrap();
+    let prepared = kernel.prepare_module_reset(MEMORY, replacement).unwrap();
+    *kernel.0.reset_fault.lock() = Some(ResetFault::DeletePartition("index"));
+    let report = kernel
+        .commit_module_reset(prepared, kernel.batch())
+        .unwrap();
+    assert!(report.cleanup_pending);
+    assert!(!kernel
+        .0
+        .keyspace
+        .partition_exists(&partition_name(MEMORY.0, old, "entries")));
+    assert!(kernel
+        .0
+        .keyspace
+        .partition_exists(&partition_name(MEMORY.0, old, "index")));
+    assert_eq!(kernel.era_state(MEMORY, old), EraState::Retired);
+    drop(kernel);
+
+    let kernel = open(&root).unwrap();
+    for name in &kernel.0.schema.0[MEMORY.0] {
+        assert!(!kernel
+            .0
+            .keyspace
+            .partition_exists(&partition_name(MEMORY.0, old, name)));
+        assert!(!kernel
+            .0
+            .keyspace
+            .partition_exists(&partition_name(MEMORY.0, abandoned, name)));
+        assert!(kernel
+            .0
+            .keyspace
+            .partition_exists(&partition_name(MEMORY.0, replacement, name)));
+    }
+    assert_eq!(kernel.era_state(MEMORY, old), EraState::Retired);
+    assert_eq!(kernel.era_state(MEMORY, abandoned), EraState::Unknown);
+    assert_eq!(kernel.era_state(MEMORY, replacement), EraState::Current);
+}
+
+#[test]
+fn module_reset_refuses_a_current_or_retired_era() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("store");
+    let kernel = create(&root);
+    let original = kernel.era(MEMORY);
+    let middle = EraId::new();
+    let last = EraId::new();
+    for era in [middle, last] {
+        let prepared = kernel.prepare_module_reset(MEMORY, era).unwrap();
+        kernel
+            .commit_module_reset(prepared.clone(), kernel.batch())
+            .unwrap();
+        assert!(
+            matches!(kernel.commit_module_reset(prepared, kernel.batch()),
+            Err(KernelError::InvalidEra(id)) if id == era)
+        );
+    }
+    drop(kernel);
+    let kernel = open(&root).unwrap();
+    for retired in [original, middle] {
+        assert_eq!(kernel.era_state(MEMORY, retired), EraState::Retired);
+        assert_eq!(kernel.era_state(SESSION, retired), EraState::Unknown);
+    }
+    for era in [original, middle, last] {
+        assert!(matches!(kernel.prepare_module_reset(MEMORY, era),
+            Err(KernelError::InvalidEra(id)) if id == era));
+    }
+    assert_eq!(kernel.era_state(MEMORY, EraId::new()), EraState::Unknown);
+}
+
+#[test]
+fn a_batch_refuses_partitions_of_a_stale_era() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("store");
+    let kernel = create(&root);
+    let memory = kernel.module(MEMORY);
+    let entries = memory.partition("entries").unwrap();
+    let receipts = kernel.module(SESSION).partition("entries").unwrap();
+    let cross_module_write = || {
+        let mut batch = kernel.batch();
+        batch.insert(&entries, "a", "payload");
+        batch.insert(&receipts, "a", "receipt");
+        batch
+    };
+    let late = cross_module_write();
+    let replacement = EraId::new();
+    let prepared = kernel.prepare_module_reset(MEMORY, replacement).unwrap();
+    kernel
+        .commit_module_reset(prepared, kernel.batch())
+        .unwrap();
+    assert!(
+        matches!(late.commit(), Err(KernelError::StaleEra { module: "memory", era }) if era == memory.era())
+    );
+    let another = kernel.prepare_module_reset(MEMORY, EraId::new()).unwrap();
+    assert!(
+        matches!(kernel.commit_module_reset(another, cross_module_write()),
+        Err(KernelError::StaleEra { module: "memory", era }) if era == memory.era())
+    );
+    assert!(!receipts.contains_key("a").unwrap());
+    assert_eq!(kernel.era(MEMORY), replacement);
+    let mut valid = kernel.batch();
+    valid.insert(&receipts, "b", "ok");
+    valid.commit().unwrap();
+}
+
+#[test]
+fn an_unknown_reset_outcome_poisons_the_kernel() {
+    for applied in [false, true] {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("store");
+        let kernel = create(&root);
+        let memory = kernel.module(MEMORY);
+        let receipts = kernel.module(SESSION).partition("entries").unwrap();
+        let replacement = EraId::new();
+        let prepared = kernel.prepare_module_reset(MEMORY, replacement).unwrap();
+        let mut batch = kernel.batch();
+        batch.insert(&receipts, "reset", "done");
+        let mut pending_read = receipts.iter();
+        let digest = kernel.keyed_hasher("test").finalize();
+        *kernel.0.reset_fault.lock() = Some(if applied {
+            ResetFault::LostCommitAck
+        } else {
+            ResetFault::UnappliedCommit
+        });
+        assert!(matches!(
+            kernel.commit_module_reset(prepared.clone(), batch),
+            Err(KernelError::CommitUnknown)
+        ));
+        assert_eq!(kernel.era(MEMORY), memory.era());
+        assert_eq!(kernel.module(MEMORY).era(), memory.era());
+        assert_eq!(kernel.era_state(MEMORY, replacement), EraState::Unknown);
+        assert_eq!(kernel.keyed_hasher("test").finalize(), digest);
+        drop(kernel.write_lock());
+        assert!(matches!(
+            memory.partition("entries"),
+            Err(KernelError::Poisoned)
+        ));
+        assert!(matches!(receipts.get("reset"), Err(KernelError::Poisoned)));
+        assert!(matches!(
+            receipts.contains_key("reset"),
+            Err(KernelError::Poisoned)
+        ));
+        assert!(matches!(
+            pending_read.next(),
+            Some(Err(KernelError::Poisoned))
+        ));
+        assert!(pending_read.next_back().is_none());
+        assert!(matches!(
+            receipts.iter().next(),
+            Some(Err(KernelError::Poisoned))
+        ));
+        assert!(matches!(
+            receipts.prefix("z").next(),
+            Some(Err(KernelError::Poisoned))
+        ));
+        assert!(matches!(
+            receipts.range("a"..="z").next_back(),
+            Some(Err(KernelError::Poisoned))
+        ));
+        assert!(matches!(
+            kernel.batch().commit(),
+            Err(KernelError::Poisoned)
+        ));
+        assert!(matches!(
+            kernel.prepare_module_reset(MEMORY, EraId::new()),
+            Err(KernelError::Poisoned)
+        ));
+        assert!(matches!(
+            kernel.commit_module_reset(prepared, kernel.batch()),
+            Err(KernelError::Poisoned)
+        ));
+        let old = memory.era();
+        drop(pending_read);
+        drop((kernel, receipts, memory));
+
+        let kernel = open(&root).unwrap();
+        let (current, leftover, leftover_state) = if applied {
+            (replacement, old, EraState::Retired)
+        } else {
+            (old, replacement, EraState::Unknown)
+        };
+        assert_eq!(kernel.era(MEMORY), current);
+        assert_eq!(kernel.era_state(MEMORY, leftover), leftover_state);
+        assert!(!kernel
+            .0
+            .keyspace
+            .partition_exists(&partition_name(MEMORY.0, leftover, "entries")));
+        assert_eq!(
+            kernel
+                .module(SESSION)
+                .partition("entries")
+                .unwrap()
+                .contains_key("reset")
+                .unwrap(),
+            applied
+        );
+    }
 }
