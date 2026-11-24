@@ -2,7 +2,7 @@
 
 | 术语 | 在本项目中的含义 | 易混用的说法 |
 | --- | --- | --- |
-| 存储内核（storage kernel） | MMDB 中唯一直接使用存储引擎的一层，提供目录租约、格式清单、批次提交、操作回执与键编码，不认识任何一类 agent 数据。 | 原生事务内核；把 `MemoryDatabase` 称作内核 |
+| 存储内核（storage kernel） | MMDB 中唯一直接使用存储引擎的一层，提供目录租约、格式清单、存储模块的 era、写锁与批次提交，不认识任何一类 agent 数据。 | 原生事务内核；把 `MemoryDatabase` 称作内核 |
 | 存储（store） | 由存储内核管理的一个目录，包含若干存储模块，一次由一个进程持有租约。 | 数据库；上下文库；指整个目录时说记忆存储 |
 | 存储模块（store module） | 存储中负责一类 agent 数据的部分，有自己的 era，可以单独重置。会话模块存放会话日志与检查点，记忆模块存放原生记忆与领域上下文。 | crate；分区；子库 |
 | 运行状态（operational state） | harness 推进执行所需的工作流、游标或队列数据，由 `StateStore` 按命名空间管理。 | 语义记忆；模型窗口；对话 |
@@ -13,7 +13,7 @@
 | owner / scope | owner 标识归属用户，scope 限定可访问的资料范围。agent、session 和 run 记录来源身份。 | 用 session 充当用户隔离边界；将 owner 当成多模型库的 tenant 编号 |
 | 记录引用（`ContextRef`） | 以记录所在存储模块的 era、owner、记录族及 ID 定位一条记录。 | 指向某次修订的 pin |
 | 固定版本（`RecordPin`） | 记录引用加具体 revision，可定位写入时使用的证据或 schema。 | 当前 head；摘要文本 |
-| 存储代际（era） | 标识一个存储模块的生命周期。重置这个模块或整个存储都产生新 era；格式 ID 描述可读写的磁盘契约。 | 格式版本；记录修订 |
+| 存储代际（era） | 标识一个存储模块的生命周期。重置这个模块或整个存储都产生新 era；格式 ID 描述可读写的磁盘契约。 | 格式版本；记录修订；清单里标识目录这一代的 `StoreEraId` |
 | 来源（sources / provenance） | sources 固定所依据的记录版本；provenance 标明操作的 actor 及可选 agent、session、run。 | 把向量相似度当作关系的依据 |
 | 操作回执（operation receipt） | 将操作 ID 和请求绑定到已提交的结果，供重试或确认提交状态。 | 外部工具已经产生效果的证明 |
 | 会话（session） | 一次 agent 交互，由一条头记录和它的会话日志组成，可以从另一会话的日志前缀 fork 出来。 | 对话；conversation |
