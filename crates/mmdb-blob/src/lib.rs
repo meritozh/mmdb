@@ -43,6 +43,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mmdb_core::{Error, Result};
+use mmdb_kernel::engine_format::{self, EngineRoot};
 
 use crate::metadata::{BlobMeta, MetaStore};
 
@@ -130,33 +131,23 @@ impl BlobStore {
 
     /// Validate the byte store and its optional enclosing engine before either is opened.
     pub fn check_format(root: &Path) -> Result<()> {
-        use mmdb_kernel::engine_format::{inspect, EngineRoot};
-        inspect(root, &["blobs", "blob-meta"])?;
-        if inspect(&fs::metadata_dir(root), &[])? == EngineRoot::New {
-            let bytes = root.join("blobs");
-            match std::fs::read_dir(&bytes) {
-                Ok(mut files) => {
-                    if files.next().transpose()?.is_some() {
-                        return Err(mmdb_core::Error::Storage(format!(
-                            "{} contains blob data without its metadata; open a new empty store",
-                            bytes.display()
-                        )));
-                    }
-                }
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-                _ => {}
+        match engine_format::inspect(&fs::metadata_dir(root), &[])? {
+            EngineRoot::New => {
+                engine_format::inspect(root, &["blobs", "blob-meta"])?;
+                fs::require_empty_blob_dir(root)?;
             }
+            EngineRoot::Existing => engine_format::inspect_enclosing(root)?,
         }
         Ok(())
     }
 
     fn open_with(path: impl AsRef<Path>, repair: bool) -> Result<Self> {
-        let root = path.as_ref().to_path_buf();
-        Self::check_format(&root)?;
-        fs::ensure_layout(&root)?;
-        let meta = Arc::new(MetaStore::open(&root)?);
+        let root = path.as_ref();
+        Self::check_format(root)?;
+        let meta = Arc::new(MetaStore::open(root)?);
+        fs::ensure_layout(root)?;
         let store = Self {
-            root,
+            root: root.to_owned(),
             meta,
             mutation: Default::default(),
         };

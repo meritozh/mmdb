@@ -78,6 +78,9 @@ impl MetaStore {
         let ks = FjallDatabase::builder(&meta_dir)
             .open()
             .map_err(|e| Error::Storage(format!("open blob-meta database: {e}")))?;
+        if !ks.keyspace_exists(PARTITION_META) {
+            fs::require_empty_blob_dir(root.as_ref())?;
+        }
         let meta = ks
             .keyspace(PARTITION_META, KeyspaceCreateOptions::default)
             .map_err(|e| Error::Storage(format!("open meta partition: {e}")))?;

@@ -17,10 +17,19 @@ pub struct Storage {
 
 impl Storage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::from_database(Self::open_database(path)?)
+    }
+
+    /// Open the primary engine before initializing any MMDB keyspaces.
+    pub fn open_database(path: impl AsRef<Path>) -> Result<FjallDatabase> {
         mmdb_kernel::engine_format::inspect(path.as_ref(), &[])?;
-        let ks = FjallDatabase::builder(path)
+        FjallDatabase::builder(path)
             .open()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Storage(e.to_string()))
+    }
+
+    /// Bind the node store to an open primary engine.
+    pub fn from_database(ks: FjallDatabase) -> Result<Self> {
         let nodes = ks
             .keyspace(partitions::NODES, KeyspaceCreateOptions::default)
             .map_err(|e| Error::Storage(e.to_string()))?;

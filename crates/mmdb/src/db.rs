@@ -77,10 +77,11 @@ impl Database {
     ) -> Result<Self> {
         let path = path.as_ref();
         BlobStore::check_format(path)?;
-        let storage = Arc::new(Storage::open(path)?);
+        let primary = Storage::open_database(path)?;
+        let blob_store = Arc::new(BlobStore::open(path)?);
+        let storage = Arc::new(Storage::from_database(primary)?);
         let vector_store = Arc::new(VectorStore::open(storage.database.clone(), path)?);
         let graph_store = Arc::new(GraphStore::open(storage.database.clone())?);
-        let blob_store = Arc::new(BlobStore::open(path)?);
         let audit_store = Arc::new(AuditStore::open(storage.database.clone())?);
         let lexical_index = Arc::new(LexicalIndex::open(storage.database.clone())?);
         let runtime_store = Arc::new(RuntimeStore::open(storage.database.clone())?);

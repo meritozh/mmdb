@@ -83,6 +83,48 @@ fn damaged_markers_and_orphan_bytes_survive_open_and_repair() {
     }
 }
 
+#[test]
+fn missing_blob_metadata_keyspace_preserves_payload_and_both_databases() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    drop(fjall::Database::builder(root).open().unwrap());
+    let metadata = root.join("blob-meta");
+    let db = fjall::Database::builder(&metadata).open().unwrap();
+    db.keyspace("unrelated", Default::default).unwrap();
+    drop(db);
+    let bytes = b"retained payload";
+    let hash = blake3::hash(bytes).to_hex();
+    let shard = root.join("blobs").join(&hash[..2]);
+    fs::create_dir_all(&shard).unwrap();
+    let payload = shard.join(hash.as_str());
+    fs::write(&payload, bytes).unwrap();
+
+    for error in [
+        BlobStore::open_with_repair(root).err(),
+        BlobStore::open(root).err(),
+        Database::open(root).err(),
+    ] {
+        let message = error
+            .expect("the missing metadata keyspace must reject open")
+            .to_string();
+        assert!(
+            message.contains("metadata") && message.contains(metadata.to_str().unwrap()),
+            "{message}"
+        );
+        assert_eq!(fs::read(&payload).unwrap(), bytes);
+    }
+    let db = fjall::Database::builder(&metadata).open().unwrap();
+    assert!(db.keyspace_exists("unrelated"));
+    assert!(!db.keyspace_exists("m"));
+    assert_eq!(
+        fjall::Database::builder(root)
+            .open()
+            .unwrap()
+            .keyspace_count(),
+        0
+    );
+}
+
 // Prepare MMDB_V2_FIXTURE using tools/fjall-v2/fixture.py. All destructive
 // operations below target independent copies inside the test's temporary root.
 #[test]
