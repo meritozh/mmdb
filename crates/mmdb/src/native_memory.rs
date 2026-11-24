@@ -4,11 +4,11 @@
 //! legacy `MemoryNode` database.  The manifest is checked before fjall is opened,
 //! so an old or otherwise unrecognised root is never adopted accidentally.
 
-use crate::store_format::{
-    require_managed_store, StoreEraId, StoreFormatError, StoreLease,
-    StoreManifest as OuterStoreManifest,
-};
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
+use mmdb_kernel::store_format::{
+    require_managed_store, StoreEraId, StoreFormatError, StoreLease,
+    StoreManifest as OuterStoreManifest, STORE_MANIFEST_FILE,
+};
 use parking_lot::Mutex;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -8609,7 +8609,7 @@ fn root_contains_only_outer_manifest(root: &Path) -> MemoryResult<bool> {
         return Ok(false);
     };
     let entry = entry.map_err(MemoryError::Io)?;
-    Ok(entry.file_name() == crate::store_format::STORE_MANIFEST_FILE && entries.next().is_none())
+    Ok(entry.file_name() == STORE_MANIFEST_FILE && entries.next().is_none())
 }
 
 fn open_partition(keyspace: &Keyspace, name: &str) -> MemoryResult<PartitionHandle> {
@@ -8629,7 +8629,7 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store_format::{ResetPlan, ResetSafety, STORE_MANIFEST_FILE};
+    use mmdb_kernel::store_format::{ResetPlan, ResetSafety};
     use std::time::Duration;
 
     fn create_test_database() -> (tempfile::TempDir, PathBuf, MemoryDatabase) {

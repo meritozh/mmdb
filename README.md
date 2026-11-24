@@ -81,6 +81,7 @@ timeouts, and retries. `Database::ingest`, `Database::recall`, and
 ```
 ┌──────────────────────────────────────────────────────────┐
 │                     mmdb (facade)                        │
+│                        └── mmdb-kernel (managed stores)  │
 ├──────────┬──────────┬──────────┬──────────┬──────────────┤
 │  vector  │  graph   │   blob   │  query   │   mmql/udf   │
 ├──────────┴──────────┴──────────┴──────────┴──────────────┤
@@ -98,6 +99,7 @@ timeouts, and retries. `Database::ingest`, `Database::recall`, and
 |-------|-------------|-------------|
 | `mmdb` | High-level facade, `NodeBuilder`, vector/graph/hybrid/blob/query APIs | [Embedded multi-model memory](docs/feature/multi-model-memory.md) |
 | `mmdb-core` | Shared types, traits, and errors | [Memory nodes](docs/feature/memory-nodes.md) |
+| `mmdb-kernel` | Managed store manifests, leases, and whole-store reset | [Operational state](docs/feature/operational-state.md) |
 | `mmdb-storage` | fjall node store, key encoding, time/kind/meta indexes | [Node persistence and indexes](docs/feature/memory-nodes.md) |
 | `mmdb-vector` | HNSW indexes, vector metadata, tombstones, snapshot reload | [Vector and hybrid search](docs/feature/vector-search.md) |
 | `mmdb-graph` | Bi-directional edges, BFS, label dictionary | [Graph traversal](docs/feature/graph-traversal.md) |

@@ -120,7 +120,7 @@ impl StoreFormatDescriptor {
         &self.format_id
     }
 
-    pub(crate) fn new_manifest(&self) -> StoreFormatResult<StoreManifest> {
+    pub fn new_manifest(&self) -> StoreFormatResult<StoreManifest> {
         StoreManifest::new(self.format_id.clone(), StoreEraId::new())
     }
 }

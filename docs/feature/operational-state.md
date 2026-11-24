@@ -10,4 +10,4 @@ Status: shipped
 
 `scan_page_after` 同时限制返回的存活条目数和检查的物理记录数。删除标记消耗扫描预算，空页也可能带有下一页游标。按返回的游标继续，直到游标为空。稀疏队列可选用 `sparse_queue_head`，以有界扫描增量建立存活 key 目录。
 
-[状态存储与测试](../../crates/mmdb/src/state.rs) · [格式、租约与显式重置](../../crates/mmdb/src/store_format.rs)
+[状态存储与测试](../../crates/mmdb/src/state.rs) · [格式、租约与显式重置](../../crates/mmdb-kernel/src/store_format.rs)

@@ -63,7 +63,7 @@ mod recall;
 mod runtime;
 mod search;
 mod state;
-pub mod store_format;
+pub use mmdb_kernel::store_format;
 #[cfg(test)]
 mod tests;
 

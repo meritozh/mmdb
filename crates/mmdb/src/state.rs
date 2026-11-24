@@ -1,8 +1,9 @@
-use crate::store_format::{
-    inspect_store_root, require_managed_store, StoreFormatDescriptor, StoreLease, StoreRootState,
-};
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
 use mmdb_core::{Error, Result};
+use mmdb_kernel::store_format::{
+    inspect_store_root, require_managed_store, StoreFormatDescriptor, StoreFormatError, StoreLease,
+    StoreRootState,
+};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -548,7 +549,7 @@ impl StateStore {
     }
 }
 
-fn state_store_format_error(error: crate::store_format::StoreFormatError) -> Error {
+fn state_store_format_error(error: StoreFormatError) -> Error {
     Error::Storage(error.to_string())
 }
 
@@ -581,11 +582,8 @@ fn state_key(tenant: u32, namespace: &str, key: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        native_memory::MemoryDatabase,
-        store_format::{require_managed_store, StoreFormatDescriptor, STORE_MANIFEST_FILE},
-        Database,
-    };
+    use crate::{native_memory::MemoryDatabase, Database};
+    use mmdb_kernel::store_format::STORE_MANIFEST_FILE;
     use serde_json::json;
 
     #[test]
