@@ -2,7 +2,7 @@ use super::storage::*;
 use super::*;
 use crate::{Actor, OperationId, RecordState, Scope, TemporalFacts};
 use serde::{Deserialize, Serialize};
-use std::io::{ErrorKind, Read};
+use std::io::Read;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SessionHead {
@@ -23,6 +23,84 @@ fn identity_key(owner: &str, session: &str, identity: &str) -> Vec<u8> {
     key
 }
 
+pub(crate) struct LogGate {
+    calls: mmdb_kernel::Partition,
+    messages: mmdb_kernel::Partition,
+}
+
+impl ContextPartitions {
+    pub(crate) fn log_gate(&self) -> LogGate {
+        LogGate {
+            calls: self.calls.clone(),
+            messages: self.messages.clone(),
+        }
+    }
+}
+
+impl crate::records::Gate for LogGate {
+    fn admits(
+        &self,
+        owner: &str,
+        header: &RecordHeader,
+        active: bool,
+        now: &crate::records::Availability,
+    ) -> ContextResult<bool> {
+        if let Some(checkpoint) = &header.checkpoint {
+            return Ok(if active {
+                checkpoint.availability_epoch == now.epoch
+            } else {
+                checkpoint.availability_epoch >= now.redaction_epoch
+            });
+        }
+        if let Some(history) = &header.history {
+            return self.message_available_locked(owner, history);
+        }
+        Ok(true)
+    }
+}
+
+impl LogGate {
+    fn message_available_locked(&self, owner: &str, history: &HistoryEntry) -> ContextResult<bool> {
+        let call;
+        let id = match &history.kind {
+            HistoryKind::AssistantStarted { message_id }
+            | HistoryKind::AssistantFragment { message_id, .. }
+            | HistoryKind::AssistantTerminal { message_id, .. } => message_id,
+            HistoryKind::ToolCall { call_id, .. } | HistoryKind::ToolResult { call_id, .. } => {
+                call = load_call(&self.calls, owner, &history.session, call_id)?
+                    .ok_or_else(|| ContextError::Corrupt("missing tool call index".into()))?;
+                if call.purged {
+                    return Ok(false);
+                }
+                let Some(id) = &call.message_id else {
+                    return Ok(true);
+                };
+                id
+            }
+            _ => return Ok(true),
+        };
+        let state: MessageState = self
+            .messages
+            .get(identity_key(owner, &history.session, id))?
+            .map(|bytes| decode(&bytes))
+            .transpose()?
+            .ok_or_else(|| ContextError::Corrupt("missing message lifecycle".into()))?;
+        Ok(!state.unavailable)
+    }
+}
+
+fn load_call(
+    calls: &mmdb_kernel::Partition,
+    owner: &str,
+    session: &str,
+    call_id: &str,
+) -> ContextResult<Option<ToolCallIndex>> {
+    calls
+        .get(identity_key(owner, session, call_id))?
+        .map(|bytes| decode(&bytes))
+        .transpose()
+}
+
 impl ContextStore<'_> {
     /// Enumerate native history without relying on an application projection.
     /// This recovery catalog requires trusted harness authority.
@@ -31,7 +109,7 @@ impl ContextStore<'_> {
         limit: usize,
         after: Option<&str>,
     ) -> ContextResult<HistorySessionPage> {
-        if !matches!(self.access.actor, Actor::System | Actor::Operator) {
+        if !matches!(self.scoped.access().actor, Actor::System | Actor::Operator) {
             return Err(ContextError::AccessDenied);
         }
         if limit == 0 || limit > 100 {
@@ -42,11 +120,11 @@ impl ContextStore<'_> {
         if let Some(after) = after {
             validate_name(after, "session cursor")?;
         }
-        let _guard = self.db.kernel.write_lock();
-        let prefix = owner_key(&self.access.owner);
+        let _guard = self.scoped.lock();
+        let prefix = owner_key(&self.scoped.access().owner);
         let start = after.map_or_else(
             || prefix.clone(),
-            |session| session_key(&self.access.owner, session),
+            |session| session_key(&self.scoped.access().owner, session),
         );
         let mut sessions = Vec::new();
         let mut next = None;
@@ -77,7 +155,7 @@ impl ContextStore<'_> {
                 .map_err(|_| ContextError::Corrupt("invalid session identity".into()))?;
             let head: SessionHead = decode(&value)?;
             next = Some(session.clone());
-            if self.check_scope(&head.scope).is_ok() {
+            if self.scoped.check_scope(&head.scope).is_ok() {
                 sessions.push(session);
             }
         }
@@ -93,19 +171,19 @@ impl ContextStore<'_> {
         &self,
         operation: OperationId,
         input: HistoryInput,
-        mut payload: R,
+        payload: R,
     ) -> ContextResult<WriteReceipt> {
         self.validate_history_input(&input)?;
-        let _guard = self.db.kernel.write_lock();
-        let event_key = identity_key(&self.access.owner, &input.session, &input.event_id);
-        let previous_operation = self.stored_operation(operation)?;
+        let _guard = self.scoped.lock();
+        let event_key = identity_key(&self.scoped.access().owner, &input.session, &input.event_id);
+        let previous_operation = self.scoped.has_operation(operation)?;
         let previous_event: Option<StoredEvent> = self
             .parts
             .events
             .get(&event_key)?
             .map(|bytes| decode(&bytes))
             .transpose()?;
-        let session_key = session_key(&self.access.owner, &input.session);
+        let session_key = session_key(&self.scoped.access().owner, &input.session);
         let head: Option<SessionHead> = self
             .parts
             .history_heads
@@ -113,7 +191,7 @@ impl ContextStore<'_> {
             .map(|bytes| decode(&bytes))
             .transpose()?;
         if let Some(head) = &head {
-            self.check_scope(&head.scope)?;
+            self.scoped.check_scope(&head.scope)?;
             if head.scope != input.scope {
                 return Err(ContextError::InvalidInput(
                     "a session's history scope cannot change".into(),
@@ -121,7 +199,7 @@ impl ContextStore<'_> {
             }
         }
         let sequence = head.map_or(0, |head| head.sequence);
-        let writing = previous_operation.is_none() && previous_event.is_none();
+        let writing = !previous_operation && previous_event.is_none();
         let (sources, source_scopes) = if writing {
             if let Some(expected) = input.expected_sequence {
                 if expected != sequence {
@@ -133,7 +211,7 @@ impl ContextStore<'_> {
             }
             let mut sources = self.validate_call_link(&input)?;
             sources.extend(input.sources.clone());
-            let source_scopes = self.validate_history_sources(&input.scope, &sources)?;
+            let source_scopes = self.scoped.validate_copy_sources(&input.scope, &sources)?;
             (sources, source_scopes)
         } else {
             (Vec::new(), Vec::new())
@@ -143,66 +221,30 @@ impl ContextStore<'_> {
         } else {
             None
         };
-        let pin = self.fresh_pin(RecordKind::History);
-        if writing {
-            let mut batch = self.db.kernel.batch();
-            batch.insert(
-                &self.parts.pending,
-                record_key(&pin.record),
-                encode(&StagedUpload {
-                    pin: pin.clone(),
-                    operation,
-                    purge: false,
-                })?,
-            );
-            batch.commit()?;
-        }
-        let mut buffer = vec![0; PAYLOAD_CHUNK_BYTES];
-        let mut hasher = self.db.kernel.keyed_hasher("context-history-payload");
-        let mut length = 0_u64;
-        let mut chunk = 0_u64;
-        loop {
-            let mut used = 0;
-            while used < buffer.len() {
-                match payload.read(&mut buffer[used..]) {
-                    Ok(0) => break,
-                    Ok(count) => used += count,
-                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            if used == 0 {
-                break;
-            }
-            hasher.update(&buffer[..used]);
-            length = length
-                .checked_add(used as u64)
-                .ok_or(ContextError::BudgetExceeded)?;
-            if writing {
-                let mut value = Vec::with_capacity(32 + used);
-                value.extend_from_slice(&self.content_digest(&buffer[..used]));
-                value.extend_from_slice(&buffer[..used]);
-                let mut batch = self.db.kernel.batch();
-                batch.insert(&self.parts.payloads, payload_key(&pin, chunk), value);
-                batch.commit()?;
-            }
-            chunk += 1;
-        }
-        let payload_digest = *hasher.finalize().as_bytes();
-        let digest = self.digest("append-history", &(&input, length, payload_digest))?;
-        if let Some(receipt) = self.replay(operation, digest)? {
+        let pin = self.scoped.fresh_pin(RecordKind::History);
+        let streamed = self
+            .scoped
+            .stream_payload(payload, writing.then_some((&pin, operation)))?;
+        let length = streamed.descriptor.bytes;
+        let payload_digest = streamed.descriptor.digest;
+        let digest = self
+            .scoped
+            .digest("append-history", &(&input, length, payload_digest))?;
+        if let Some(receipt) = self.scoped.replay(operation, digest)? {
             return Ok(receipt);
         }
         let mut event_input = input.clone();
         event_input.expected_sequence = None;
-        let event_digest = self.digest("history-event", &(&event_input, length, payload_digest))?;
+        let event_digest = self
+            .scoped
+            .digest("history-event", &(&event_input, length, payload_digest))?;
         if let Some(previous) = previous_event {
             if previous.digest != event_digest {
                 return Err(ContextError::IdempotencyConflict);
             }
-            self.header_locked(&previous.receipt.pin)?;
-            return self.commit_operation(
-                self.db.kernel.batch(),
+            self.scoped.header_locked(&previous.receipt.pin)?;
+            return self.scoped.commit_operation(
+                self.scoped.batch(),
                 operation,
                 digest,
                 previous.receipt,
@@ -221,7 +263,7 @@ impl ContextStore<'_> {
             kind: input.kind.clone(),
             media_type: input.media_type,
         };
-        let mut provenance = self.provenance();
+        let mut provenance = self.scoped.provenance();
         provenance.session = Some(input.session.clone());
         let header = RecordHeader {
             pin: pin.clone(),
@@ -234,11 +276,7 @@ impl ContextStore<'_> {
             information: InformationKind::Observation,
             temporal: TemporalFacts::observed_at(input.occurred_at_ms),
             recorded_at_ms: super::super::now_ms(),
-            payload: PayloadDescriptor {
-                revision: pin.revision,
-                bytes: length,
-                digest: payload_digest,
-            },
+            payload: streamed.descriptor.clone(),
             endpoints: None,
             history: Some(history),
             checkpoint: None,
@@ -247,11 +285,11 @@ impl ContextStore<'_> {
             pin: pin.clone(),
             history_sequence: Some(next_sequence),
         };
-        let mut batch = self.db.kernel.batch();
+        let mut batch = self.scoped.batch();
         if let Some((key, state)) = message_transition {
             batch.insert(&self.parts.messages, key, encode(&state)?);
         }
-        self.put_header(&mut batch, &header)?;
+        self.scoped.put_header(&mut batch, &header)?;
         let mut order_key = session_key.clone();
         order_key.extend_from_slice(&next_sequence.to_be_bytes());
         batch.insert(&self.parts.history_order, order_key, encode(&pin.record)?);
@@ -278,7 +316,7 @@ impl ContextStore<'_> {
                 ..
             } => batch.insert(
                 &self.parts.calls,
-                identity_key(&self.access.owner, &input.session, &call_id),
+                identity_key(&self.scoped.access().owner, &input.session, &call_id),
                 encode(&ToolCallIndex {
                     record: pin.record.clone(),
                     message_id,
@@ -287,22 +325,24 @@ impl ContextStore<'_> {
             ),
             HistoryKind::ToolResult { call_id, .. } => batch.insert(
                 &self.parts.results,
-                identity_key(&self.access.owner, &input.session, &call_id),
+                identity_key(&self.scoped.access().owner, &input.session, &call_id),
                 encode(&pin.record)?,
             ),
             _ => {}
         }
-        batch.remove(&self.parts.pending, record_key(&pin.record));
-        self.commit_operation(batch, operation, digest, receipt)
+        streamed.publish(&mut batch);
+        self.scoped
+            .commit_operation(batch, operation, digest, receipt)
     }
 
     fn validate_history_input(&self, input: &HistoryInput) -> ContextResult<()> {
-        self.check_scope(&input.scope)?;
+        self.scoped.check_scope(&input.scope)?;
         validate_name(&input.session, "session")?;
         validate_name(&input.event_id, "event identity")?;
         validate_name(&input.media_type, "media type")?;
         if self
-            .access
+            .scoped
+            .access()
             .session
             .as_ref()
             .is_some_and(|session| session != &input.session)
@@ -311,7 +351,7 @@ impl ContextStore<'_> {
         }
         if input.kind == HistoryKind::UserMessage
             && !matches!(
-                self.access.actor,
+                self.scoped.access().actor,
                 Actor::User | Actor::System | Actor::Operator
             )
         {
@@ -352,7 +392,7 @@ impl ContextStore<'_> {
             | HistoryKind::AssistantTerminal { message_id, .. } => message_id,
             _ => return Ok(None),
         };
-        let key = identity_key(&self.access.owner, &input.session, message_id);
+        let key = identity_key(&self.scoped.access().owner, &input.session, message_id);
         let previous: Option<MessageState> = self
             .parts
             .messages
@@ -396,19 +436,23 @@ impl ContextStore<'_> {
     ) -> ContextResult<Option<MessageState>> {
         validate_name(session, "session")?;
         validate_name(message_id, "assistant message identity")?;
-        let _guard = self.db.kernel.write_lock();
+        let _guard = self.scoped.lock();
         let head: Option<SessionHead> = self
             .parts
             .history_heads
-            .get(session_key(&self.access.owner, session))?
+            .get(session_key(&self.scoped.access().owner, session))?
             .map(|bytes| decode(&bytes))
             .transpose()?;
         if let Some(head) = head {
-            self.check_scope(&head.scope)?;
+            self.scoped.check_scope(&head.scope)?;
         }
         self.parts
             .messages
-            .get(identity_key(&self.access.owner, session, message_id))?
+            .get(identity_key(
+                &self.scoped.access().owner,
+                session,
+                message_id,
+            ))?
             .map(|bytes| decode(&bytes))
             .transpose()
     }
@@ -418,53 +462,26 @@ impl ContextStore<'_> {
         session: &str,
         sequence: u64,
     ) -> ContextResult<RecordHeader> {
-        let mut key = session_key(&self.access.owner, session);
+        let mut key = session_key(&self.scoped.access().owner, session);
         key.extend_from_slice(&sequence.to_be_bytes());
         let record = self.parts.history_order.get(key)?.ok_or_else(|| {
             ContextError::InvalidInput("checkpoint history position has not been committed".into())
         })?;
-        self.head_locked(&decode(&record)?)
+        self.scoped.head_locked(&decode(&record)?)
     }
 
     fn call_index(&self, session: &str, call_id: &str) -> ContextResult<Option<ToolCallIndex>> {
-        self.parts
-            .calls
-            .get(identity_key(&self.access.owner, session, call_id))?
-            .map(|bytes| decode(&bytes))
-            .transpose()
+        load_call(
+            &self.parts.calls,
+            &self.scoped.access().owner,
+            session,
+            call_id,
+        )
     }
 
     fn indexed_call(&self, session: &str, call_id: &str) -> ContextResult<ToolCallIndex> {
         self.call_index(session, call_id)?
             .ok_or_else(|| ContextError::Corrupt("missing tool call index".into()))
-    }
-
-    pub(crate) fn message_available_locked(&self, history: &HistoryEntry) -> ContextResult<bool> {
-        let call;
-        let id = match &history.kind {
-            HistoryKind::AssistantStarted { message_id }
-            | HistoryKind::AssistantFragment { message_id, .. }
-            | HistoryKind::AssistantTerminal { message_id, .. } => message_id,
-            HistoryKind::ToolCall { call_id, .. } | HistoryKind::ToolResult { call_id, .. } => {
-                call = self.indexed_call(&history.session, call_id)?;
-                if call.purged {
-                    return Ok(false);
-                }
-                let Some(id) = &call.message_id else {
-                    return Ok(true);
-                };
-                id
-            }
-            _ => return Ok(true),
-        };
-        let state: MessageState = self
-            .parts
-            .messages
-            .get(identity_key(&self.access.owner, &history.session, id))?
-            .map(|bytes| decode(&bytes))
-            .transpose()?
-            .ok_or_else(|| ContextError::Corrupt("missing message lifecycle".into()))?;
-        Ok(!state.unavailable)
     }
 
     pub(crate) fn withdraw_history(
@@ -483,14 +500,14 @@ impl ContextStore<'_> {
             } => {
                 let mut call = self.indexed_call(&history.session, call_id)?;
                 call.purged = true;
-                let key = identity_key(&self.access.owner, &history.session, call_id);
+                let key = identity_key(&self.scoped.access().owner, &history.session, call_id);
                 batch.insert(&self.parts.calls, key, encode(&call)?);
                 let Some(id) = message_id else { return Ok(()) };
                 id
             }
             _ => return Ok(()),
         };
-        let key = identity_key(&self.access.owner, &history.session, id);
+        let key = identity_key(&self.scoped.access().owner, &history.session, id);
         let mut state: MessageState = self
             .parts
             .messages
@@ -514,7 +531,11 @@ impl ContextStore<'_> {
                     let state: MessageState = self
                         .parts
                         .messages
-                        .get(identity_key(&self.access.owner, &input.session, message_id))?
+                        .get(identity_key(
+                            &self.scoped.access().owner,
+                            &input.session,
+                            message_id,
+                        ))?
                         .map(|bytes| decode(&bytes))
                         .transpose()?
                         .ok_or_else(|| {
@@ -529,7 +550,7 @@ impl ContextStore<'_> {
                     }
                 }
                 if self.parts.calls.contains_key(identity_key(
-                    &self.access.owner,
+                    &self.scoped.access().owner,
                     &input.session,
                     call_id,
                 ))? {
@@ -537,17 +558,17 @@ impl ContextStore<'_> {
                 }
             }
             HistoryKind::ToolResult { call_id, .. } => {
-                let key = identity_key(&self.access.owner, &input.session, call_id);
+                let key = identity_key(&self.scoped.access().owner, &input.session, call_id);
                 let call = self.call_index(&input.session, call_id)?.ok_or_else(|| {
                     ContextError::InvalidInput(
                         "tool result has no preceding call in this session".into(),
                     )
                 })?;
-                let header = self.head_locked(&call.record)?;
+                let header = self.scoped.head_locked(&call.record)?;
                 // A completed operation may have revised a source used by its
                 // call. Pair immutable originals using historical readability;
                 // purge and message unavailability still invalidate the link.
-                if !self.available_locked(&header.pin, false)? {
+                if !self.scoped.available_locked(&header.pin, false)? {
                     return Err(ContextError::Unavailable(call.record));
                 }
                 if self.parts.results.contains_key(key)? {
@@ -562,15 +583,15 @@ impl ContextStore<'_> {
 
     pub fn history_position(&self, session: &str) -> ContextResult<u64> {
         validate_name(session, "session")?;
-        let _guard = self.db.kernel.write_lock();
+        let _guard = self.scoped.lock();
         let head: Option<SessionHead> = self
             .parts
             .history_heads
-            .get(session_key(&self.access.owner, session))?
+            .get(session_key(&self.scoped.access().owner, session))?
             .map(|bytes| decode(&bytes))
             .transpose()?;
         if let Some(head) = head {
-            self.check_scope(&head.scope)?;
+            self.scoped.check_scope(&head.scope)?;
             Ok(head.sequence)
         } else {
             Ok(0)
@@ -586,17 +607,17 @@ impl ContextStore<'_> {
     ) -> ContextResult<(Option<RecordHeader>, Option<RecordHeader>)> {
         validate_name(session, "session")?;
         validate_name(call_id, "tool call identity")?;
-        let _guard = self.db.kernel.write_lock();
-        let key = identity_key(&self.access.owner, session, call_id);
+        let _guard = self.scoped.lock();
+        let key = identity_key(&self.scoped.access().owner, session, call_id);
         let call = self
             .call_index(session, call_id)?
-            .map(|call| self.head_locked(&call.record))
+            .map(|call| self.scoped.head_locked(&call.record))
             .transpose()?;
         let result = self
             .parts
             .results
             .get(&key)?
-            .map(|bytes| self.head_locked(&decode(&bytes)?))
+            .map(|bytes| self.scoped.head_locked(&decode(&bytes)?))
             .transpose()?;
         Ok((call, result))
     }
@@ -613,8 +634,8 @@ impl ContextStore<'_> {
                 "history page limit must be 1..=100".into(),
             ));
         }
-        let _guard = self.db.kernel.write_lock();
-        let prefix = session_key(&self.access.owner, session);
+        let _guard = self.scoped.lock();
+        let prefix = session_key(&self.scoped.access().owner, session);
         let mut start = prefix.clone();
         start.extend_from_slice(&after_sequence.to_be_bytes());
         let mut entries = Vec::new();
@@ -635,7 +656,7 @@ impl ContextStore<'_> {
                     next_sequence,
                 });
             }
-            let header = self.head_locked(&decode(&reference)?)?;
+            let header = self.scoped.head_locked(&decode(&reference)?)?;
             entries.push(header);
         }
         Ok(HistoryPage {
@@ -651,61 +672,7 @@ impl ContextStore<'_> {
         max_chunks: usize,
         max_uploads: usize,
     ) -> ContextResult<RecoveryReport> {
-        if max_chunks == 0 || max_chunks > 4096 || max_uploads == 0 || max_uploads > 100 {
-            return Err(ContextError::InvalidInput("invalid cleanup budget".into()));
-        }
-        let _guard = self.db.kernel.write_lock();
-        let mut report = RecoveryReport {
-            chunks_removed: 0,
-            uploads_removed: 0,
-            more: false,
-        };
-        for entry in self.parts.pending.prefix(owner_key(&self.access.owner)) {
-            let (key, bytes) = entry?;
-            if report.chunks_removed == max_chunks || report.uploads_removed == max_uploads {
-                report.more = true;
-                break;
-            }
-            let staged: StagedUpload = decode(&bytes)?;
-            self.check_ref(&staged.pin.record)?;
-            let head = self.head_locked(&staged.pin.record);
-            match (staged.purge, head) {
-                (true, Ok(header)) if header.state == RecordState::Purged => {}
-                (false, Err(ContextError::NotFound(_))) => {}
-                (_, Err(error)) => return Err(error),
-                _ => {
-                    return Err(ContextError::Corrupt(
-                        "cleanup entry points at committed live data".into(),
-                    ))
-                }
-            }
-            let prefix = if staged.purge {
-                record_key(&staged.pin.record)
-            } else {
-                revision_key(&staged.pin)
-            };
-            let remaining = max_chunks - report.chunks_removed;
-            let mut batch = self.db.kernel.batch();
-            let mut complete = true;
-            for (seen, chunk) in self.parts.payloads.prefix(prefix).enumerate() {
-                if seen == remaining {
-                    complete = false;
-                    break;
-                }
-                let (chunk_key, _) = chunk?;
-                batch.remove(&self.parts.payloads, chunk_key);
-                report.chunks_removed += 1;
-            }
-            if complete {
-                batch.remove(&self.parts.pending, key);
-                report.uploads_removed += 1;
-            }
-            batch.commit()?;
-            if !complete {
-                report.more = true;
-                break;
-            }
-        }
-        Ok(report)
+        self.scoped
+            .recover_payloads(StoreModule::Session, max_chunks, max_uploads)
     }
 }

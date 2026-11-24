@@ -88,8 +88,8 @@ impl ContextStore<'_> {
                 "extraction batch exceeds {MAX_BATCH_SIZE} operations"
             )));
         }
-        let _guard = self.db.kernel.write_lock();
-        let op_key = extraction_key(&self.access.owner, operation_id);
+        let _guard = self.scoped.lock();
+        let op_key = extraction_key(&self.scoped.access().owner, operation_id);
 
         // Completed memo -> replay.
         if let Some(bytes) = self.parts.extraction_receipts.get(op_key.clone())? {
@@ -111,7 +111,7 @@ impl ContextStore<'_> {
         }
 
         // Persist the Incomplete marker in its own durable commit first.
-        let mut marker = self.db.kernel.batch();
+        let mut marker = self.scoped.batch();
         marker.insert(&self.parts.extraction_incomplete, op_key.clone(), b"1");
         marker.commit()?;
 
@@ -137,7 +137,7 @@ impl ContextStore<'_> {
     }
 
     fn clear_extraction_marker(&self, key: &[u8]) -> ContextResult<()> {
-        let mut batch = self.db.kernel.batch();
+        let mut batch = self.scoped.batch();
         batch.remove(&self.parts.extraction_incomplete, key);
         Ok(batch.commit()?)
     }
@@ -147,7 +147,7 @@ impl ContextStore<'_> {
         operation_id: Ulid,
         ops: &[ExtractionOp],
     ) -> ContextResult<(ExtractionReceipt, mmdb_kernel::Batch)> {
-        let mut batch = self.db.kernel.batch();
+        let mut batch = self.scoped.batch();
         let mut receipt = ExtractionReceipt {
             operation_id,
             created_objects: Vec::new(),
@@ -166,14 +166,14 @@ impl ContextStore<'_> {
                     let type_def = self.type_definition_locked(type_ref)?;
                     self.validate_properties(&type_def, properties, &type_def.scope)?;
                     if !sources.is_empty() {
-                        self.validate_sources(
+                        self.scoped.validate_sources(
                             &type_def.scope,
                             sources,
                             InformationKind::Observation,
                             None,
                         )?;
                     }
-                    let pin = self.fresh_pin(RecordKind::Object);
+                    let pin = self.scoped.fresh_pin(RecordKind::Object);
                     self.write_record(
                         &mut batch,
                         &pin,
@@ -190,14 +190,14 @@ impl ContextStore<'_> {
                     properties,
                     sources,
                 } => {
-                    let (previous, pin) = self.next_revision(expected)?;
+                    let (previous, pin) = self.scoped.next_revision(expected)?;
                     let type_ref = previous.type_pin.clone().ok_or_else(|| {
                         ContextError::InvalidInput("revised record has no type".into())
                     })?;
                     let type_def = self.type_definition_locked(&type_ref)?;
                     self.validate_properties(&type_def, properties, &previous.scope)?;
                     if !sources.is_empty() {
-                        self.validate_sources(
+                        self.scoped.validate_sources(
                             &previous.scope,
                             sources,
                             InformationKind::Observation,
@@ -232,14 +232,14 @@ impl ContextStore<'_> {
                     let mut properties: Properties = BTreeMap::new();
                     properties.insert("weight".into(), serde_json::json!(*weight));
                     if !sources.is_empty() {
-                        self.validate_sources(
+                        self.scoped.validate_sources(
                             &type_def.scope,
                             sources,
                             InformationKind::Observation,
                             None,
                         )?;
                     }
-                    let pin = self.fresh_pin(RecordKind::Relation);
+                    let pin = self.scoped.fresh_pin(RecordKind::Relation);
                     self.write_record(
                         &mut batch,
                         &pin,
@@ -257,7 +257,7 @@ impl ContextStore<'_> {
                     evidence: _,
                     sources,
                 } => {
-                    let (previous, pin) = self.next_revision(expected)?;
+                    let (previous, pin) = self.scoped.next_revision(expected)?;
                     let type_ref = previous.type_pin.clone().ok_or_else(|| {
                         ContextError::InvalidInput("revised relation has no type".into())
                     })?;
@@ -266,7 +266,7 @@ impl ContextStore<'_> {
                         properties.insert("weight".into(), serde_json::json!(*weight));
                     }
                     if !sources.is_empty() {
-                        self.validate_sources(
+                        self.scoped.validate_sources(
                             &previous.scope,
                             sources,
                             InformationKind::Observation,
@@ -287,7 +287,7 @@ impl ContextStore<'_> {
             }
         }
         if !receipt.revised_objects.is_empty() || !receipt.revised_relations.is_empty() {
-            self.advance_availability_epoch(&mut batch)?;
+            self.scoped.advance_epoch(&mut batch)?;
         }
         Ok((receipt, batch))
     }
@@ -313,21 +313,16 @@ impl ContextStore<'_> {
             type_pin,
             sources,
             source_scopes: Vec::new(),
-            provenance: self.provenance(),
+            provenance: self.scoped.provenance(),
             information: InformationKind::Observation,
             temporal: TemporalFacts::observed_at(now),
             recorded_at_ms: now,
-            payload: crate::context::PayloadDescriptor {
-                revision: pin.revision,
-                bytes: bytes.len() as u64,
-                digest: self.content_digest(&bytes),
-            },
+            payload: self.scoped.put_payload(batch, pin, &bytes),
             endpoints,
             history: None,
             checkpoint: None,
         };
-        self.put_payload(batch, pin, &bytes);
-        self.put_header(batch, &header)?;
+        self.scoped.put_header(batch, &header)?;
         self.replace_postings(batch, &header, Some(properties))?;
         self.replace_adjacency(batch, None, &header)?;
         Ok(())

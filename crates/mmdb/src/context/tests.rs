@@ -2,7 +2,6 @@ use super::*;
 use crate::{Actor, OperationId, RecordState, Scope, TemporalFacts};
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::sync::atomic::Ordering;
 use ulid::Ulid;
 
 #[test]
@@ -144,7 +143,7 @@ fn committed_history_survives_a_lost_acknowledgement_without_duplication() {
         let store = db
             .context(ContextAccess::new("owner", Actor::Assistant))
             .unwrap();
-        store.parts.fail_commit_ack.store(true, Ordering::SeqCst);
+        store.scoped.lose_next_commit_ack();
         let error = store
             .append_history(operation, input.clone(), b"durable answer".as_slice())
             .unwrap_err();
@@ -209,10 +208,16 @@ fn checksum_failure_is_reported_instead_of_returning_modified_source_bytes() {
         )
         .unwrap();
     let key = storage::payload_key(&receipt.pin, 0);
-    let mut bytes = store.parts.payloads.get(&key).unwrap().unwrap().to_vec();
+    let mut bytes = store
+        .scoped
+        .test_payloads()
+        .get(&key)
+        .unwrap()
+        .unwrap()
+        .to_vec();
     bytes[32] ^= 1;
-    let mut batch = store.db.kernel.batch();
-    batch.insert(&store.parts.payloads, key, bytes);
+    let mut batch = store.scoped.batch();
+    batch.insert(store.scoped.test_payloads(), key, bytes);
     batch.commit().unwrap();
     assert!(matches!(
         store.read_payload(&receipt.pin, 0, 32),
@@ -829,7 +834,7 @@ fn extraction_batch_failure_is_atomic() {
     let (_dir, store) = fresh_store();
     let bogus = RecordPin {
         record: ContextRef {
-            era: store.db.era_id(),
+            era: store.scoped.era(StoreModule::Memory),
             owner: "owner".into(),
             kind: RecordKind::Object,
             id: Ulid::new(),
@@ -934,7 +939,7 @@ fn extraction_crash_recovery() {
     // Simulate a previous crash: an Incomplete marker exists but no receipt.
     let mut key = crate::context::storage::owner_key("owner");
     crate::context::storage::segment(&mut key, op.0.to_be_bytes().as_slice());
-    let mut batch = store.db.kernel.batch();
+    let mut batch = store.scoped.batch();
     batch.insert(&store.parts.extraction_incomplete, key, b"1");
     batch.commit().unwrap();
 

@@ -17,22 +17,26 @@ impl ContextStore<'_> {
         operation: OperationId,
         definition: TypeDefinition,
     ) -> ContextResult<WriteReceipt> {
-        let _guard = self.db.kernel.write_lock();
+        let _guard = self.scoped.lock();
         self.validate_definition(&definition)?;
-        let digest = self.digest("define-type", &definition)?;
-        if let Some(receipt) = self.replay(operation, digest)? {
+        let digest = self.scoped.digest("define-type", &definition)?;
+        if let Some(receipt) = self.scoped.replay(operation, digest)? {
             return Ok(receipt);
         }
-        let key = name_key(&self.access.owner, &definition.scope, &definition.name)?;
+        let key = name_key(
+            &self.scoped.access().owner,
+            &definition.scope,
+            &definition.name,
+        )?;
         if let Some(reference) = self.parts.names.get(&key)? {
             let record: ContextRef = decode(&reference)?;
-            let header = self.head_locked(&record)?;
+            let header = self.scoped.head_locked(&record)?;
             let current = self.type_definition_locked(&header.pin)?;
             if current != definition {
                 return Err(ContextError::TypeConflict(definition.name));
             }
-            return self.commit_operation(
-                self.db.kernel.batch(),
+            return self.scoped.commit_operation(
+                self.scoped.batch(),
                 operation,
                 digest,
                 WriteReceipt {
@@ -44,7 +48,7 @@ impl ContextStore<'_> {
         self.write_type_locked(
             operation,
             digest,
-            self.fresh_pin(RecordKind::Type),
+            self.scoped.fresh_pin(RecordKind::Type),
             definition,
         )
     }
@@ -57,10 +61,10 @@ impl ContextStore<'_> {
         name: &str,
         kind: TypeKind,
     ) -> ContextResult<RecordPin> {
-        let key = name_key(&self.access.owner, &Scope::Personal, name)?;
+        let key = name_key(&self.scoped.access().owner, &Scope::Personal, name)?;
         if let Some(reference) = self.parts.names.get(&key)? {
             let record: ContextRef = decode(&reference)?;
-            return self.head_locked(&record).map(|header| header.pin);
+            return self.scoped.head_locked(&record).map(|header| header.pin);
         }
         let definition = TypeDefinition {
             name: name.to_string(),
@@ -70,8 +74,8 @@ impl ContextStore<'_> {
         };
         let receipt = self.write_type_locked(
             OperationId::new(),
-            self.digest("define-type", &definition)?,
-            self.fresh_pin(RecordKind::Type),
+            self.scoped.digest("define-type", &definition)?,
+            self.scoped.fresh_pin(RecordKind::Type),
             definition,
         )?;
         Ok(receipt.pin)
@@ -83,13 +87,15 @@ impl ContextStore<'_> {
         expected: RecordPin,
         definition: TypeDefinition,
     ) -> ContextResult<WriteReceipt> {
-        let _guard = self.db.kernel.write_lock();
+        let _guard = self.scoped.lock();
         self.validate_definition(&definition)?;
-        let digest = self.digest("revise-type", &(&expected, &definition))?;
-        if let Some(receipt) = self.replay(operation, digest)? {
+        let digest = self
+            .scoped
+            .digest("revise-type", &(&expected, &definition))?;
+        if let Some(receipt) = self.scoped.replay(operation, digest)? {
             return Ok(receipt);
         }
-        let (_, pin) = self.next_revision(&expected)?;
+        let (_, pin) = self.scoped.next_revision(&expected)?;
         let previous = self.type_definition_locked(&expected)?;
         if previous.name != definition.name
             || previous.scope != definition.scope
@@ -111,6 +117,7 @@ impl ContextStore<'_> {
     ) -> ContextResult<WriteReceipt> {
         let bytes = encode(&definition)?;
         let now = super::super::now_ms();
+        let mut batch = self.scoped.batch();
         let header = RecordHeader {
             pin: pin.clone(),
             scope: definition.scope.clone(),
@@ -118,31 +125,29 @@ impl ContextStore<'_> {
             type_pin: None,
             sources: Vec::new(),
             source_scopes: Vec::new(),
-            provenance: self.provenance(),
+            provenance: self.scoped.provenance(),
             information: InformationKind::Observation,
             temporal: TemporalFacts::observed_at(now),
             recorded_at_ms: now,
-            payload: PayloadDescriptor {
-                revision: pin.revision,
-                bytes: bytes.len() as u64,
-                digest: self.content_digest(&bytes),
-            },
+            payload: self.scoped.put_payload(&mut batch, &pin, &bytes),
             endpoints: None,
             history: None,
             checkpoint: None,
         };
-        let mut batch = self.db.kernel.batch();
         if pin.revision > 1 {
-            self.advance_availability_epoch(&mut batch)?;
+            self.scoped.advance_epoch(&mut batch)?;
         }
-        self.put_payload(&mut batch, &pin, &bytes);
-        self.put_header(&mut batch, &header)?;
+        self.scoped.put_header(&mut batch, &header)?;
         batch.insert(
             &self.parts.names,
-            name_key(&self.access.owner, &definition.scope, &definition.name)?,
+            name_key(
+                &self.scoped.access().owner,
+                &definition.scope,
+                &definition.name,
+            )?,
             encode(&pin.record)?,
         );
-        self.commit_operation(
+        self.scoped.commit_operation(
             batch,
             operation,
             digest,
@@ -158,18 +163,18 @@ impl ContextStore<'_> {
         scope: &Scope,
         name: &str,
     ) -> ContextResult<Option<(RecordPin, TypeDefinition)>> {
-        let _guard = self.db.kernel.write_lock();
-        self.check_scope(scope)?;
+        let _guard = self.scoped.lock();
+        self.scoped.check_scope(scope)?;
         validate_name(name, "type name")?;
-        let Some(bytes) = self
-            .parts
-            .names
-            .get(name_key(&self.access.owner, scope, name)?)?
+        let Some(bytes) =
+            self.parts
+                .names
+                .get(name_key(&self.scoped.access().owner, scope, name)?)?
         else {
             return Ok(None);
         };
         let reference = decode(&bytes)?;
-        let header = self.head_locked(&reference)?;
+        let header = self.scoped.head_locked(&reference)?;
         Ok(Some((
             header.pin.clone(),
             self.type_definition_locked(&header.pin)?,
@@ -182,64 +187,36 @@ impl ContextStore<'_> {
                 "type page limit must be 1..=100".into(),
             ));
         }
-        let _guard = self.db.kernel.write_lock();
-        let mut prefix = owner_key(&self.access.owner);
-        prefix.push(kind_byte(RecordKind::Type));
-        let start = if let Some(after) = after {
-            self.check_ref(after)?;
-            if after.kind != RecordKind::Type {
-                return Err(ContextError::InvalidInput(
-                    "type cursor has the wrong family".into(),
+        let _guard = self.scoped.lock();
+        let mut definitions = Vec::new();
+        let mut after = after.cloned();
+        let mut remaining = 4096;
+        loop {
+            let page = self.scoped.scan_heads(
+                RecordKind::Type,
+                after.as_ref(),
+                (limit - definitions.len()).min(remaining),
+            )?;
+            remaining -= page.heads.len();
+            for pin in page.heads {
+                let header = match self.scoped.header_locked(&pin) {
+                    Ok(header) => header,
+                    Err(ContextError::AccessDenied) => continue,
+                    Err(e) => return Err(e),
+                };
+                definitions.push((
+                    header.pin.clone(),
+                    self.type_definition_locked(&header.pin)?,
                 ));
             }
-            record_key(after)
-        } else {
-            prefix.clone()
-        };
-        let mut definitions = Vec::new();
-        let mut next = None;
-        let mut scanned = 0;
-        for entry in self.parts.heads.range(start.clone()..) {
-            let (key, revision) = entry?;
-            if !key.starts_with(&prefix) {
-                break;
+            if page.next.is_none() || remaining == 0 || definitions.len() == limit {
+                return Ok(TypePage {
+                    definitions,
+                    next: page.next,
+                });
             }
-            if after.is_some() && key.as_ref() == start {
-                continue;
-            }
-            if definitions.len() == limit || scanned == 4096 {
-                return Ok(TypePage { definitions, next });
-            }
-            if key.len() != prefix.len() + 16 || revision.len() != 8 {
-                return Err(ContextError::Corrupt("invalid type cursor".into()));
-            }
-            let id = u128::from_be_bytes(
-                key[prefix.len()..]
-                    .try_into()
-                    .map_err(|_| ContextError::Corrupt("invalid type identity".into()))?,
-            );
-            let reference = ContextRef {
-                era: self.db.era_id,
-                owner: self.access.owner.clone(),
-                kind: RecordKind::Type,
-                id: ulid::Ulid(id),
-            };
-            next = Some(reference.clone());
-            scanned += 1;
-            let header = match self.head_locked(&reference) {
-                Ok(header) => header,
-                Err(ContextError::AccessDenied) => continue,
-                Err(e) => return Err(e),
-            };
-            definitions.push((
-                header.pin.clone(),
-                self.type_definition_locked(&header.pin)?,
-            ));
+            after = page.next;
         }
-        Ok(TypePage {
-            definitions,
-            next: None,
-        })
     }
 
     pub(crate) fn type_definition_locked(&self, pin: &RecordPin) -> ContextResult<TypeDefinition> {
@@ -248,15 +225,15 @@ impl ContextStore<'_> {
                 "expected a type reference".into(),
             ));
         }
-        let header = self.header_locked(pin)?;
+        let header = self.scoped.header_locked(pin)?;
         if header.state != RecordState::Active {
             return Err(ContextError::Unavailable(pin.record.clone()));
         }
-        decode(&self.small_payload_locked(&header)?)
+        decode(&self.scoped.small_payload_locked(&header)?)
     }
 
     pub(crate) fn validate_definition(&self, definition: &TypeDefinition) -> ContextResult<()> {
-        self.check_scope(&definition.scope)?;
+        self.scoped.check_scope(&definition.scope)?;
         validate_name(&definition.name, "type name")?;
         if definition.properties.len() > 128 || encode(definition)?.len() > MAX_RECORD_BYTES {
             return Err(ContextError::InvalidInput(
@@ -300,7 +277,7 @@ impl ContextStore<'_> {
     }
 
     fn validate_object_type_ref(&self, reference: &ContextRef) -> ContextResult<()> {
-        let header = self.head_locked(reference)?;
+        let header = self.scoped.head_locked(reference)?;
         if !matches!(
             self.type_definition_locked(&header.pin)?.kind,
             TypeKind::Object
@@ -360,11 +337,11 @@ impl ContextStore<'_> {
                         "reference property needs a versioned record reference".into(),
                     )
                 })?;
-                let header = self.header_locked(&pin)?;
+                let header = self.scoped.header_locked(&pin)?;
                 if header.scope != *scope && header.scope != Scope::Personal {
                     return Err(ContextError::AccessDenied);
                 }
-                if !self.available_locked(&pin, true)? {
+                if !self.scoped.available_locked(&pin, true)? {
                     return Err(ContextError::Unavailable(pin.record));
                 }
                 target_type.as_ref().is_none_or(|expected| {

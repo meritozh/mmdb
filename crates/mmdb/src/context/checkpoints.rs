@@ -2,98 +2,11 @@ use super::storage::*;
 use super::*;
 use crate::{OperationId, RecordState, TemporalFacts};
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct CheckpointVisibility {
-    availability_epoch: u64,
-    redaction_epoch: u64,
-}
-
 impl ContextStore<'_> {
     pub fn availability_epoch(&self) -> ContextResult<u64> {
-        let _guard = self.db.kernel.write_lock();
-        self.availability_epoch_locked()
+        let _guard = self.scoped.lock();
+        self.scoped.availability_epoch_locked()
     }
-    pub(crate) fn availability_epoch_locked(&self) -> ContextResult<u64> {
-        self.parts
-            .lifecycle
-            .get(owner_key(&self.access.owner))?
-            .map(|bytes| decode(&bytes))
-            .transpose()
-            .map(|epoch| epoch.unwrap_or(0))
-    }
-
-    fn checkpoint_redaction_key(&self) -> Vec<u8> {
-        let mut key = owner_key(&self.access.owner);
-        key.extend_from_slice(b"checkpoint-redaction");
-        key
-    }
-
-    /// Old stores did not distinguish corrections from erasure. Their current
-    /// epoch is the conservative baseline: never revive an older summary whose
-    /// unlisted input may already have been purged by an older writer.
-    pub(crate) fn checkpoint_redaction_epoch_locked(&self) -> ContextResult<u64> {
-        let current = self.availability_epoch_locked()?;
-        let tracked = self
-            .parts
-            .lifecycle
-            .get(self.checkpoint_redaction_key())?
-            .map(|bytes| decode::<CheckpointVisibility>(&bytes))
-            .transpose()?;
-        match tracked {
-            Some(tracked) if tracked.availability_epoch == current => {
-                if tracked.redaction_epoch > current {
-                    return Err(ContextError::Corrupt(
-                        "checkpoint redaction epoch exceeds current epoch".into(),
-                    ));
-                }
-                Ok(tracked.redaction_epoch)
-            }
-            // An older writer can advance the original epoch without updating
-            // this marker. Treat that gap as possible erasure, never as a safe
-            // correction merely because a marker already exists.
-            _ => Ok(current),
-        }
-    }
-
-    pub(crate) fn advance_availability_epoch(
-        &self,
-        batch: &mut mmdb_kernel::Batch,
-    ) -> ContextResult<u64> {
-        let current = self.availability_epoch_locked()?;
-        let next = current.checked_add(1).ok_or(ContextError::BudgetExceeded)?;
-        let redaction_epoch = self.checkpoint_redaction_epoch_locked()?;
-        batch.insert(
-            &self.parts.lifecycle,
-            self.checkpoint_redaction_key(),
-            encode(&CheckpointVisibility {
-                availability_epoch: next,
-                redaction_epoch,
-            })?,
-        );
-        batch.insert(
-            &self.parts.lifecycle,
-            owner_key(&self.access.owner),
-            encode(&next)?,
-        );
-        Ok(next)
-    }
-
-    pub(crate) fn invalidate_checkpoint_payloads(
-        &self,
-        batch: &mut mmdb_kernel::Batch,
-        epoch: u64,
-    ) -> ContextResult<()> {
-        batch.insert(
-            &self.parts.lifecycle,
-            self.checkpoint_redaction_key(),
-            encode(&CheckpointVisibility {
-                availability_epoch: epoch,
-                redaction_epoch: epoch,
-            })?,
-        );
-        Ok(())
-    }
-
     /// Checkpoints are immutable recovery records, fixed to committed history.
     /// A correction invalidates older checkpoints for current recovery while
     /// exact historical reads remain available. Purge or history withdrawal
@@ -106,19 +19,21 @@ impl ContextStore<'_> {
         validate_name(&input.session, "checkpoint session")?;
         validate_name(&input.run, "checkpoint run")?;
         if self
-            .access
+            .scoped
+            .access()
             .session
             .as_ref()
             .is_some_and(|session| *session != input.session)
             || self
-                .access
+                .scoped
+                .access()
                 .run
                 .as_ref()
                 .is_some_and(|run| *run != input.run)
         {
             return Err(ContextError::AccessDenied);
         }
-        if self.access.parent_run.is_some() && input.scope != CheckpointScope::Run {
+        if self.scoped.access().parent_run.is_some() && input.scope != CheckpointScope::Run {
             return Err(ContextError::AccessDenied);
         }
         let bytes = encode(&input.payload)?;
@@ -127,17 +42,22 @@ impl ContextStore<'_> {
                 "checkpoint exceeds 128 KiB".into(),
             ));
         }
-        let _guard = self.db.kernel.write_lock();
-        let digest = self.digest("save-checkpoint", &input)?;
-        if let Some(receipt) = self.replay(operation, digest)? {
+        let _guard = self.scoped.lock();
+        let digest = self.scoped.digest("save-checkpoint", &input)?;
+        if let Some(receipt) = self.scoped.replay(operation, digest)? {
             return Ok(receipt);
         }
-        if self.availability_epoch_locked()? != input.expected_availability_epoch {
+        if self.scoped.availability_epoch_locked()? != input.expected_availability_epoch {
             return Err(ContextError::InvalidInput(
                 "context changed while checkpoint was being generated".into(),
             ));
         }
-        let key = checkpoint_key(&self.access.owner, &input.session, input.scope, &input.run);
+        let key = checkpoint_key(
+            &self.scoped.access().owner,
+            &input.session,
+            input.scope,
+            &input.run,
+        );
         let previous: Option<RecordPin> = self
             .parts
             .checkpoints
@@ -150,7 +70,8 @@ impl ContextStore<'_> {
             ));
         }
         let window = if let Some(previous) = &previous {
-            self.header_locked(previous)?
+            self.scoped
+                .header_locked(previous)?
                 .checkpoint
                 .ok_or_else(|| ContextError::Corrupt("checkpoint metadata missing".into()))?
                 .window
@@ -164,10 +85,15 @@ impl ContextStore<'_> {
         if !sources.contains(&anchor.pin) {
             sources.push(anchor.pin);
         }
-        let source_scopes =
-            self.validate_sources(&anchor.scope, &sources, InformationKind::Inference, None)?;
-        let pin = self.fresh_pin(RecordKind::Checkpoint);
+        let source_scopes = self.scoped.validate_sources(
+            &anchor.scope,
+            &sources,
+            InformationKind::Inference,
+            None,
+        )?;
+        let pin = self.scoped.fresh_pin(RecordKind::Checkpoint);
         let now = super::super::now_ms();
+        let mut batch = self.scoped.batch();
         let header = RecordHeader {
             pin: pin.clone(),
             scope: anchor.scope,
@@ -175,15 +101,11 @@ impl ContextStore<'_> {
             type_pin: None,
             sources,
             source_scopes,
-            provenance: self.provenance(),
+            provenance: self.scoped.provenance(),
             information: InformationKind::Inference,
             temporal: TemporalFacts::observed_at(now),
             recorded_at_ms: now,
-            payload: PayloadDescriptor {
-                revision: 1,
-                bytes: bytes.len() as u64,
-                digest: self.content_digest(&bytes),
-            },
+            payload: self.scoped.put_payload(&mut batch, &pin, &bytes),
             endpoints: None,
             history: None,
             checkpoint: Some(CheckpointMetadata {
@@ -193,14 +115,12 @@ impl ContextStore<'_> {
                 window,
                 history_sequence: input.history_sequence,
                 previous,
-                availability_epoch: self.availability_epoch_locked()?,
+                availability_epoch: self.scoped.availability_epoch_locked()?,
             }),
         };
-        let mut batch = self.db.kernel.batch();
-        self.put_payload(&mut batch, &pin, &bytes);
-        self.put_header(&mut batch, &header)?;
+        self.scoped.put_header(&mut batch, &header)?;
         batch.insert(&self.parts.checkpoints, key, encode(&pin)?);
-        self.commit_operation(
+        self.scoped.commit_operation(
             batch,
             operation,
             digest,
@@ -213,11 +133,11 @@ impl ContextStore<'_> {
 
     pub fn latest_checkpoint(&self, session: &str) -> ContextResult<Option<RecordHeader>> {
         validate_name(session, "session")?;
-        let _guard = self.db.kernel.write_lock();
+        let _guard = self.scoped.lock();
         self.parts
             .checkpoints
-            .get(session_key(&self.access.owner, session))?
-            .map(|bytes| self.header_locked(&decode(&bytes)?))
+            .get(session_key(&self.scoped.access().owner, session))?
+            .map(|bytes| self.scoped.header_locked(&decode(&bytes)?))
             .transpose()
     }
 
@@ -229,16 +149,16 @@ impl ContextStore<'_> {
     ) -> ContextResult<Option<RecordHeader>> {
         validate_name(session, "session")?;
         validate_name(run, "run")?;
-        let _guard = self.db.kernel.write_lock();
+        let _guard = self.scoped.lock();
         self.parts
             .checkpoints
             .get(checkpoint_key(
-                &self.access.owner,
+                &self.scoped.access().owner,
                 session,
                 CheckpointScope::Run,
                 run,
             ))?
-            .map(|bytes| self.header_locked(&decode(&bytes)?))
+            .map(|bytes| self.scoped.header_locked(&decode(&bytes)?))
             .transpose()
     }
 }
@@ -265,7 +185,7 @@ mod tests {
             .context(ContextAccess::new("owner", Actor::System))
             .unwrap();
         let mut batch = db.kernel.batch();
-        store.advance_availability_epoch(&mut batch).unwrap();
+        store.scoped.advance_epoch(&mut batch).unwrap();
         batch.commit().unwrap();
         let anchor = store
             .append_history(
@@ -303,7 +223,7 @@ mod tests {
         // Simulate an older binary advancing only the original lifecycle key.
         let mut batch = db.kernel.batch();
         batch.insert(
-            &store.parts.lifecycle,
+            store.scoped.test_lifecycle(),
             owner_key("owner"),
             encode(&2u64).unwrap(),
         );
@@ -313,16 +233,19 @@ mod tests {
             Err(ContextError::Unavailable(_))
         ));
         let mut batch = db.kernel.batch();
-        batch.remove(&store.parts.lifecycle, store.checkpoint_redaction_key());
+        batch.remove(
+            store.scoped.test_lifecycle(),
+            store.scoped.checkpoint_redaction_key(),
+        );
         batch.commit().unwrap();
         assert!(matches!(
             store.read(&checkpoint),
             Err(ContextError::Unavailable(_))
         ));
         let mut batch = db.kernel.batch();
-        assert_eq!(store.advance_availability_epoch(&mut batch).unwrap(), 3);
+        assert_eq!(store.scoped.advance_epoch(&mut batch).unwrap(), 3);
         batch.commit().unwrap();
-        assert_eq!(store.checkpoint_redaction_epoch_locked().unwrap(), 2);
+        assert_eq!(store.scoped.checkpoint_redaction_epoch_locked().unwrap(), 2);
         drop(store);
         drop(db);
         let db = MemoryDatabase::open_context(path).unwrap();
@@ -333,6 +256,6 @@ mod tests {
             store.read(&checkpoint),
             Err(ContextError::Unavailable(_))
         ));
-        assert_eq!(store.checkpoint_redaction_epoch_locked().unwrap(), 2);
+        assert_eq!(store.scoped.checkpoint_redaction_epoch_locked().unwrap(), 2);
     }
 }

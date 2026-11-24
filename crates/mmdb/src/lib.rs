@@ -65,7 +65,14 @@ mod runtime;
 mod search;
 mod state;
 pub use mmdb_kernel::{store_format, EraId, OperationId};
-pub use records::{Actor, RecordState, Scope, TemporalFacts, MAX_ACCESS_SCOPES};
+pub use records::{
+    Actor, CheckpointMetadata, CheckpointScope, ContextAccess, ContextError, ContextRef,
+    ContextResult, Endpoints, HistoryEntry, HistoryKind, InformationKind, MessageStatus,
+    PayloadDescriptor, PayloadPage, Provenance, RecordHeader, RecordKind, RecordPin, RecordState,
+    RecoveryReport, Scope, StoreModule, TemporalFacts, ToolOutcome, WriteReceipt,
+    MAX_ACCESS_SCOPES, MAX_CONTEXT_NAME_BYTES, MAX_CONTEXT_SOURCES, MAX_PAYLOAD_PAGE_BYTES,
+    MAX_RECORD_BYTES, PAYLOAD_CHUNK_BYTES,
+};
 #[cfg(test)]
 mod tests;
 

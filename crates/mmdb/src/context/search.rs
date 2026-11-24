@@ -105,7 +105,12 @@ impl ContextStore<'_> {
             for term in decode::<Vec<[u8; 32]>>(&previous)? {
                 batch.remove(
                     &self.parts.postings,
-                    posting_key(&self.access.owner, &header.scope, term, &header.pin.record)?,
+                    posting_key(
+                        &self.scoped.access().owner,
+                        &header.scope,
+                        term,
+                        &header.pin.record,
+                    )?,
                 );
             }
         }
@@ -113,12 +118,17 @@ impl ContextStore<'_> {
             let text = serde_json::to_string(properties)?;
             let hashes: BTreeSet<_> = terms(&text)
                 .into_iter()
-                .map(|term| self.content_digest(term.as_bytes()))
+                .map(|term| self.scoped.content_digest(term.as_bytes()))
                 .collect();
             for hash in &hashes {
                 batch.insert(
                     &self.parts.postings,
-                    posting_key(&self.access.owner, &header.scope, *hash, &header.pin.record)?,
+                    posting_key(
+                        &self.scoped.access().owner,
+                        &header.scope,
+                        *hash,
+                        &header.pin.record,
+                    )?,
                     encode(&header.pin)?,
                 );
             }
@@ -163,27 +173,27 @@ impl ContextStore<'_> {
         &self,
         pin: &RecordPin,
         at: Option<i64>,
-        memo: &mut SourceMemo,
+        memo: &mut crate::records::Memo,
     ) -> ContextResult<Option<RecordHeader>> {
-        let header = match self.header_locked(pin) {
+        let header = match self.scoped.header_locked(pin) {
             Ok(header) => header,
             Err(ContextError::AccessDenied | ContextError::NotFound(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
         if at.is_some_and(|at| !header.temporal.is_valid_at(at))
-            || !self.available_memoized(pin, true, memo)?
+            || !self.scoped.available_memoized(pin, true, memo)?
         {
             return Ok(None);
         }
         if let Some(endpoints) = &header.endpoints {
             for endpoint in [&endpoints.from, &endpoints.to] {
-                let endpoint = match self.head_locked(endpoint) {
+                let endpoint = match self.scoped.head_locked(endpoint) {
                     Ok(header) => header,
                     Err(ContextError::AccessDenied | ContextError::NotFound(_)) => return Ok(None),
                     Err(error) => return Err(error),
                 };
                 if at.is_some_and(|at| !endpoint.temporal.is_valid_at(at))
-                    || !self.available_memoized(&endpoint.pin, true, memo)?
+                    || !self.scoped.available_memoized(&endpoint.pin, true, memo)?
                 {
                     return Ok(None);
                 }
@@ -201,8 +211,8 @@ impl ContextStore<'_> {
             ));
         }
         let mut memo = BTreeMap::new();
-        let _guard = self.db.kernel.write_lock();
-        let endpoint = self.head_locked(&query.endpoint)?;
+        let _guard = self.scoped.lock();
+        let endpoint = self.scoped.head_locked(&query.endpoint)?;
         if self
             .current_candidate(&endpoint.pin, query.valid_at_ms, &mut memo)?
             .is_none()
@@ -210,7 +220,7 @@ impl ContextStore<'_> {
             return Err(ContextError::Unavailable(query.endpoint));
         }
         if let Some(filter) = &query.type_filter {
-            let header = self.head_locked(filter)?;
+            let header = self.scoped.head_locked(filter)?;
             if !matches!(
                 self.type_definition_locked(&header.pin)?.kind,
                 TypeKind::Relation { .. }
@@ -221,14 +231,14 @@ impl ContextStore<'_> {
             }
         }
         let prefix = record_key(&query.endpoint);
-        let digest = self.digest(
+        let digest = self.scoped.digest(
             "relation-query-cursor",
             &(
                 &query.endpoint,
                 query.direction,
                 &query.type_filter,
                 query.valid_at_ms,
-                &self.access.scopes,
+                &self.scoped.access().scopes,
             ),
         )?;
         let start = if let Some(cursor) = &query.cursor {
@@ -306,19 +316,19 @@ impl ContextStore<'_> {
             ));
         }
         let mut memo = BTreeMap::new();
-        let _guard = self.db.kernel.write_lock();
+        let _guard = self.scoped.lock();
         let mut candidates: BTreeMap<ContextRef, (RecordPin, usize, Vec<RecordPin>)> =
             BTreeMap::new();
         let mut candidates_examined = 0;
         let mut edges_examined = 0;
         let mut truncated = false;
         for reference in &query.seeds {
-            self.check_ref(reference)?;
+            self.scoped.check_ref(reference)?;
             if candidates_examined >= budget.max_candidates {
                 truncated = true;
                 break;
             }
-            let head = self.head_locked(reference)?;
+            let head = self.scoped.head_locked(reference)?;
             candidates_examined += 1;
             if self
                 .current_candidate(&head.pin, query.valid_at_ms, &mut memo)?
@@ -328,11 +338,11 @@ impl ContextStore<'_> {
             }
         }
         'postings: for term in terms(&query.text) {
-            for scope in &self.access.scopes {
+            for scope in &self.scoped.access().scopes {
                 for item in self.parts.postings.prefix(posting_prefix(
-                    &self.access.owner,
+                    &self.scoped.access().owner,
                     scope,
-                    self.content_digest(term.as_bytes()),
+                    self.scoped.content_digest(term.as_bytes()),
                 )?) {
                     if candidates_examined >= budget.max_candidates {
                         truncated = true;
@@ -400,7 +410,7 @@ impl ContextStore<'_> {
                     break 'expand;
                 }
                 candidates_examined += 1;
-                let head = self.head_locked(&other)?;
+                let head = self.scoped.head_locked(&other)?;
                 if self
                     .current_candidate(&head.pin, query.valid_at_ms, &mut memo)?
                     .is_none()
@@ -416,7 +426,7 @@ impl ContextStore<'_> {
         let mut ranked: Vec<_> = candidates
             .into_values()
             .map(|(pin, score, path)| {
-                let header = self.header_locked(&pin)?;
+                let header = self.scoped.header_locked(&pin)?;
                 Ok((pin, score, path, header.recorded_at_ms))
             })
             .collect::<ContextResult<_>>()?;
@@ -465,16 +475,16 @@ impl ContextStore<'_> {
         if let Some(session) = &query.session {
             validate_name(session, "session")?;
         }
-        let _guard = self.db.kernel.write_lock();
+        let _guard = self.scoped.lock();
         let needle = query.text.as_bytes().to_ascii_lowercase();
         let table = prefix_table(&needle);
-        let digest = self.digest(
+        let digest = self.scoped.digest(
             "history-search-cursor",
-            &(&query.text, &query.session, &self.access.scopes),
+            &(&query.text, &query.session, &self.scoped.access().scopes),
         )?;
         let prefix = query.session.as_ref().map_or_else(
-            || owner_key(&self.access.owner),
-            |session| session_key(&self.access.owner, session),
+            || owner_key(&self.scoped.access().owner),
+            |session| session_key(&self.scoped.access().owner, session),
         );
         let start = if let Some(cursor) = &query.cursor {
             if cursor.query_digest != digest || !cursor.key.starts_with(&prefix) {
@@ -511,12 +521,12 @@ impl ContextStore<'_> {
                 return Ok(result);
             }
             result.events_examined += 1;
-            let header = match self.head_locked(&decode(&reference)?) {
+            let header = match self.scoped.head_locked(&decode(&reference)?) {
                 Ok(header) => header,
                 Err(ContextError::AccessDenied) => continue,
                 Err(error) => return Err(error),
             };
-            if !self.available_locked(&header.pin, false)? {
+            if !self.scoped.available_locked(&header.pin, false)? {
                 continue;
             }
             if offset > header.payload.bytes {
@@ -534,7 +544,7 @@ impl ContextStore<'_> {
                     });
                     return Ok(result);
                 }
-                let page = self.payload_slice_locked(
+                let page = self.scoped.payload_slice_locked(
                     &header,
                     offset,
                     remaining.min(MAX_PAYLOAD_PAGE_BYTES),

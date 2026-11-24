@@ -92,11 +92,16 @@ const NATIVE_MODULES: &[ModuleSpec] = &[ModuleSpec {
     id: MEMORY,
     partitions: NATIVE_PARTITIONS,
 }];
-const CONTEXT_PARTITIONS: [&str; NATIVE_PARTITIONS.len() + context::PARTITION_NAMES.len()] = {
-    let mut partitions = [""; NATIVE_PARTITIONS.len() + context::PARTITION_NAMES.len()];
+const CONTEXT_PARTITIONS: [&str;
+    NATIVE_PARTITIONS.len() + context::PARTITION_NAMES.len() + crate::records::PARTITION_NAMES.len()] = {
+    let mut partitions = [""; NATIVE_PARTITIONS.len()
+        + context::PARTITION_NAMES.len()
+        + crate::records::PARTITION_NAMES.len()];
     let (native, context) = partitions.split_at_mut(NATIVE_PARTITIONS.len());
     native.copy_from_slice(NATIVE_PARTITIONS);
+    let (context, records) = context.split_at_mut(context::PARTITION_NAMES.len());
     context.copy_from_slice(context::PARTITION_NAMES);
+    records.copy_from_slice(crate::records::PARTITION_NAMES);
     partitions
 };
 const CONTEXT_MODULES: &[ModuleSpec] = &[ModuleSpec {
@@ -1591,7 +1596,7 @@ struct ArtifactEvidenceInsert<'a> {
 
 pub struct MemoryDatabase {
     pub(crate) kernel: Kernel,
-    context: Option<context::ContextPartitions>,
+    context: Option<(context::ContextPartitions, crate::records::Records)>,
     era_id: EraId,
     evidence: Partition,
     evidence_availability: Partition,
@@ -1702,7 +1707,13 @@ impl MemoryDatabase {
     fn with_context(kernel: Kernel) -> MemoryResult<Self> {
         let era = kernel.module(MEMORY);
         let mut database = Self::on_era(kernel, &era)?;
-        database.context = Some(context::ContextPartitions::open(&era)?);
+        let parts = context::ContextPartitions::open(&era)?;
+        let records = crate::records::Records::open(
+            database.kernel.clone(),
+            &era,
+            Box::new(parts.log_gate()),
+        )?;
+        database.context = Some((parts, records));
         Ok(database)
     }
 
