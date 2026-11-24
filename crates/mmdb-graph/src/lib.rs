@@ -8,7 +8,7 @@
 //! O(neighbours) time, optionally filtered by label, and symmetrically all
 //! incoming edges. The edge payload itself lives only in `edges_out`; the
 //! reverse partition stores just keys so updates stay cheap.
-use fjall::{Database as FjallDatabase, Keyspace, KeyspaceCreateOptions, PersistMode};
+use fjall::{Database as FjallDatabase, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
 use mmdb_core::{Edge, Error, Result};
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use ulid::Ulid;
@@ -119,9 +119,21 @@ impl GraphStore {
             Some(l) => in_label_range(tenant, node, label_hash(l)),
             None => in_node_range(tenant, node),
         };
+        let view = self.database.snapshot();
+        self.read_incoming(&view, tenant, node, label, view.range(&self.inn, lo..hi))
+    }
+
+    fn read_incoming(
+        &self,
+        view: &fjall::Snapshot,
+        tenant: u32,
+        node: Ulid,
+        label: Option<&str>,
+        index_rows: impl Iterator<Item = fjall::Guard>,
+    ) -> Result<Vec<Edge>> {
         let mut out = Vec::new();
-        for kv in self.inn.range(lo..hi) {
-            let (k, _) = kv.into_inner().map_err(|e| Error::Storage(e.to_string()))?;
+        for row in index_rows {
+            let k = row.key().map_err(|e| Error::Storage(e.to_string()))?;
             // k = [tenant(4) | dst(16) | lh(4) | src(16)]
             if k.len() != 4 + 16 + 4 + 16 {
                 continue;
@@ -133,9 +145,8 @@ impl GraphStore {
             src_buf.copy_from_slice(&k[24..40]);
             let src = Ulid(u128::from_be_bytes(src_buf));
             let kout = out_key(tenant, src, lh, node);
-            if let Some(v) = self
-                .out
-                .get(&kout)
+            if let Some(v) = view
+                .get(&self.out, &kout)
                 .map_err(|e| Error::Storage(e.to_string()))?
             {
                 let e: Edge = serde_json::from_slice(&v).map_err(Error::from)?;
@@ -367,6 +378,36 @@ mod tests {
         let ins = g.neighbours_in(0, b, None).unwrap();
         assert_eq!(ins.len(), 1);
         assert_eq!(ins[0].src, a);
+    }
+
+    #[test]
+    fn incoming_join_keeps_the_payload_deleted_after_index_selection() {
+        let (_dir, graph) = open();
+        let src = Ulid::new();
+        let dst = Ulid::new();
+        graph.add_edge(7, mk_edge(src, dst, "rel")).unwrap();
+
+        let view = graph.database.snapshot();
+        let (lo, hi) = in_label_range(7, dst, label_hash("rel"));
+        // The writer commits after the iterator has selected its reverse marker.
+        let rows = view.range(&graph.inn, lo..hi).rev().inspect(|_| {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| graph.remove_edge(7, src, dst, "rel"))
+                    .join()
+                    .unwrap()
+                    .unwrap();
+            });
+        });
+        let result = graph
+            .read_incoming(&view, 7, dst, Some("rel"), rows)
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            (result[0].src, result[0].dst, result[0].label.as_str()),
+            (src, dst, "rel")
+        );
+        assert!(graph.neighbours_in(7, dst, Some("rel")).unwrap().is_empty());
     }
 
     #[test]

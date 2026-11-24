@@ -37,6 +37,11 @@ collisions remain enumerable.
 `bfs` returns node ids in discovery order and excludes the seed. It deduplicates
 visited nodes during traversal.
 
+An incoming-neighbour query reads the reverse markers and their forward edge
+payloads from one database snapshot. An update or deletion that commits during
+that query becomes visible to the next query. Each neighbour lookup in a BFS
+takes its own read view.
+
 ## Edge Lifecycle
 
 `add_edge` writes forward edge, reverse marker, and label dictionary entries in
