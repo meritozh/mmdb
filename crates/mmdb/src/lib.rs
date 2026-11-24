@@ -46,6 +46,23 @@ pub use mmdb_query as query;
 pub use mmdb_storage as storage;
 pub use mmdb_vector as vector;
 
+/// Declare a module's partition schema together with its typed handles.
+macro_rules! module_partitions {
+    ($parts:ident, $schema:ident, { $($field:ident => $name:expr),+ $(,)? }) => {
+        pub(crate) const $schema: &[&str] = &[$($name),+];
+
+        pub(crate) struct $parts {
+            $(pub(crate) $field: mmdb_kernel::Partition,)+
+        }
+
+        impl $parts {
+            pub(crate) fn open(era: &mmdb_kernel::EraPartitions) -> mmdb_kernel::KernelResult<Self> {
+                Ok(Self { $($field: era.partition($name)?,)+ })
+            }
+        }
+    };
+}
+
 mod access;
 mod audit;
 mod builder;
@@ -63,9 +80,9 @@ mod recall;
 mod records;
 mod runtime;
 mod search;
+pub mod session;
 mod state;
 pub mod store;
-pub use store::{Store, StoreError, StoreResult, STORE_FORMAT_ID};
 pub use mmdb_kernel::{store_format, EraId, OperationId};
 pub use records::{
     Actor, CheckpointMetadata, CheckpointScope, ContextAccess, ContextError, ContextRef,
@@ -75,6 +92,7 @@ pub use records::{
     MAX_ACCESS_SCOPES, MAX_CONTEXT_NAME_BYTES, MAX_CONTEXT_SOURCES, MAX_PAYLOAD_PAGE_BYTES,
     MAX_RECORD_BYTES, PAYLOAD_CHUNK_BYTES,
 };
+pub use store::{Store, StoreError, StoreResult, STORE_FORMAT_ID};
 #[cfg(test)]
 mod tests;
 

@@ -179,7 +179,7 @@ impl Scoped<'_> {
 
     pub(crate) fn recover_payloads(
         &self,
-        modules: &[StoreModule],
+        module: StoreModule,
         max_chunks: usize,
         max_uploads: usize,
     ) -> ContextResult<RecoveryReport> {
@@ -193,14 +193,8 @@ impl Scoped<'_> {
             more: false,
         };
         let owner = owner_key(&self.access().owner);
-        let pending = modules.iter().flat_map(|&module| {
-            let table = self.table(module);
-            table
-                .pending
-                .prefix(&owner)
-                .map(move |entry| (module, table, entry))
-        });
-        for (module, table, entry) in pending {
+        let table = self.table(module);
+        for entry in table.pending.prefix(owner) {
             let (key, bytes) = entry?;
             if report.chunks_removed == max_chunks || report.uploads_removed == max_uploads {
                 report.more = true;

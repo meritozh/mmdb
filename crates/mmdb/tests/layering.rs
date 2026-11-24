@@ -22,6 +22,7 @@ fn store_modules_do_not_name_fjall() {
     for path in [
         "records",
         "context",
+        "session",
         "store.rs",
         "native_memory.rs",
         "entity.rs",

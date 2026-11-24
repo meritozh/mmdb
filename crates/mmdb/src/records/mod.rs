@@ -124,6 +124,15 @@ pub enum StoreModule {
 }
 
 impl RecordKind {
+    pub(crate) fn require_module(self, module: StoreModule) -> ContextResult<()> {
+        if self.module() != module {
+            return Err(ContextError::InvalidInput(format!(
+                "expected a {module:?} record"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn module(self) -> StoreModule {
         match self {
             Self::History | Self::Checkpoint => StoreModule::Session,

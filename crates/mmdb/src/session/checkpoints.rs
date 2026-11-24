@@ -1,12 +1,18 @@
-use super::storage::*;
 use super::*;
+use crate::records::codec::*;
 use crate::{OperationId, RecordState, TemporalFacts};
 
-impl ContextStore<'_> {
-    pub fn availability_epoch(&self) -> ContextResult<u64> {
+impl SessionLog<'_> {
+    pub fn read_checkpoint(&self, pin: &RecordPin) -> ContextResult<CheckpointRecord> {
+        if pin.record.kind != RecordKind::Checkpoint {
+            return Err(ContextError::InvalidInput("expected a checkpoint".into()));
+        }
         let _guard = self.scoped.lock();
-        self.scoped.availability_epoch_locked()
+        let header = self.scoped.readable_header_locked(pin)?;
+        let payload = decode(&self.scoped.small_payload_locked(&header)?)?;
+        Ok(CheckpointRecord { header, payload })
     }
+
     /// Checkpoints are immutable recovery records, fixed to committed history.
     /// A correction invalidates older checkpoints for current recovery while
     /// exact historical reads remain available. Purge or history withdrawal
@@ -183,7 +189,7 @@ mod tests {
         let path = tmp.path().join("context");
         let db = Store::create(&path).unwrap();
         let store = db
-            .context(ContextAccess::new("owner", Actor::System))
+            .session_log(ContextAccess::new("owner", Actor::System))
             .unwrap();
         let mut batch = store.scoped.batch();
         store.scoped.advance_epoch(&mut batch).unwrap();
@@ -220,7 +226,7 @@ mod tests {
             )
             .unwrap()
             .pin;
-        assert!(store.read(&checkpoint).is_ok());
+        assert!(store.read_checkpoint(&checkpoint).is_ok());
         // Simulate an older binary advancing only the original lifecycle key.
         let mut batch = store.scoped.batch();
         batch.insert(
@@ -230,7 +236,7 @@ mod tests {
         );
         batch.commit().unwrap();
         assert!(matches!(
-            store.read(&checkpoint),
+            store.read_checkpoint(&checkpoint),
             Err(ContextError::Unavailable(_))
         ));
         let mut batch = store.scoped.batch();
@@ -240,7 +246,7 @@ mod tests {
         );
         batch.commit().unwrap();
         assert!(matches!(
-            store.read(&checkpoint),
+            store.read_checkpoint(&checkpoint),
             Err(ContextError::Unavailable(_))
         ));
         let mut batch = store.scoped.batch();
@@ -251,10 +257,10 @@ mod tests {
         drop(db);
         let db = Store::open(path).unwrap();
         let store = db
-            .context(ContextAccess::new("owner", Actor::System))
+            .session_log(ContextAccess::new("owner", Actor::System))
             .unwrap();
         assert!(matches!(
-            store.read(&checkpoint),
+            store.read_checkpoint(&checkpoint),
             Err(ContextError::Unavailable(_))
         ));
         assert_eq!(store.scoped.checkpoint_redaction_epoch_locked().unwrap(), 2);

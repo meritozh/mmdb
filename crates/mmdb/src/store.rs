@@ -1,6 +1,7 @@
-use crate::context::{self, ContextPartitions, ContextStore};
+use crate::context::{self, ContextParts, ContextStore};
 use crate::native_memory::{self, MemoryDatabase, MemoryError};
 use crate::records::{self, Records};
+use crate::session::{self, LogGate, SessionLog, SessionParts};
 use crate::{
     ContextAccess, ContextError, ContextResult, EraId, StoreFormatDescriptor, StoreModule,
 };
@@ -29,7 +30,7 @@ macro_rules! partitions {
 const MODULES: &[ModuleSpec] = &[
     ModuleSpec {
         id: SESSION,
-        partitions: &partitions!(records::SESSION_PARTITIONS, context::SESSION_PARTITIONS),
+        partitions: &partitions!(records::SESSION_PARTITIONS, session::SESSION_PARTITIONS),
     },
     ModuleSpec {
         id: MEMORY,
@@ -45,7 +46,8 @@ const MODULES: &[ModuleSpec] = &[
 pub struct Store {
     kernel: Kernel,
     records: Records,
-    context: ContextPartitions,
+    context: ContextParts,
+    session: SessionParts,
     memory: MemoryDatabase,
 }
 
@@ -65,18 +67,20 @@ impl Store {
     fn from_kernel(kernel: Kernel) -> StoreResult<Self> {
         let session = kernel.module(SESSION);
         let memory = kernel.module(MEMORY);
-        let context = ContextPartitions::open(&session, &memory)?;
+        let context = ContextParts::open(&memory)?;
         let records = Records::open(
             kernel.clone(),
             &session,
             &memory,
-            Box::new(context.log_gate()),
+            Box::new(LogGate::open(&session)?),
         )?;
+        let session = SessionParts::open(&session)?;
         let memory = MemoryDatabase::on_era(kernel.clone(), &memory)?;
         Ok(Self {
             kernel,
             records,
             context,
+            session,
             memory,
         })
     }
@@ -85,6 +89,14 @@ impl Store {
         self.kernel.era(match module {
             StoreModule::Session => SESSION,
             StoreModule::Memory => MEMORY,
+        })
+    }
+
+    pub fn session_log(&self, access: ContextAccess) -> ContextResult<SessionLog<'_>> {
+        access.validate()?;
+        Ok(SessionLog {
+            scoped: self.records.scoped(access),
+            parts: &self.session,
         })
     }
 

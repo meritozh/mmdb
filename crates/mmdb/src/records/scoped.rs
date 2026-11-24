@@ -99,6 +99,14 @@ pub(crate) struct HeadPage {
 }
 
 impl Scoped<'_> {
+    pub(crate) fn readable_header_locked(&self, pin: &RecordPin) -> ContextResult<RecordHeader> {
+        let header = self.header_locked(pin)?;
+        if !self.available_locked(pin, false)? {
+            return Err(ContextError::Unavailable(pin.record.clone()));
+        }
+        Ok(header)
+    }
+
     pub(crate) fn access(&self) -> &ContextAccess {
         &self.access
     }

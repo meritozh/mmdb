@@ -296,6 +296,22 @@ impl ContextStore<'_> {
         Ok(out)
     }
 
+    pub fn availability_epoch(&self) -> ContextResult<u64> {
+        let _guard = self.scoped.lock();
+        self.scoped.availability_epoch_locked()
+    }
+
+    /// Cleans abandoned uploads and purged payloads, never live committed data.
+    /// The chunk and upload counts bound work even for very large originals.
+    pub fn recover_payloads(
+        &self,
+        max_chunks: usize,
+        max_uploads: usize,
+    ) -> ContextResult<RecoveryReport> {
+        self.scoped
+            .recover_payloads(StoreModule::Memory, max_chunks, max_uploads)
+    }
+
     pub fn retract(
         &self,
         operation: OperationId,
@@ -320,44 +336,25 @@ impl ContextStore<'_> {
         expected: RecordPin,
         state: RecordState,
     ) -> ContextResult<WriteReceipt> {
-        let _guard = self.scoped.lock();
+        expected.record.kind.require_module(StoreModule::Memory)?;
         if expected.record.kind == RecordKind::Type {
             return Err(ContextError::InvalidInput(
                 "type versions cannot be retracted or purged".into(),
             ));
         }
-        if (state == RecordState::Purged
-            || matches!(
-                expected.record.kind,
-                RecordKind::History | RecordKind::ActionExecution
-            ))
+        if (state == RecordState::Purged || expected.record.kind == RecordKind::ActionExecution)
             && !matches!(self.scoped.access().actor, Actor::User | Actor::Operator)
         {
             return Err(ContextError::AccessDenied);
         }
-        let digest = self
-            .scoped
-            .digest("set-context-state", &(&expected, state))?;
-        if let Some(receipt) = self.scoped.replay(operation, digest)? {
-            return Ok(receipt);
-        }
-        let mut batch = self.scoped.batch();
-        let redacts = state == RecordState::Purged || expected.record.kind == RecordKind::History;
-        let (previous, header) = self
-            .scoped
-            .state_change(&mut batch, operation, &expected, state, redacts)?;
-        if let Some(history) = &header.history {
-            self.withdraw_history(&mut batch, history)?;
-        }
-        self.replace_postings(&mut batch, &header, None)?;
-        self.replace_adjacency(&mut batch, Some(&previous), &header)?;
-        self.scoped.commit_operation(
-            batch,
+        self.scoped.commit_state_change(
             operation,
-            digest,
-            WriteReceipt {
-                pin: header.pin,
-                history_sequence: header.history.as_ref().map(|history| history.sequence),
+            expected,
+            state,
+            state == RecordState::Purged,
+            |batch, previous, header| {
+                self.replace_postings(batch, header, None)?;
+                self.replace_adjacency(batch, Some(previous), header)
             },
         )
     }

@@ -1,5 +1,5 @@
-use super::storage::*;
 use super::*;
+use crate::records::codec::*;
 use crate::{Actor, OperationId, RecordState, Scope, TemporalFacts};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
@@ -28,12 +28,12 @@ pub(crate) struct LogGate {
     messages: mmdb_kernel::Partition,
 }
 
-impl ContextPartitions {
-    pub(crate) fn log_gate(&self) -> LogGate {
-        LogGate {
-            calls: self.calls.clone(),
-            messages: self.messages.clone(),
-        }
+impl LogGate {
+    pub(crate) fn open(session: &mmdb_kernel::EraPartitions) -> mmdb_kernel::KernelResult<Self> {
+        Ok(Self {
+            calls: session.partition(CALLS)?,
+            messages: session.partition(MESSAGES)?,
+        })
     }
 }
 
@@ -101,7 +101,7 @@ fn load_call(
         .transpose()
 }
 
-impl ContextStore<'_> {
+impl SessionLog<'_> {
     /// Enumerate native history without relying on an application projection.
     /// This recovery catalog requires trusted harness authority.
     pub fn history_sessions(
@@ -663,19 +663,5 @@ impl ContextStore<'_> {
             entries,
             next_sequence: None,
         })
-    }
-
-    /// Cleans abandoned uploads and purged payloads, never live committed data.
-    /// The chunk and upload counts bound work even for very large originals.
-    pub fn recover_payloads(
-        &self,
-        max_chunks: usize,
-        max_uploads: usize,
-    ) -> ContextResult<RecoveryReport> {
-        self.scoped.recover_payloads(
-            &[StoreModule::Session, StoreModule::Memory],
-            max_chunks,
-            max_uploads,
-        )
     }
 }

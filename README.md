@@ -22,15 +22,17 @@ directory so workflows and queues survive a memory-store reset.
 ## Harness Context
 
 The `mmdb::context` contract provides versioned object and relation types,
-source-backed records, ordered session logs, and bounded lexical and graph
-recall. The session and memory modules share the store lease, write lock and
-durable batches. An assistant can save validated
+source-backed records, and bounded lexical and graph recall. The
+`mmdb::session` module provides ordered session events and checkpoints. Both modules
+share the store lease, write lock and durable batches. An assistant can save validated
 context directly, with provenance and an explicit inference label.
 
 Create a fresh root with `mmdb::Store::create(path)` and reopen it with
 `mmdb::Store::open(path)`. Use `store.memory()` for native memory or
-`store.context(ContextAccess::new(owner, actor))` for a `ContextStore`. The default scope shares context
-across that owner's agents and sessions. The harness supplies trusted identity,
+`store.context(access)` for a `ContextStore`. Use `store.session_log(access)`
+for a `SessionLog`. Construct the access profile with
+`ContextAccess::new(owner, actor)`. The default scope shares context across
+that owner's agents and sessions. The harness supplies trusted identity,
 scope and tool permissions.
 
 `TypeDefinition::note(scope)` is an optional starting schema registered through

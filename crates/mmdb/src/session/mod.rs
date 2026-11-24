@@ -1,0 +1,119 @@
+//! Continuous, owner-scoped session events and recovery checkpoints.
+
+mod checkpoints;
+mod history;
+mod search;
+mod types;
+
+use crate::records::codec::{owner_key, segment};
+pub use crate::records::RecoveryReport;
+use crate::records::*;
+use crate::OperationId;
+pub(crate) use history::LogGate;
+pub use types::*;
+
+const CALLS: &str = "session_tool_calls_v1";
+const MESSAGES: &str = "session_messages_v1";
+module_partitions!(SessionParts, SESSION_PARTITIONS, {
+    history_order => "session_order_v1",
+    history_heads => "session_heads_v1",
+    events => "session_events_v1",
+    calls => CALLS,
+    results => "session_tool_results_v1",
+    messages => MESSAGES,
+    checkpoints => "session_checkpoints_v1",
+});
+
+/// Read and append session events and checkpoints under one trusted access profile.
+pub struct SessionLog<'a> {
+    pub(crate) scoped: Scoped<'a>,
+    pub(crate) parts: &'a SessionParts,
+}
+
+fn session_key(owner: &str, session: &str) -> Vec<u8> {
+    let mut key = owner_key(owner);
+    segment(&mut key, session.as_bytes());
+    key
+}
+
+impl SessionLog<'_> {
+    pub fn head(&self, record: &ContextRef) -> ContextResult<RecordHeader> {
+        record.kind.require_module(StoreModule::Session)?;
+        let _guard = self.scoped.lock();
+        self.scoped.head_locked(record)
+    }
+
+    pub fn inspect_header(&self, pin: &RecordPin) -> ContextResult<RecordHeader> {
+        pin.record.kind.require_module(StoreModule::Session)?;
+        let _guard = self.scoped.lock();
+        self.scoped.header_locked(pin)
+    }
+
+    pub fn read_payload(
+        &self,
+        pin: &RecordPin,
+        offset: u64,
+        limit: usize,
+    ) -> ContextResult<PayloadPage> {
+        pin.record.kind.require_module(StoreModule::Session)?;
+        let _guard = self.scoped.lock();
+        let header = self.scoped.readable_header_locked(pin)?;
+        self.scoped.payload_slice_locked(&header, offset, limit)
+    }
+
+    pub fn operation_receipt(
+        &self,
+        operation: crate::OperationId,
+    ) -> ContextResult<Option<WriteReceipt>> {
+        self.scoped.operation_receipt(operation)
+    }
+
+    pub fn retract(
+        &self,
+        operation: OperationId,
+        expected: RecordPin,
+    ) -> ContextResult<WriteReceipt> {
+        self.change_state(operation, expected, RecordState::Retracted)
+    }
+
+    /// Hides this record and dependent memory records immediately.
+    /// Physical chunk cleanup is bounded and resumable with `recover_payloads`.
+    pub fn purge(
+        &self,
+        operation: OperationId,
+        expected: RecordPin,
+    ) -> ContextResult<WriteReceipt> {
+        self.change_state(operation, expected, RecordState::Purged)
+    }
+
+    fn change_state(
+        &self,
+        operation: OperationId,
+        expected: RecordPin,
+        state: RecordState,
+    ) -> ContextResult<WriteReceipt> {
+        expected.record.kind.require_module(StoreModule::Session)?;
+        let redacts = state == RecordState::Purged || expected.record.kind == RecordKind::History;
+        if redacts && !matches!(self.scoped.access().actor, Actor::User | Actor::Operator) {
+            return Err(ContextError::AccessDenied);
+        }
+        self.scoped
+            .commit_state_change(operation, expected, state, redacts, |batch, _, header| {
+                if let Some(history) = &header.history {
+                    self.withdraw_history(batch, history)?;
+                }
+                Ok(())
+            })
+    }
+
+    /// Cleans abandoned uploads and purged payloads, never live committed data.
+    /// The chunk and upload counts bound work even for very large originals.
+    pub fn recover_payloads(
+        &self,
+        max_chunks: usize,
+        max_uploads: usize,
+    ) -> ContextResult<RecoveryReport> {
+        self.scoped
+            .recover_payloads(StoreModule::Session, max_chunks, max_uploads)
+    }
+}

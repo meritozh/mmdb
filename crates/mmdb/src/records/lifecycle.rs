@@ -98,6 +98,34 @@ impl Scoped<'_> {
         Ok(())
     }
 
+    pub(crate) fn commit_state_change(
+        &self,
+        operation: OperationId,
+        expected: RecordPin,
+        state: RecordState,
+        redacts: bool,
+        update_indexes: impl FnOnce(&mut Batch, &RecordHeader, &RecordHeader) -> ContextResult<()>,
+    ) -> ContextResult<WriteReceipt> {
+        let _guard = self.lock();
+        let digest = self.digest("set-context-state", &(&expected, state))?;
+        if let Some(receipt) = self.replay(operation, digest)? {
+            return Ok(receipt);
+        }
+        let mut batch = self.batch();
+        let (previous, header) =
+            self.state_change(&mut batch, operation, &expected, state, redacts)?;
+        update_indexes(&mut batch, &previous, &header)?;
+        self.commit_operation(
+            batch,
+            operation,
+            digest,
+            WriteReceipt {
+                pin: header.pin,
+                history_sequence: header.history.as_ref().map(|history| history.sequence),
+            },
+        )
+    }
+
     pub(crate) fn state_change(
         &self,
         batch: &mut Batch,

@@ -1,5 +1,6 @@
 //! A deterministic pair of harnesses sharing a context store across reopen.
 use mmdb::context::*;
+use mmdb::session::HistoryInput;
 use mmdb::Store;
 use mmdb::{Actor, OperationId, Scope, TemporalFacts};
 use serde_json::json;
@@ -12,8 +13,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let db = Store::create(&path)?;
         let mut access = ContextAccess::new("owner", Actor::System);
         access.agent = Some("research".into());
+        let log = db.session_log(access.clone())?;
         let context = db.context(access)?;
-        let evidence = context.append_history(
+        let evidence = log.append_history(
             OperationId::new(),
             HistoryInput {
                 sources: Vec::new(),
@@ -101,6 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut access = ContextAccess::new("owner", Actor::Assistant);
     access.agent = Some("trading".into());
     access.session = Some("trading-session".into());
+    let log = db.session_log(access.clone())?;
     let context = db.context(access)?;
     let (_, definition) = context
         .find_type(&Scope::Personal, "research.observation")?
@@ -119,7 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if hit.path != vec![relation.pin] {
         return Err("indirect record did not retain its relation path".into());
     }
-    let raw = context.read_payload(&hit.record.header.sources[0], 0, 4096)?;
+    let raw = log.read_payload(&hit.record.header.sources[0], 0, 4096)?;
     println!(
         "Trading recalled record {} at revision {} from agent {:?}.",
         saved.pin.record.id, saved.pin.revision, hit.record.header.provenance.agent
@@ -132,7 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "Original session history position: {}",
-        context.history_position("research-session")?
+        log.history_position("research-session")?
     );
     Ok(())
 }
