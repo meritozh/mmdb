@@ -1,6 +1,5 @@
 use crate::store_format::{
-    directory_contains_only_manifest, require_managed_store, StoreEraId, StoreFormatDescriptor,
-    StoreFormatError, StoreLease,
+    require_managed_store, StoreEraId, StoreFormatDescriptor, StoreFormatError, StoreLease,
 };
 use fjall::{Config, Keyspace, PartitionHandle, PersistMode};
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
@@ -198,9 +197,12 @@ impl StoreMetadata {
         keyspace: &Keyspace,
         store_era: &StoreEraId,
         schema: &Schema,
-        pristine: bool,
     ) -> KernelResult<(Self, PartitionHandle)> {
-        if !pristine && !keyspace.partition_exists(KERNEL_PARTITION) {
+        let has_modules = keyspace
+            .list_partitions()
+            .iter()
+            .any(|name| name.as_ref() != KERNEL_PARTITION);
+        if has_modules && !keyspace.partition_exists(KERNEL_PARTITION) {
             return Err(KernelError::Corrupt(
                 "kernel metadata partition is missing".into(),
             ));
@@ -226,7 +228,9 @@ impl StoreMetadata {
             }
             return Ok((metadata, partition));
         }
-        if !pristine {
+        // Module partitions appear only after the first metadata commit, so a store
+        // without them is new or its first open stopped before that commit.
+        if has_modules || !partition.is_empty()? {
             return Err(KernelError::Corrupt(
                 "kernel store metadata is missing".into(),
             ));
@@ -370,10 +374,9 @@ impl Kernel {
         lease: StoreLease,
     ) -> KernelResult<Self> {
         let managed = require_managed_store(root, format.format_id())?;
-        let pristine = directory_contains_only_manifest(managed.canonical_root())?;
         let keyspace = Config::new(managed.canonical_root()).open()?;
         let store_era = managed.manifest().store_era_id().clone();
-        let (metadata, partition) = StoreMetadata::load(&keyspace, &store_era, &schema, pristine)?;
+        let (metadata, partition) = StoreMetadata::load(&keyspace, &store_era, &schema)?;
         let eras = ModuleEras::load(metadata.eras, &partition, &schema)?;
         schema.open_partitions(&keyspace, &eras.current)?;
         Ok(Self(Arc::new(Inner {

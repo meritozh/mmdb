@@ -132,6 +132,24 @@ fn store_metadata_is_created_once_and_checked_against_the_manifest() {
 }
 
 #[test]
+fn a_first_open_stopped_before_its_metadata_commit_initializes_on_reopen() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("store");
+    fs::create_dir(&root).unwrap();
+    format().new_manifest().unwrap().write_new(&root).unwrap();
+    // The interrupted open left engine files and an empty metadata partition.
+    let keyspace = Config::new(&root).open().unwrap();
+    keyspace
+        .open_partition(KERNEL_PARTITION, Default::default())
+        .unwrap();
+    drop(keyspace);
+    let kernel = open(&root).unwrap();
+    let era = kernel.era(SESSION);
+    drop(kernel);
+    assert_eq!(open(&root).unwrap().era(SESSION), era);
+}
+
+#[test]
 fn open_rejects_another_format() {
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("store");
