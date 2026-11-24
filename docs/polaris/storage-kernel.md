@@ -42,7 +42,7 @@ Status: active
 
 ## Features
 
-1. 会话日志和检查点从记忆存储迁到存储内核上的会话模块，从随记忆一起重置变为重置记忆后仍完整可读。Iterate [连续会话日志与原文搜索](../feature/session-log.md). Part: 1. After: none
+1. [连续会话日志与原文搜索](../feature/session-log.md)：会话日志和检查点从记忆存储迁到存储内核上的会话模块，从随记忆一起重置变为重置记忆后仍完整可读。Part: 1. After: none
 2. 会话日志从只记录消息和工具事件，变为也记录轮次的开始与结束，并在重开时把未结束的轮次关闭并标为中断。Iterate [连续会话日志与原文搜索](../feature/session-log.md). Part: 1. After: 1
 3. harness 可以创建带头记录的会话、按修订号列出会话，并从一段日志前缀 fork 出子会话。New. Part: 1. After: 1, 2
 4. harness 可以把派生出的对话存成绑定到日志位置的对话缓存，之后只读缓存之后的日志尾部就能还原对话，并在日志事件被撤回或清除后认出缓存已过期。New. Part: 1. After: 1
