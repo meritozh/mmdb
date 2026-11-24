@@ -163,7 +163,7 @@ impl ContextStore<'_> {
         &self,
         pin: &RecordPin,
         at: Option<i64>,
-        memo: &mut BTreeMap<(RecordPin, usize), usize>,
+        memo: &mut SourceMemo,
     ) -> ContextResult<Option<RecordHeader>> {
         let header = match self.header_locked(pin) {
             Ok(header) => header,

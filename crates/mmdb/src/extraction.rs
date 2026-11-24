@@ -306,6 +306,7 @@ impl ContextStore<'_> {
             state: RecordState::Active,
             type_pin,
             sources,
+            source_scopes: Vec::new(),
             provenance: self.provenance(),
             information: InformationKind::Observation,
             temporal: TemporalFacts::observed_at(now),

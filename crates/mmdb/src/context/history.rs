@@ -10,6 +10,13 @@ struct SessionHead {
     scope: Scope,
 }
 
+#[derive(Serialize, Deserialize)]
+struct ToolCallIndex {
+    record: ContextRef,
+    message_id: Option<String>,
+    purged: bool,
+}
+
 fn identity_key(owner: &str, session: &str, identity: &str) -> Vec<u8> {
     let mut key = session_key(owner, session);
     segment(&mut key, identity.as_bytes());
@@ -115,7 +122,7 @@ impl ContextStore<'_> {
         }
         let sequence = head.map_or(0, |head| head.sequence);
         let writing = previous_operation.is_none() && previous_event.is_none();
-        let call_sources = if writing {
+        let (sources, source_scopes) = if writing {
             if let Some(expected) = input.expected_sequence {
                 if expected != sequence {
                     return Err(ContextError::HistoryConflict {
@@ -126,10 +133,10 @@ impl ContextStore<'_> {
             }
             let mut sources = self.validate_call_link(&input)?;
             sources.extend(input.sources.clone());
-            self.validate_history_sources(&input.scope, &sources)?;
-            sources
+            let source_scopes = self.validate_history_sources(&input.scope, &sources)?;
+            (sources, source_scopes)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         let message_transition = if writing {
             self.message_transition(&input)?
@@ -221,7 +228,8 @@ impl ContextStore<'_> {
             scope: input.scope.clone(),
             state: RecordState::Active,
             type_pin: None,
-            sources: call_sources,
+            sources,
+            source_scopes,
             provenance,
             information: InformationKind::Observation,
             temporal: TemporalFacts::observed_at(input.occurred_at_ms),
@@ -264,10 +272,18 @@ impl ContextStore<'_> {
             })?,
         );
         match input.kind {
-            HistoryKind::ToolCall { call_id, .. } => batch.insert(
+            HistoryKind::ToolCall {
+                call_id,
+                message_id,
+                ..
+            } => batch.insert(
                 &self.parts.calls,
                 identity_key(&self.access.owner, &input.session, &call_id),
-                encode(&pin.record)?,
+                encode(&ToolCallIndex {
+                    record: pin.record.clone(),
+                    message_id,
+                    purged: false,
+                })?,
             ),
             HistoryKind::ToolResult { call_id, .. } => batch.insert(
                 &self.parts.results,
@@ -410,15 +426,35 @@ impl ContextStore<'_> {
         self.head_locked(&decode(&record)?)
     }
 
+    fn call_index(&self, session: &str, call_id: &str) -> ContextResult<Option<ToolCallIndex>> {
+        self.parts
+            .calls
+            .get(identity_key(&self.access.owner, session, call_id))?
+            .map(|bytes| decode(&bytes))
+            .transpose()
+    }
+
+    fn indexed_call(&self, session: &str, call_id: &str) -> ContextResult<ToolCallIndex> {
+        self.call_index(session, call_id)?
+            .ok_or_else(|| ContextError::Corrupt("missing tool call index".into()))
+    }
+
     pub(crate) fn message_available_locked(&self, history: &HistoryEntry) -> ContextResult<bool> {
+        let call;
         let id = match &history.kind {
             HistoryKind::AssistantStarted { message_id }
             | HistoryKind::AssistantFragment { message_id, .. }
-            | HistoryKind::AssistantTerminal { message_id, .. }
-            | HistoryKind::ToolCall {
-                message_id: Some(message_id),
-                ..
-            } => message_id,
+            | HistoryKind::AssistantTerminal { message_id, .. } => message_id,
+            HistoryKind::ToolCall { call_id, .. } | HistoryKind::ToolResult { call_id, .. } => {
+                call = self.indexed_call(&history.session, call_id)?;
+                if call.purged {
+                    return Ok(false);
+                }
+                let Some(id) = &call.message_id else {
+                    return Ok(true);
+                };
+                id
+            }
             _ => return Ok(true),
         };
         let state: MessageState = self
@@ -431,7 +467,7 @@ impl ContextStore<'_> {
         Ok(!state.unavailable)
     }
 
-    pub(crate) fn invalidate_message(
+    pub(crate) fn withdraw_history(
         &self,
         batch: &mut fjall::Batch,
         history: &HistoryEntry,
@@ -439,11 +475,19 @@ impl ContextStore<'_> {
         let id = match &history.kind {
             HistoryKind::AssistantStarted { message_id }
             | HistoryKind::AssistantFragment { message_id, .. }
-            | HistoryKind::AssistantTerminal { message_id, .. }
-            | HistoryKind::ToolCall {
-                message_id: Some(message_id),
+            | HistoryKind::AssistantTerminal { message_id, .. } => message_id,
+            HistoryKind::ToolCall {
+                call_id,
+                message_id,
                 ..
-            } => message_id,
+            } => {
+                let mut call = self.indexed_call(&history.session, call_id)?;
+                call.purged = true;
+                let key = identity_key(&self.access.owner, &history.session, call_id);
+                batch.insert(&self.parts.calls, key, encode(&call)?);
+                let Some(id) = message_id else { return Ok(()) };
+                id
+            }
             _ => return Ok(()),
         };
         let key = identity_key(&self.access.owner, &history.session, id);
@@ -494,18 +538,17 @@ impl ContextStore<'_> {
             }
             HistoryKind::ToolResult { call_id, .. } => {
                 let key = identity_key(&self.access.owner, &input.session, call_id);
-                let call = self.parts.calls.get(&key)?.ok_or_else(|| {
+                let call = self.call_index(&input.session, call_id)?.ok_or_else(|| {
                     ContextError::InvalidInput(
                         "tool result has no preceding call in this session".into(),
                     )
                 })?;
-                let reference = decode(&call)?;
-                let header = self.head_locked(&reference)?;
+                let header = self.head_locked(&call.record)?;
                 // A completed operation may have revised a source used by its
                 // call. Pair immutable originals using historical readability;
                 // purge and message unavailability still invalidate the link.
                 if !self.available_locked(&header.pin, false)? {
-                    return Err(ContextError::Unavailable(reference));
+                    return Err(ContextError::Unavailable(call.record));
                 }
                 if self.parts.results.contains_key(key)? {
                     return Err(ContextError::IdempotencyConflict);
@@ -546,10 +589,8 @@ impl ContextStore<'_> {
         let _guard = self.db.write_lock.lock();
         let key = identity_key(&self.access.owner, session, call_id);
         let call = self
-            .parts
-            .calls
-            .get(&key)?
-            .map(|bytes| self.head_locked(&decode(&bytes)?))
+            .call_index(session, call_id)?
+            .map(|call| self.head_locked(&call.record))
             .transpose()?;
         let result = self
             .parts

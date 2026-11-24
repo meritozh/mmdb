@@ -1283,8 +1283,12 @@ fn copied_history_tracks_source_availability_and_session_catalog_pages() {
         .unwrap()
         .purge(OperationId::new(), original)
         .unwrap();
+    assert_eq!(
+        store.read_payload(&copy.pin, 0, 100).unwrap().bytes,
+        b"withdrawable-secret copied"
+    );
     assert!(matches!(
-        store.read_payload(&copy.pin, 0, 100),
+        store.validate_current(&[copy.pin], None),
         Err(ContextError::Unavailable(_))
     ));
     for index in 0..7 {
@@ -1549,11 +1553,18 @@ fn live_revision_keeps_checkpoint_derived_originals_and_pairs_the_completed_tool
         .unwrap()
         .purge(OperationId::new(), raw)
         .unwrap();
-    for pin in [&checkpoint, &derived, &call, &result] {
-        assert!(
-            matches!(store.read(pin), Err(ContextError::Unavailable(_))),
-            "purge must still hide every copied original"
-        );
+    for pin in [&checkpoint, &derived] {
+        assert!(matches!(store.read(pin), Err(ContextError::Unavailable(_))));
+    }
+    for (pin, payload) in [
+        (&call, b"revise the original note".as_slice()),
+        (&result, b"revision 2 committed".as_slice()),
+    ] {
+        assert_eq!(store.read_payload(pin, 0, 100).unwrap().bytes, payload);
+        assert!(matches!(
+            store.validate_current(std::slice::from_ref(pin), None),
+            Err(ContextError::Unavailable(_))
+        ));
     }
 }
 
@@ -1774,7 +1785,7 @@ fn session_and_child_run_checkpoints_keep_independent_cas_chains_across_reopen()
 }
 
 #[test]
-fn history_copies_old_object_and_type_pins_but_purge_blocks_object_copies() {
+fn log_copies_stay_readable_after_their_sources_change() {
     let tmp = tempfile::tempdir().unwrap();
     let db = MemoryDatabase::create_context(tmp.path().join("context")).unwrap();
     let store = db.context(access("owner")).unwrap();
@@ -1850,21 +1861,16 @@ fn history_copies_old_object_and_type_pins_but_purge_blocks_object_copies() {
         store.read(&old_object),
         Err(ContextError::Unavailable(_))
     ));
-    assert!(matches!(
-        store.read(&copies[0].0),
-        Err(ContextError::Unavailable(_))
-    ));
-    assert!(matches!(
-        store.read_payload(&copies[0].0, 0, MAX_RECORD_BYTES),
-        Err(ContextError::Unavailable(_))
-    ));
-    assert_eq!(
-        store
-            .read_payload(&copies[1].0, 0, MAX_RECORD_BYTES)
-            .unwrap()
-            .bytes,
-        copies[1].1
-    );
+    for (pin, payload) in &copies {
+        assert_eq!(
+            store.read_payload(pin, 0, MAX_RECORD_BYTES).unwrap().bytes,
+            *payload
+        );
+        assert!(matches!(
+            store.validate_current(std::slice::from_ref(pin), None),
+            Err(ContextError::Unavailable(_))
+        ));
+    }
 
     let mut blocked = history_input("snapshot-session", "copy-after-purge");
     blocked.kind = HistoryKind::Notice;
@@ -1944,7 +1950,7 @@ fn history_copy_reserves_new_root_depth_before_committing_an_unreadable_record()
 }
 
 #[test]
-fn tool_results_link_historical_call_sources_and_still_follow_purge() {
+fn tool_results_stay_readable_after_their_call_source_is_purged() {
     let temp = tempfile::tempdir().unwrap();
     let db = MemoryDatabase::create_context(temp.path().join("context")).unwrap();
     let store = db.context(access("owner")).unwrap();
@@ -1988,10 +1994,21 @@ fn tool_results_link_historical_call_sources_and_still_follow_purge() {
         store.read_payload(&result.pin, 0, 100).unwrap().bytes,
         b"revision committed"
     );
-    db.context(ContextAccess::new("owner", Actor::User))
-        .unwrap()
-        .purge(OperationId::new(), current)
+    let user = db
+        .context(ContextAccess::new("owner", Actor::User))
         .unwrap();
+    user.purge(OperationId::new(), current).unwrap();
+    for (pin, payload) in [
+        (&call.pin, b"update to a new revision".as_slice()),
+        (&result.pin, b"revision committed".as_slice()),
+    ] {
+        assert_eq!(store.read_payload(pin, 0, 100).unwrap().bytes, payload);
+        assert!(matches!(
+            store.validate_current(std::slice::from_ref(pin), None),
+            Err(ContextError::Unavailable(_))
+        ));
+    }
+    user.purge(OperationId::new(), call.pin).unwrap();
     assert!(matches!(
         store.read(&result.pin),
         Err(ContextError::Unavailable(_))
@@ -2041,4 +2058,172 @@ fn history_copy_shares_the_aggregate_source_budget_including_its_new_root() {
         .unwrap()
         .entries
         .is_empty());
+}
+
+#[test]
+fn a_log_copy_needs_the_scopes_of_its_sources() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = MemoryDatabase::create_context(tmp.path().join("context")).unwrap();
+    let workspace = Scope::Workspace(ulid::Ulid::new());
+    let mut authorized = access("owner");
+    authorized.scopes.push(workspace.clone());
+    let store = db.context(authorized).unwrap();
+    let raw = source(&store, "raw", "personal detail");
+    let mut input = history_input("work", "copy");
+    input.scope = workspace.clone();
+    input.sources = vec![raw];
+    let copy = store
+        .append_history(OperationId::new(), input.clone(), b"first".as_slice())
+        .unwrap()
+        .pin;
+    input.event_id = "second".into();
+    input.sources = vec![copy];
+    let nested = store
+        .append_history(OperationId::new(), input, b"second".as_slice())
+        .unwrap()
+        .pin;
+    let checkpoint = store
+        .save_checkpoint(
+            OperationId::new(),
+            CheckpointInput {
+                session: "work".into(),
+                run: "run".into(),
+                scope: CheckpointScope::Session,
+                history_sequence: 2,
+                expected_previous: None,
+                expected_availability_epoch: store.availability_epoch().unwrap(),
+                sources: vec![],
+                payload: json!("summary"),
+            },
+        )
+        .unwrap()
+        .pin;
+    let mut restricted = access("owner");
+    restricted.scopes = vec![workspace];
+    let restricted = db.context(restricted).unwrap();
+    for pin in [&nested, &checkpoint] {
+        assert_eq!(
+            store.read(pin).unwrap().header.source_scopes,
+            vec![Scope::Personal]
+        );
+        assert!(matches!(
+            restricted.read_payload(pin, 0, 100),
+            Err(ContextError::Unavailable(_))
+        ));
+        assert!(matches!(
+            restricted.validate_current(std::slice::from_ref(pin), None),
+            Err(ContextError::Unavailable(_))
+        ));
+    }
+}
+
+#[test]
+fn purging_a_log_event_hides_what_was_derived_from_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = MemoryDatabase::create_context(tmp.path().join("context")).unwrap();
+    let store = db
+        .context(ContextAccess::new("owner", Actor::Operator))
+        .unwrap();
+    let raw = source(&store, "raw", "original");
+    let independent = source(&store, "other", "another observation");
+    let kind = store
+        .define_type(OperationId::new(), definition("note"))
+        .unwrap()
+        .pin;
+    let a = store
+        .save_object(OperationId::new(), object(&kind, &raw, "derived"))
+        .unwrap()
+        .pin;
+    let b = store
+        .save_object(
+            OperationId::new(),
+            object(&kind, &independent, "independent"),
+        )
+        .unwrap()
+        .pin;
+    let link = store
+        .save_relation(
+            OperationId::new(),
+            relation(&relation_type(&store, &kind), &a, &b, &raw),
+        )
+        .unwrap()
+        .pin;
+    let checkpoint = store
+        .save_checkpoint(
+            OperationId::new(),
+            CheckpointInput {
+                scope: CheckpointScope::Session,
+                session: "session-a".into(),
+                run: "run".into(),
+                history_sequence: 2,
+                expected_previous: None,
+                expected_availability_epoch: store.availability_epoch().unwrap(),
+                sources: vec![raw.clone()],
+                payload: json!("summary"),
+            },
+        )
+        .unwrap()
+        .pin;
+    store.purge(OperationId::new(), raw).unwrap();
+    for pin in [&a, &link, &checkpoint] {
+        assert!(matches!(
+            store.read_payload(pin, 0, 100),
+            Err(ContextError::Unavailable(_))
+        ));
+    }
+    assert!(store.read(&b).is_ok());
+}
+
+#[test]
+fn a_withdrawn_fragment_hides_its_whole_message() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = MemoryDatabase::create_context(tmp.path().join("context")).unwrap();
+    let store = db
+        .context(ContextAccess::new("owner", Actor::Operator))
+        .unwrap();
+    let message_id = "message".to_string();
+    let kinds = [
+        HistoryKind::AssistantStarted {
+            message_id: message_id.clone(),
+        },
+        HistoryKind::AssistantFragment {
+            message_id: message_id.clone(),
+            ordinal: 0,
+        },
+        HistoryKind::AssistantFragment {
+            message_id: message_id.clone(),
+            ordinal: 1,
+        },
+        HistoryKind::ToolCall {
+            message_id: Some(message_id.clone()),
+            call_id: "call".into(),
+            tool_name: "read".into(),
+        },
+        HistoryKind::ToolResult {
+            call_id: "call".into(),
+            outcome: ToolOutcome::Succeeded,
+        },
+        HistoryKind::AssistantTerminal {
+            message_id,
+            status: MessageStatus::Completed,
+        },
+    ];
+    let mut pins = Vec::new();
+    for (index, kind) in kinds.into_iter().enumerate() {
+        let mut input = history_input("session-a", &index.to_string());
+        input.kind = kind;
+        pins.push(
+            store
+                .append_history(OperationId::new(), input, b"event".as_slice())
+                .unwrap()
+                .pin,
+        );
+    }
+    store.retract(OperationId::new(), pins[1].clone()).unwrap();
+    for pin in pins {
+        assert!(matches!(
+            store.read_payload(&pin, 0, 100),
+            Err(ContextError::Unavailable(_))
+        ));
+    }
 }

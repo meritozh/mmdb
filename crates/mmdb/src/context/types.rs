@@ -265,6 +265,8 @@ pub struct RecordHeader {
     pub state: RecordState,
     pub type_pin: Option<RecordPin>,
     pub sources: Vec<RecordPin>,
+    /// Additional scopes required to read the session snapshot.
+    pub source_scopes: Vec<Scope>,
     pub provenance: Provenance,
     pub information: InformationKind,
     pub temporal: TemporalFacts,

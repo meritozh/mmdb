@@ -181,6 +181,7 @@ impl ContextStore<'_> {
             state: RecordState::Active,
             type_pin: Some(input.type_pin),
             sources: input.sources,
+            source_scopes: Vec::new(),
             provenance: self.provenance(),
             information: input.information,
             temporal: input.temporal,
@@ -317,7 +318,7 @@ impl ContextStore<'_> {
         self.change_state(operation, expected, RecordState::Retracted)
     }
 
-    /// Makes this record and payloads derived from it unavailable immediately.
+    /// Hides this record and dependent memory records immediately.
     /// Physical chunk cleanup is bounded and resumable with `recover_payloads`.
     pub fn purge(
         &self,
@@ -375,7 +376,7 @@ impl ContextStore<'_> {
             self.invalidate_checkpoint_payloads(&mut batch, epoch)?;
         }
         if let Some(history) = &header.history {
-            self.invalidate_message(&mut batch, history)?;
+            self.withdraw_history(&mut batch, history)?;
         }
         self.put_header(&mut batch, &header)?;
         self.replace_postings(&mut batch, &header, None)?;

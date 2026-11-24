@@ -79,6 +79,39 @@ pub(crate) fn encode<T: Serialize>(value: &T) -> ContextResult<Vec<u8>> {
     Ok(serde_json::to_vec(value)?)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum SourceCheck {
+    Current,
+    Historical,
+    Copy,
+    // A new event must fit the graph budget for subsequent current checks.
+    // Below a readable session snapshot, charge only the shape of its provenance.
+    BudgetOnly,
+}
+
+pub(super) type SourceMemo = BTreeMap<(RecordPin, usize, SourceCheck), usize>;
+
+#[derive(Default)]
+struct SourceWalk {
+    count: usize,
+    path: BTreeSet<RecordPin>,
+    scopes: BTreeSet<Scope>,
+}
+
+impl SourceWalk {
+    fn for_new_record() -> Self {
+        Self {
+            count: 1,
+            ..Self::default()
+        }
+    }
+
+    fn other_scopes(mut self, own: &Scope) -> Vec<Scope> {
+        self.scopes.remove(own);
+        self.scopes.into_iter().collect()
+    }
+}
+
 impl ContextStore<'_> {
     pub(crate) fn check_scope(&self, scope: &Scope) -> ContextResult<()> {
         if !self.access.scopes.contains(scope) {
@@ -173,35 +206,39 @@ impl ContextStore<'_> {
         &self,
         pin: &RecordPin,
         active: bool,
-        memo: &mut BTreeMap<(RecordPin, usize), usize>,
+        memo: &mut SourceMemo,
     ) -> ContextResult<bool> {
-        self.available_walk(pin, active, None, 0, &mut 0, &mut BTreeSet::new(), memo)
+        let check = if active {
+            SourceCheck::Current
+        } else {
+            SourceCheck::Historical
+        };
+        self.available_walk(pin, check, None, 0, &mut SourceWalk::default(), memo)
     }
 
     fn available_walk(
         &self,
         pin: &RecordPin,
-        active: bool,
+        check: SourceCheck,
         excluded: Option<&ContextRef>,
         depth: usize,
-        count: &mut usize,
-        path: &mut BTreeSet<RecordPin>,
-        memo: &mut BTreeMap<(RecordPin, usize), usize>,
+        walk: &mut SourceWalk,
+        memo: &mut SourceMemo,
     ) -> ContextResult<bool> {
-        let prior = *count;
-        *count += 1;
-        if depth > 32 || *count > 4096 {
+        let prior = walk.count;
+        walk.count += 1;
+        if depth > 32 || walk.count > 4096 {
             return Err(ContextError::BudgetExceeded);
         }
-        if excluded == Some(&pin.record) || !path.insert(pin.clone()) {
+        if excluded == Some(&pin.record) || !walk.path.insert(pin.clone()) {
             return Ok(false);
         }
-        // Only cache successful, acyclic walks at the same remaining depth.
-        // Charge their original cost so reuse cannot widen the traversal budget.
-        if let Some(cost) = memo.get(&(pin.clone(), depth)) {
-            *count = prior + cost;
-            path.remove(pin);
-            return if *count > 4096 {
+        // Charge the original cost when reusing a successful, acyclic walk.
+        let key = (pin.clone(), depth, check);
+        if let Some(cost) = memo.get(&key) {
+            walk.count = prior + cost;
+            walk.path.remove(pin);
+            return if walk.count > 4096 {
                 Err(ContextError::BudgetExceeded)
             } else {
                 Ok(true)
@@ -209,56 +246,63 @@ impl ContextStore<'_> {
         }
         let header = match self.header_locked(pin) {
             Ok(header) => header,
-            Err(ContextError::NotFound(_) | ContextError::AccessDenied) => {
-                path.remove(pin);
-                return Ok(false);
-            }
+            Err(ContextError::NotFound(_) | ContextError::AccessDenied) => return Ok(false),
             Err(error) => return Err(error),
         };
-        let head = self.head_locked(&pin.record)?;
-        if header
-            .checkpoint
-            .as_ref()
-            .map(|checkpoint| {
-                if active {
-                    self.availability_epoch_locked()
-                        .map(|epoch| epoch != checkpoint.availability_epoch)
-                } else {
-                    self.checkpoint_redaction_epoch_locked()
-                        .map(|epoch| checkpoint.availability_epoch < epoch)
-                }
-            })
-            .transpose()?
-            .unwrap_or(false)
-        {
-            path.remove(pin);
-            return Ok(false);
-        }
-        if let Some(history) = &header.history {
-            if !self.message_available_locked(history)? {
-                path.remove(pin);
+        if check != SourceCheck::BudgetOnly {
+            if !self.header_available(&header, check == SourceCheck::Current)? {
                 return Ok(false);
             }
+            walk.scopes.insert(header.scope.clone());
+            walk.scopes.extend(header.source_scopes.iter().cloned());
         }
+        let session_record = matches!(
+            pin.record.kind,
+            RecordKind::History | RecordKind::Checkpoint
+        );
+        let source_check = match (session_record, check) {
+            (true, SourceCheck::Historical) => None,
+            (true, SourceCheck::Copy) => Some(SourceCheck::BudgetOnly),
+            _ => Some(check),
+        };
+        if let Some(source_check) = source_check {
+            for source in &header.sources {
+                if !self.available_walk(source, source_check, excluded, depth + 1, walk, memo)? {
+                    return Ok(false);
+                }
+            }
+        }
+        walk.path.remove(pin);
+        if memo.len() < 4096 {
+            memo.insert(key, walk.count - prior);
+        }
+        Ok(true)
+    }
+
+    fn header_available(&self, header: &RecordHeader, active: bool) -> ContextResult<bool> {
+        let head = self.head_locked(&header.pin.record)?;
         if head.state == RecordState::Purged
             || header.state == RecordState::Purged
             || (active
                 && (head.state != RecordState::Active
-                    || head.pin.revision != pin.revision
+                    || head.pin != header.pin
                     || header.state != RecordState::Active))
+            || !header
+                .source_scopes
+                .iter()
+                .all(|scope| self.access.scopes.contains(scope))
         {
-            path.remove(pin);
             return Ok(false);
         }
-        for source in &header.sources {
-            if !self.available_walk(source, active, excluded, depth + 1, count, path, memo)? {
-                path.remove(pin);
-                return Ok(false);
-            }
+        if let Some(checkpoint) = &header.checkpoint {
+            return if active {
+                Ok(checkpoint.availability_epoch == self.availability_epoch_locked()?)
+            } else {
+                Ok(checkpoint.availability_epoch >= self.checkpoint_redaction_epoch_locked()?)
+            };
         }
-        path.remove(pin);
-        if memo.len() < 4096 {
-            memo.insert((pin.clone(), depth), *count - prior);
+        if let Some(history) = &header.history {
+            return self.message_available_locked(history);
         }
         Ok(true)
     }
@@ -269,7 +313,7 @@ impl ContextStore<'_> {
         sources: &[RecordPin],
         information: InformationKind,
         revising: Option<&ContextRef>,
-    ) -> ContextResult<()> {
+    ) -> ContextResult<Vec<Scope>> {
         self.check_scope(scope)?;
         if sources.is_empty() || sources.len() > MAX_CONTEXT_SOURCES {
             return Err(ContextError::InvalidInput(
@@ -281,8 +325,7 @@ impl ContextStore<'_> {
         {
             return Err(ContextError::AccessDenied);
         }
-        let mut count = 1;
-        let mut path = BTreeSet::new();
+        let mut walk = SourceWalk::for_new_record();
         let mut memo = BTreeMap::new();
         for source in sources {
             if source.record.kind == RecordKind::Type {
@@ -294,42 +337,47 @@ impl ContextStore<'_> {
             if header.scope != *scope && header.scope != Scope::Personal {
                 return Err(ContextError::AccessDenied);
             }
-            if !self.available_walk(source, true, revising, 1, &mut count, &mut path, &mut memo)? {
+            if !self.available_walk(
+                source,
+                SourceCheck::Current,
+                revising,
+                1,
+                &mut walk,
+                &mut memo,
+            )? {
                 if revising.is_some() {
                     return Err(ContextError::InvalidInput("revision sources must be available and cannot depend on the revised record".into()));
                 }
                 return Err(ContextError::Unavailable(source.record.clone()));
             }
         }
-        Ok(())
+        Ok(walk.other_scopes(scope))
     }
 
     /// Original snapshots may copy a historical version or a type descriptor.
-    /// They retain its exact pin; purge still invalidates every copied payload.
     pub(crate) fn validate_history_sources(
         &self,
         scope: &Scope,
         sources: &[RecordPin],
-    ) -> ContextResult<()> {
+    ) -> ContextResult<Vec<Scope>> {
         self.check_scope(scope)?;
         if sources.len() > MAX_CONTEXT_SOURCES {
             return Err(ContextError::InvalidInput(
                 "history has too many source references".into(),
             ));
         }
-        let mut count = 1;
-        let mut path = BTreeSet::new();
+        let mut walk = SourceWalk::for_new_record();
         let mut memo = BTreeMap::new();
         for source in sources {
             let header = self.header_locked(source)?;
             if header.scope != *scope && header.scope != Scope::Personal {
                 return Err(ContextError::AccessDenied);
             }
-            if !self.available_walk(source, false, None, 1, &mut count, &mut path, &mut memo)? {
+            if !self.available_walk(source, SourceCheck::Copy, None, 1, &mut walk, &mut memo)? {
                 return Err(ContextError::Unavailable(source.record.clone()));
             }
         }
-        Ok(())
+        Ok(walk.other_scopes(scope))
     }
 
     pub(crate) fn digest<T: Serialize>(&self, domain: &str, input: &T) -> ContextResult<[u8; 32]> {

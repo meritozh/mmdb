@@ -22,7 +22,7 @@ use super::{MemoryDatabase, MemoryError, MemoryResult, OperationId};
 use fjall::{Keyspace, PartitionHandle};
 use std::fmt;
 
-pub const CONTEXT_STORE_FORMAT_ID: &str = "mmdb-context-v1";
+pub const CONTEXT_STORE_FORMAT_ID: &str = "mmdb-context-dev4";
 pub const PAYLOAD_CHUNK_BYTES: usize = 32 * 1024;
 pub const MAX_PAYLOAD_PAGE_BYTES: usize = 1024 * 1024;
 pub const MAX_RECORD_BYTES: usize = 128 * 1024;

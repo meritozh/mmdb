@@ -36,7 +36,7 @@ scope and tool permissions.
 the same catalog as custom types. Complete raw events stream into checksummed
 chunks; history search uses bounded, resumable substring scans. Objects use
 lexical postings and explicit relation paths. This contract currently requires
-the fresh `mmdb-context-v1` format; ordinary opening never converts old data.
+the fresh `mmdb-context-dev4` format; ordinary opening never converts old data.
 One process holds the store lease at a time.
 
 ```sh

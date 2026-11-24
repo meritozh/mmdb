@@ -164,7 +164,8 @@ impl ContextStore<'_> {
         if !sources.contains(&anchor.pin) {
             sources.push(anchor.pin);
         }
-        self.validate_sources(&anchor.scope, &sources, InformationKind::Inference, None)?;
+        let source_scopes =
+            self.validate_sources(&anchor.scope, &sources, InformationKind::Inference, None)?;
         let pin = self.fresh_pin(RecordKind::Checkpoint);
         let now = super::super::now_ms();
         let header = RecordHeader {
@@ -173,6 +174,7 @@ impl ContextStore<'_> {
             state: RecordState::Active,
             type_pin: None,
             sources,
+            source_scopes,
             provenance: self.provenance(),
             information: InformationKind::Inference,
             temporal: TemporalFacts::observed_at(now),
