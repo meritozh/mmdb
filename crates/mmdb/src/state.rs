@@ -582,7 +582,7 @@ fn state_key(tenant: u32, namespace: &str, key: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{native_memory::MemoryDatabase, Database};
+    use crate::{Database, Store};
     use mmdb_kernel::store_format::STORE_MANIFEST_FILE;
     use serde_json::json;
 
@@ -700,7 +700,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("memory");
         let format = StoreFormatDescriptor::new("example.runtime-state-v1").unwrap();
-        let memory = MemoryDatabase::create(&root).unwrap();
+        let memory = Store::create(&root).unwrap();
         drop(memory);
 
         let error = match StateStore::open_path(&root, 0, &format) {

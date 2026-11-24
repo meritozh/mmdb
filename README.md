@@ -23,12 +23,13 @@ directory so workflows and queues survive a memory-store reset.
 
 The `mmdb::context` contract provides versioned object and relation types,
 source-backed records, ordered session logs, and bounded lexical and graph
-recall, committed through the batches of `MemoryDatabase`. An assistant can save validated
+recall. The session and memory modules share the store lease, write lock and
+durable batches. An assistant can save validated
 context directly, with provenance and an explicit inference label.
 
-Create a fresh root with `native_memory::MemoryDatabase::create_context(path)`,
-reopen it with `open_context(path)`, and obtain a `ContextStore` using
-`context(ContextAccess::new(owner, actor))`. The default scope shares context
+Create a fresh root with `mmdb::Store::create(path)` and reopen it with
+`mmdb::Store::open(path)`. Use `store.memory()` for native memory or
+`store.context(ContextAccess::new(owner, actor))` for a `ContextStore`. The default scope shares context
 across that owner's agents and sessions. The harness supplies trusted identity,
 scope and tool permissions.
 
@@ -36,7 +37,8 @@ scope and tool permissions.
 the same catalog as custom types. Complete raw events stream into checksummed
 chunks; history search uses bounded, resumable substring scans. Objects use
 lexical postings and explicit relation paths. This contract currently requires
-the fresh `mmdb-context-dev7` format; ordinary opening never converts old data.
+the `mmdb-store-dev9` format. Use an explicit whole-store reset to replace a
+legacy directory.
 One process holds the store lease at a time.
 
 ```sh

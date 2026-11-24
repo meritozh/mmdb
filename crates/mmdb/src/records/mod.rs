@@ -134,8 +134,7 @@ impl RecordKind {
 
 pub(crate) struct StreamedPayload {
     pub descriptor: PayloadDescriptor,
-    upload: Option<RecordPin>,
-    pending: mmdb_kernel::Partition,
+    upload: Option<(RecordPin, mmdb_kernel::Partition)>,
 }
 
 #[cfg(test)]
@@ -159,17 +158,25 @@ mod tests {
     }
 
     #[test]
-    fn only_session_kinds_require_the_gate_even_in_a_shared_table() {
-        const MODULE: ModuleId = ModuleId("memory");
-        const MODULES: &[ModuleSpec] = &[ModuleSpec {
-            id: MODULE,
-            partitions: PARTITION_NAMES,
-        }];
+    fn only_session_kinds_require_the_gate() {
+        const MEMORY: ModuleId = ModuleId("memory");
+        const SESSION: ModuleId = ModuleId("session");
+        const MODULES: &[ModuleSpec] = &[
+            ModuleSpec {
+                id: MEMORY,
+                partitions: MEMORY_PARTITIONS,
+            },
+            ModuleSpec {
+                id: SESSION,
+                partitions: SESSION_PARTITIONS,
+            },
+        ];
         let tmp = tempfile::tempdir().unwrap();
         let format = StoreFormatDescriptor::new("records-test").unwrap();
         let kernel = Kernel::create(&tmp.path().join("store"), &format, MODULES).unwrap();
-        let era = kernel.module(MODULE);
-        let records = Records::open(kernel, &era, Box::new(FixedGate(false))).unwrap();
+        let memory = kernel.module(MEMORY);
+        let session = kernel.module(SESSION);
+        let records = Records::open(kernel, &session, &memory, Box::new(FixedGate(false))).unwrap();
         let scoped = records.scoped(ContextAccess::new("owner", Actor::System));
         let mut batch = scoped.batch();
         let mut pins = Vec::new();

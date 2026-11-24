@@ -174,17 +174,18 @@ fn checkpoint_key(owner: &str, session: &str, scope: CheckpointScope, run: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Store;
     use crate::{Actor, Scope};
 
     #[test]
     fn missing_and_stale_visibility_markers_do_not_restore_old_checkpoint_payloads() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("context");
-        let db = MemoryDatabase::create_context(&path).unwrap();
+        let db = Store::create(&path).unwrap();
         let store = db
             .context(ContextAccess::new("owner", Actor::System))
             .unwrap();
-        let mut batch = db.kernel.batch();
+        let mut batch = store.scoped.batch();
         store.scoped.advance_epoch(&mut batch).unwrap();
         batch.commit().unwrap();
         let anchor = store
@@ -221,7 +222,7 @@ mod tests {
             .pin;
         assert!(store.read(&checkpoint).is_ok());
         // Simulate an older binary advancing only the original lifecycle key.
-        let mut batch = db.kernel.batch();
+        let mut batch = store.scoped.batch();
         batch.insert(
             store.scoped.test_lifecycle(),
             owner_key("owner"),
@@ -232,7 +233,7 @@ mod tests {
             store.read(&checkpoint),
             Err(ContextError::Unavailable(_))
         ));
-        let mut batch = db.kernel.batch();
+        let mut batch = store.scoped.batch();
         batch.remove(
             store.scoped.test_lifecycle(),
             store.scoped.checkpoint_redaction_key(),
@@ -242,13 +243,13 @@ mod tests {
             store.read(&checkpoint),
             Err(ContextError::Unavailable(_))
         ));
-        let mut batch = db.kernel.batch();
+        let mut batch = store.scoped.batch();
         assert_eq!(store.scoped.advance_epoch(&mut batch).unwrap(), 3);
         batch.commit().unwrap();
         assert_eq!(store.scoped.checkpoint_redaction_epoch_locked().unwrap(), 2);
         drop(store);
         drop(db);
-        let db = MemoryDatabase::open_context(path).unwrap();
+        let db = Store::open(path).unwrap();
         let store = db
             .context(ContextAccess::new("owner", Actor::System))
             .unwrap();

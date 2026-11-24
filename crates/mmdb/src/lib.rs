@@ -49,6 +49,7 @@ pub use mmdb_vector as vector;
 mod access;
 mod audit;
 mod builder;
+pub mod context;
 mod convert;
 mod db;
 mod dream;
@@ -57,13 +58,14 @@ pub mod entity;
 mod extraction;
 mod lexical;
 pub mod native_memory;
-pub use native_memory::context;
 mod query_impl;
 mod recall;
 mod records;
 mod runtime;
 mod search;
 mod state;
+pub mod store;
+pub use store::{Store, StoreError, StoreResult, STORE_FORMAT_ID};
 pub use mmdb_kernel::{store_format, EraId, OperationId};
 pub use records::{
     Actor, CheckpointMetadata, CheckpointScope, ContextAccess, ContextError, ContextRef,

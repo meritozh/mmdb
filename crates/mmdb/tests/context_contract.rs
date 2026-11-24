@@ -1,6 +1,6 @@
 use mmdb::context::*;
-use mmdb::native_memory::MemoryDatabase;
 use mmdb::{Actor, OperationId, RecordState, Scope, TemporalFacts};
+use mmdb::{Store, StoreError, STORE_FORMAT_ID};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read};
@@ -110,7 +110,7 @@ fn independent_harnesses_share_types_history_and_relations_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("context");
     let (paper, decision, link, type_pin, raw) = {
-        let db = MemoryDatabase::create_context(&root).unwrap();
+        let db = Store::create(&root).unwrap();
         let research = db.context(access("owner")).unwrap();
         let raw = source(
             &research,
@@ -145,7 +145,7 @@ fn independent_harnesses_share_types_history_and_relations_after_reopen() {
             .pin;
         (paper, decision, link, type_pin, raw)
     };
-    let db = MemoryDatabase::open_context(&root).unwrap();
+    let db = Store::open(&root).unwrap();
     let mut trader_access = access("owner");
     trader_access.actor = Actor::Assistant;
     trader_access.agent = Some("trading".into());
@@ -187,7 +187,7 @@ fn independent_harnesses_share_types_history_and_relations_after_reopen() {
 #[test]
 fn type_versions_are_reused_and_old_instances_keep_their_schema() {
     let dir = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(dir.path().join("context")).unwrap();
+    let db = Store::create(dir.path().join("context")).unwrap();
     let context = db.context(access("owner")).unwrap();
     let raw = source(&context, "raw", "A bounded observation");
     let original = definition("observation");
@@ -246,7 +246,7 @@ fn type_versions_are_reused_and_old_instances_keep_their_schema() {
 #[test]
 fn source_and_property_validation_reject_cross_owner_or_wrong_type() {
     let dir = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(dir.path().join("context")).unwrap();
+    let db = Store::create(dir.path().join("context")).unwrap();
     let alice = db.context(access("alice")).unwrap();
     let bob = db.context(access("bob")).unwrap();
     let raw = source(&alice, "a", "Alice's evidence");
@@ -288,7 +288,7 @@ fn source_and_property_validation_reject_cross_owner_or_wrong_type() {
 #[test]
 fn private_sources_do_not_become_public_through_objects_or_relations() {
     let dir = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(dir.path().join("context")).unwrap();
+    let db = Store::create(dir.path().join("context")).unwrap();
     let private = Scope::Session(ulid::Ulid::new());
     let mut permitted = access("owner");
     permitted.scopes.push(private.clone());
@@ -333,7 +333,7 @@ fn complete_large_history_is_searchable_across_chunks_and_query_pages() {
     let tail_at = bytes.len() - tail.len();
     bytes[tail_at..].copy_from_slice(tail);
     let pin = {
-        let db = MemoryDatabase::create_context(&root).unwrap();
+        let db = Store::create(&root).unwrap();
         db.context(access("owner"))
             .unwrap()
             .append_history(
@@ -344,7 +344,7 @@ fn complete_large_history_is_searchable_across_chunks_and_query_pages() {
             .unwrap()
             .pin
     };
-    let db = MemoryDatabase::open_context(&root).unwrap();
+    let db = Store::open(&root).unwrap();
     let context = db.context(access("owner")).unwrap();
     let mut restored = Vec::new();
     let mut offset = 0;
@@ -388,7 +388,7 @@ fn complete_large_history_is_searchable_across_chunks_and_query_pages() {
 #[test]
 fn append_retries_preserve_identity_and_order_even_after_later_events() {
     let dir = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(dir.path().join("context")).unwrap();
+    let db = Store::create(dir.path().join("context")).unwrap();
     let context = db.context(access("owner")).unwrap();
     let operation = OperationId::new();
     let mut input = history_input("session", "first");
@@ -432,7 +432,7 @@ fn append_retries_preserve_identity_and_order_even_after_later_events() {
 #[test]
 fn concurrent_appends_allocate_one_session_order() {
     let dir = tempfile::tempdir().unwrap();
-    let db = Arc::new(MemoryDatabase::create_context(dir.path().join("context")).unwrap());
+    let db = Arc::new(Store::create(dir.path().join("context")).unwrap());
     let jobs: Vec<_> = (0..8)
         .map(|index| {
             let db = db.clone();
@@ -471,7 +471,7 @@ fn concurrent_appends_allocate_one_session_order() {
 #[test]
 fn tool_results_require_their_call_and_follow_its_purge_state() {
     let dir = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(dir.path().join("context")).unwrap();
+    let db = Store::create(dir.path().join("context")).unwrap();
     let context = db
         .context(ContextAccess::new("owner", Actor::Operator))
         .unwrap();
@@ -513,7 +513,7 @@ fn purged_sources_stay_unavailable_after_reopen_recovery_and_replay() {
     let root = dir.path().join("context");
     let operation = OperationId::new();
     let (raw, note, input) = {
-        let db = MemoryDatabase::create_context(&root).unwrap();
+        let db = Store::create(&root).unwrap();
         let context = db.context(access("owner")).unwrap();
         let raw = source(&context, "raw", "sensitive observation");
         let type_pin = context
@@ -532,7 +532,7 @@ fn purged_sources_stay_unavailable_after_reopen_recovery_and_replay() {
         ));
         (raw, note, input)
     };
-    let db = MemoryDatabase::open_context(&root).unwrap();
+    let db = Store::open(&root).unwrap();
     let context = db.context(access("owner")).unwrap();
     assert_eq!(context.save_object(operation, input).unwrap().pin, note);
     assert!(context.recall(query("sensitive")).unwrap().hits.is_empty());
@@ -552,7 +552,7 @@ fn purged_sources_stay_unavailable_after_reopen_recovery_and_replay() {
 #[test]
 fn correction_replaces_postings_and_retains_explicit_history() {
     let dir = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(dir.path().join("context")).unwrap();
+    let db = Store::create(dir.path().join("context")).unwrap();
     let context = db.context(access("owner")).unwrap();
     let raw = source(&context, "raw", "A correction source");
     let type_pin = context
@@ -600,7 +600,7 @@ fn correction_replaces_postings_and_retains_explicit_history() {
 #[test]
 fn revisions_cannot_introduce_self_dependent_source_chains() {
     let dir = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(dir.path().join("context")).unwrap();
+    let db = Store::create(dir.path().join("context")).unwrap();
     let store = db.context(access("owner")).unwrap();
     let raw = source(&store, "raw", "observation");
     let note = store
@@ -645,7 +645,7 @@ fn revisions_cannot_introduce_self_dependent_source_chains() {
 #[test]
 fn relationship_cycles_are_bounded_and_inactive_endpoints_are_excluded() {
     let dir = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(dir.path().join("context")).unwrap();
+    let db = Store::create(dir.path().join("context")).unwrap();
     let context = db.context(access("owner")).unwrap();
     let raw = source(&context, "raw", "source");
     let type_pin = context
@@ -689,7 +689,7 @@ fn relationship_cycles_are_bounded_and_inactive_endpoints_are_excluded() {
 #[test]
 fn relation_pages_apply_direction_scope_time_and_type_filters_without_stalling() {
     let dir = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(dir.path().join("context")).unwrap();
+    let db = Store::create(dir.path().join("context")).unwrap();
     let private = Scope::Session(ulid::Ulid::new());
     let mut permitted = access("owner");
     permitted.scopes.push(private.clone());
@@ -819,25 +819,25 @@ fn reset_creates_a_new_context_era_without_importing_previous_history() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap().join("context");
     let old = {
-        let db = MemoryDatabase::create_context(&root).unwrap();
+        let db = Store::create(&root).unwrap();
         source(&db.context(access("owner")).unwrap(), "old", "old source")
     };
     let safety = ResetSafety::for_current_process(Vec::new()).unwrap();
     let plan = ResetPlan::build(
         std::slice::from_ref(&root),
-        CONTEXT_STORE_FORMAT_ID,
-        CONTEXT_STORE_FORMAT_ID,
+        STORE_FORMAT_ID,
+        STORE_FORMAT_ID,
         SystemTime::now(),
         Duration::from_secs(60),
         &safety,
     )
     .unwrap();
     let receipt = commit_reset(&plan, plan.digest().as_str(), StoreEraId::new(), &[]).unwrap();
-    let db = MemoryDatabase::open_context(&root).unwrap();
+    let db = Store::open(&root).unwrap();
     let fresh = db.context(access("owner")).unwrap();
     assert_eq!(fresh.history_position("session-a").unwrap(), 0);
     assert!(matches!(fresh.read(&old), Err(ContextError::AccessDenied)));
-    let previous = MemoryDatabase::open_context(receipt.quarantine_path()).unwrap();
+    let previous = Store::open(receipt.quarantine_path()).unwrap();
     assert_eq!(
         previous
             .context(access("owner"))
@@ -852,7 +852,7 @@ fn reset_creates_a_new_context_era_without_importing_previous_history() {
 #[test]
 fn chinese_terms_find_curated_context_without_embeddings() {
     let dir = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(dir.path().join("context")).unwrap();
+    let db = Store::create(dir.path().join("context")).unwrap();
     let context = db.context(access("owner")).unwrap();
     let raw = source(&context, "raw", "项目需要考虑交易日窗口。");
     let type_pin = context
@@ -896,7 +896,7 @@ fn incomplete_uploads_never_advance_history_and_can_be_cleaned() {
     let root = dir.path().join("context");
     let operation = OperationId::new();
     {
-        let db = MemoryDatabase::create_context(&root).unwrap();
+        let db = Store::create(&root).unwrap();
         let context = db.context(access("owner")).unwrap();
         assert!(matches!(
             context.append_history(
@@ -911,7 +911,7 @@ fn incomplete_uploads_never_advance_history_and_can_be_cleaned() {
         assert_eq!(context.history_position("session").unwrap(), 0);
         assert!(context.operation_receipt(operation).unwrap().is_none());
     }
-    let db = MemoryDatabase::open_context(&root).unwrap();
+    let db = Store::open(&root).unwrap();
     let context = db.context(access("owner")).unwrap();
     assert!(context
         .history("session", 0, 10)
@@ -950,7 +950,7 @@ fn history_crash_child() {
             Ok(buffer.len())
         }
     }
-    let db = MemoryDatabase::create_context(root).unwrap();
+    let db = Store::create(root).unwrap();
     db.context(access("owner"))
         .unwrap()
         .append_history(
@@ -972,7 +972,7 @@ fn actual_process_interruption_leaves_no_partial_visible_history() {
         .status()
         .unwrap();
     assert_eq!(status.code(), Some(77));
-    let db = MemoryDatabase::open_context(&root).unwrap();
+    let db = Store::open(&root).unwrap();
     let context = db.context(access("owner")).unwrap();
     assert_eq!(context.history_position("session").unwrap(), 0);
     assert_eq!(context.recover_payloads(10, 10).unwrap().chunks_removed, 1);
@@ -992,28 +992,51 @@ fn actual_process_interruption_leaves_no_partial_visible_history() {
 #[test]
 fn format_and_store_identity_prevent_accidental_adoption() {
     let dir = tempfile::tempdir().unwrap();
-    let legacy = dir.path().join("legacy");
-    {
-        let db = MemoryDatabase::create(&legacy).unwrap();
+    use mmdb::store_format::{StoreEraId, StoreFormatError, StoreManifest};
+    use mmdb_kernel::KernelError;
+    for legacy_format in [
+        "mmdb-context-v1",
+        "mmdb-native-memory-v1",
+        "mmdb-context-dev7",
+        "mmdb-native-memory-dev7",
+    ] {
+        let legacy = dir.path().join(legacy_format);
+        std::fs::create_dir(&legacy).unwrap();
+        StoreManifest::new(legacy_format, StoreEraId::new())
+            .unwrap()
+            .write_new(&legacy)
+            .unwrap();
         assert!(matches!(
-            db.context(access("owner")),
-            Err(ContextError::UnsupportedFormat)
+            Store::open(&legacy),
+            Err(StoreError::Kernel(KernelError::Format(StoreFormatError::FormatMismatch { expected, found, .. })))
+                if expected == STORE_FORMAT_ID && found == legacy_format
         ));
     }
-    assert!(MemoryDatabase::open_context(&legacy).is_err());
-    let first = MemoryDatabase::create_context(dir.path().join("first")).unwrap();
-    let pin = source(&first.context(access("owner")).unwrap(), "raw", "one era");
-    let second = MemoryDatabase::create_context(dir.path().join("second")).unwrap();
-    assert!(matches!(
-        second.context(access("owner")).unwrap().read(&pin),
-        Err(ContextError::AccessDenied)
-    ));
+    let first = Store::create(dir.path().join("first")).unwrap();
+    let context = first.context(access("owner")).unwrap();
+    let pin = source(&context, "raw", "one era");
+    let type_pin = context
+        .define_type(OperationId::new(), definition("note"))
+        .unwrap()
+        .pin;
+    assert_eq!(pin.record.era, first.era(StoreModule::Session));
+    assert_eq!(type_pin.record.era, first.era(StoreModule::Memory));
+    assert_ne!(pin.record.era, type_pin.record.era);
+    assert_eq!(first.memory().era_id(), type_pin.record.era);
+    let second = Store::create(dir.path().join("second")).unwrap();
+    let foreign = second.context(access("owner")).unwrap();
+    for pin in [pin, type_pin] {
+        assert!(matches!(
+            foreign.read(&pin),
+            Err(ContextError::AccessDenied)
+        ));
+    }
 }
 
 #[test]
 fn source_validation_reserves_the_new_root_depth_and_aggregate_budget() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(tmp.path().join("context")).unwrap();
+    let db = Store::create(tmp.path().join("context")).unwrap();
     let store = db.context(access("owner")).unwrap();
     let root = source(&store, "source", "evidence");
     let kind = store
@@ -1049,7 +1072,7 @@ fn source_validation_reserves_the_new_root_depth_and_aggregate_budget() {
 #[test]
 fn action_discovery_and_preparation_share_the_same_target_scope() {
     let d = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(d.path().join("db")).unwrap();
+    let db = Store::create(d.path().join("db")).unwrap();
     let a = Scope::Session(ulid::Ulid::new());
     let b = Scope::Session(ulid::Ulid::new());
     let mut access = access("owner");
@@ -1104,7 +1127,7 @@ fn action_discovery_and_preparation_share_the_same_target_scope() {
 #[test]
 fn action_contract_enforces_authority_versions_conditions_and_one_preparation() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = Arc::new(MemoryDatabase::create_context(tmp.path().join("context")).unwrap());
+    let db = Arc::new(Store::create(tmp.path().join("context")).unwrap());
     let store = db.context(access("owner")).unwrap();
     let evidence = source(&store, "source", "milestone instruction");
     let kind = store
@@ -1266,7 +1289,7 @@ fn action_contract_enforces_authority_versions_conditions_and_one_preparation() 
 #[test]
 fn copied_history_tracks_source_availability_and_session_catalog_pages() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(tmp.path().join("context")).unwrap();
+    let db = Store::create(tmp.path().join("context")).unwrap();
     let store = db.context(access("owner")).unwrap();
     let original = source(&store, "source", "withdrawable-secret");
     let mut copied = history_input("model-session", "model-request");
@@ -1332,7 +1355,7 @@ fn copied_history_tracks_source_availability_and_session_catalog_pages() {
 #[test]
 fn current_validation_rejects_changed_dependencies_without_breaking_historical_reads() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(tmp.path().join("context")).unwrap();
+    let db = Store::create(tmp.path().join("context")).unwrap();
     let store = db.context(access("owner")).unwrap();
     let root = source(&store, "original", "original instruction");
     let kind = store
@@ -1371,7 +1394,7 @@ fn current_validation_rejects_changed_dependencies_without_breaking_historical_r
 fn checkpoint_parent_and_epoch_are_compared_atomically_and_survive_reopen() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("context");
-    let db = MemoryDatabase::create_context(&path).unwrap();
+    let db = Store::create(&path).unwrap();
     let store = db.context(access("owner")).unwrap();
     let anchor = source(&store, "event", "original");
     let input = CheckpointInput {
@@ -1419,7 +1442,7 @@ fn checkpoint_parent_and_epoch_are_compared_atomically_and_survive_reopen() {
         .is_err());
     drop(store);
     drop(db);
-    let reopened = MemoryDatabase::open_context(path).unwrap();
+    let reopened = Store::open(path).unwrap();
     let store = reopened.context(access("owner")).unwrap();
     assert_eq!(
         store.latest_checkpoint("session-a").unwrap().unwrap().pin,
@@ -1436,7 +1459,7 @@ fn checkpoint_parent_and_epoch_are_compared_atomically_and_survive_reopen() {
 fn live_revision_keeps_checkpoint_derived_originals_and_pairs_the_completed_tool() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("context");
-    let db = MemoryDatabase::create_context(&path).unwrap();
+    let db = Store::create(&path).unwrap();
     let store = db.context(access("owner")).unwrap();
     let raw = source(&store, "original", "SQLite source text");
     let kind = store
@@ -1545,7 +1568,7 @@ fn live_revision_keeps_checkpoint_derived_originals_and_pairs_the_completed_tool
     );
     drop(store);
     drop(db);
-    let db = MemoryDatabase::open_context(&path).unwrap();
+    let db = Store::open(&path).unwrap();
     let store = db.context(access("owner")).unwrap();
     for pin in [&checkpoint, &derived, &call, &result] {
         assert!(store.read(pin).is_ok());
@@ -1572,7 +1595,7 @@ fn live_revision_keeps_checkpoint_derived_originals_and_pairs_the_completed_tool
 #[test]
 fn checkpoint_history_redaction_remains_conservative_for_unlisted_summary_input() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(tmp.path().join("context")).unwrap();
+    let db = Store::create(tmp.path().join("context")).unwrap();
     let store = db.context(access("owner")).unwrap();
     let omitted = source(
         &store,
@@ -1632,7 +1655,7 @@ fn session_and_child_run_checkpoints_keep_independent_cas_chains_across_reopen()
     };
 
     let (base, first) = {
-        let db = MemoryDatabase::create_context(&path).unwrap();
+        let db = Store::create(&path).unwrap();
         let store = db.context(access("owner")).unwrap();
         let anchor = source(&store, "anchor", "committed parent history");
         let base = CheckpointInput {
@@ -1673,7 +1696,7 @@ fn session_and_child_run_checkpoints_keep_independent_cas_chains_across_reopen()
 
     // Every handle and the database have dropped before acquiring a new lease.
     let second = {
-        let db = MemoryDatabase::open_context(&path).unwrap();
+        let db = Store::open(&path).unwrap();
         for ((scope, profile), pin) in cases.iter().zip(&first) {
             let store = db.context(profile.clone()).unwrap();
             let run = profile.run.as_deref().unwrap();
@@ -1756,7 +1779,7 @@ fn session_and_child_run_checkpoints_keep_independent_cas_chains_across_reopen()
         second
     };
 
-    let db = MemoryDatabase::open_context(&path).unwrap();
+    let db = Store::open(&path).unwrap();
     for (index, (scope, profile)) in cases.iter().enumerate() {
         let store = db.context(profile.clone()).unwrap();
         let header = latest(&store, *scope, profile.run.as_deref().unwrap()).unwrap();
@@ -1788,7 +1811,7 @@ fn session_and_child_run_checkpoints_keep_independent_cas_chains_across_reopen()
 #[test]
 fn log_copies_stay_readable_after_their_sources_change() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(tmp.path().join("context")).unwrap();
+    let db = Store::create(tmp.path().join("context")).unwrap();
     let store = db.context(access("owner")).unwrap();
     let raw = source(&store, "evidence", "original observation");
     let old_type = store
@@ -1894,7 +1917,7 @@ fn log_copies_stay_readable_after_their_sources_change() {
 #[test]
 fn history_copy_reserves_new_root_depth_before_committing_an_unreadable_record() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(tmp.path().join("context")).unwrap();
+    let db = Store::create(tmp.path().join("context")).unwrap();
     let store = db.context(access("owner")).unwrap();
     let mut chain = vec![source(&store, "root", "original evidence")];
     for depth in 1..=32 {
@@ -1953,7 +1976,7 @@ fn history_copy_reserves_new_root_depth_before_committing_an_unreadable_record()
 #[test]
 fn tool_results_stay_readable_after_their_call_source_is_purged() {
     let temp = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(temp.path().join("context")).unwrap();
+    let db = Store::create(temp.path().join("context")).unwrap();
     let store = db.context(access("owner")).unwrap();
     let raw = source(&store, "source", "old observation");
     let kind = store
@@ -2019,7 +2042,7 @@ fn tool_results_stay_readable_after_their_call_source_is_purged() {
 #[test]
 fn history_copy_shares_the_aggregate_source_budget_including_its_new_root() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(tmp.path().join("context")).unwrap();
+    let db = Store::create(tmp.path().join("context")).unwrap();
     let store = db.context(access("owner")).unwrap();
     let raw = source(&store, "root", "original evidence");
     let mut wide = history_input("budget-session", "wide");
@@ -2064,7 +2087,7 @@ fn history_copy_shares_the_aggregate_source_budget_including_its_new_root() {
 #[test]
 fn a_log_copy_needs_the_scopes_of_its_sources() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(tmp.path().join("context")).unwrap();
+    let db = Store::create(tmp.path().join("context")).unwrap();
     let workspace = Scope::Workspace(ulid::Ulid::new());
     let mut authorized = access("owner");
     authorized.scopes.push(workspace.clone());
@@ -2121,7 +2144,7 @@ fn a_log_copy_needs_the_scopes_of_its_sources() {
 #[test]
 fn purging_a_log_event_hides_what_was_derived_from_it() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(tmp.path().join("context")).unwrap();
+    let db = Store::create(tmp.path().join("context")).unwrap();
     let store = db
         .context(ContextAccess::new("owner", Actor::Operator))
         .unwrap();
@@ -2178,7 +2201,7 @@ fn purging_a_log_event_hides_what_was_derived_from_it() {
 #[test]
 fn a_withdrawn_fragment_hides_its_whole_message() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(tmp.path().join("context")).unwrap();
+    let db = Store::create(tmp.path().join("context")).unwrap();
     let store = db
         .context(ContextAccess::new("owner", Actor::Operator))
         .unwrap();
@@ -2227,4 +2250,47 @@ fn a_withdrawn_fragment_hides_its_whole_message() {
             Err(ContextError::Unavailable(_))
         ));
     }
+}
+
+#[test]
+fn a_legacy_directory_resets_into_an_empty_store() {
+    use mmdb::store_format::{commit_reset, ResetPlan, ResetSafety, StoreEraId, StoreManifest};
+    use std::time::{Duration, SystemTime};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap().join("legacy");
+    std::fs::create_dir(&root).unwrap();
+    let legacy = "mmdb-context-v1";
+    StoreManifest::new(legacy, StoreEraId::new())
+        .unwrap()
+        .write_new(&root)
+        .unwrap();
+    std::fs::write(root.join("old-data"), b"previous contents").unwrap();
+    let safety = ResetSafety::for_current_process(Vec::new()).unwrap();
+    let plan = ResetPlan::build(
+        std::slice::from_ref(&root),
+        legacy,
+        STORE_FORMAT_ID,
+        SystemTime::now(),
+        Duration::from_secs(60),
+        &safety,
+    )
+    .unwrap();
+    let receipt = commit_reset(&plan, plan.digest().as_str(), StoreEraId::new(), &[]).unwrap();
+    let store = Store::open(&root).unwrap();
+    let context = store.context(access("owner")).unwrap();
+    assert!(context
+        .history_sessions(10, None)
+        .unwrap()
+        .sessions
+        .is_empty());
+    assert!(context
+        .query_current_valid(None, None, 10)
+        .unwrap()
+        .is_empty());
+    assert_eq!(context.availability_epoch().unwrap(), 0);
+    assert!(!root.join("old-data").exists());
+    assert_eq!(
+        std::fs::read(receipt.quarantine_path().join("old-data")).unwrap(),
+        b"previous contents"
+    );
 }

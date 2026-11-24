@@ -21,13 +21,14 @@ pub(crate) trait Gate: Send + Sync {
     ) -> ContextResult<bool>;
 }
 
-const HEADERS: &str = "context_headers_v1";
-const HEADS: &str = "context_heads_v1";
-const PAYLOADS: &str = "context_payloads_v1";
-const PENDING: &str = "context_pending_uploads_v1";
-const LIFECYCLE: &str = "context_lifecycle_v1";
-const OPERATIONS: &str = "context_operations_v1";
-pub(crate) const PARTITION_NAMES: &[&str] =
+const HEADERS: &str = "records_headers_v1";
+const HEADS: &str = "records_heads_v1";
+const PAYLOADS: &str = "records_payloads_v1";
+const PENDING: &str = "records_pending_v1";
+const LIFECYCLE: &str = "records_lifecycle_v1";
+const OPERATIONS: &str = "records_operations_v1";
+pub(crate) const MEMORY_PARTITIONS: &[&str] = &[HEADERS, HEADS, PAYLOADS, PENDING];
+pub(crate) const SESSION_PARTITIONS: &[&str] =
     &[HEADERS, HEADS, PAYLOADS, PENDING, LIFECYCLE, OPERATIONS];
 
 pub(crate) struct RecordTable {
@@ -52,7 +53,8 @@ impl RecordTable {
 
 pub(crate) struct Records {
     pub(super) kernel: Kernel,
-    pub(super) table: RecordTable,
+    session: RecordTable,
+    memory: RecordTable,
     pub(super) lifecycle: Partition,
     operations: Partition,
     gate: Box<dyn Gate>,
@@ -63,14 +65,16 @@ pub(crate) struct Records {
 impl Records {
     pub(crate) fn open(
         kernel: Kernel,
-        era: &EraPartitions,
+        session: &EraPartitions,
+        memory: &EraPartitions,
         gate: Box<dyn Gate>,
     ) -> KernelResult<Self> {
         Ok(Self {
             kernel,
-            table: RecordTable::open(era)?,
-            lifecycle: era.partition(LIFECYCLE)?,
-            operations: era.partition(OPERATIONS)?,
+            session: RecordTable::open(session)?,
+            memory: RecordTable::open(memory)?,
+            lifecycle: session.partition(LIFECYCLE)?,
+            operations: session.partition(OPERATIONS)?,
             gate,
             #[cfg(test)]
             fail_commit_ack: Default::default(),
@@ -104,8 +108,15 @@ impl Scoped<'_> {
     pub(crate) fn batch(&self) -> Batch {
         self.records.kernel.batch()
     }
-    pub(crate) fn era(&self, _module: StoreModule) -> EraId {
-        self.records.table.era
+    pub(super) fn table(&self, module: StoreModule) -> &RecordTable {
+        match module {
+            StoreModule::Session => &self.records.session,
+            StoreModule::Memory => &self.records.memory,
+        }
+    }
+
+    pub(crate) fn era(&self, module: StoreModule) -> EraId {
+        self.table(module).era
     }
 
     pub(crate) fn scan_heads(
@@ -130,8 +141,7 @@ impl Scoped<'_> {
         };
         let mut heads = Vec::new();
         for entry in self
-            .records
-            .table
+            .table(kind.module())
             .heads
             .range((start, Unbounded))
             .take(4096)
@@ -170,8 +180,8 @@ impl Scoped<'_> {
         Ok(HeadPage { heads, next })
     }
     #[cfg(test)]
-    pub(crate) fn test_payloads(&self) -> &Partition {
-        &self.records.table.payloads
+    pub(crate) fn test_payloads(&self, kind: RecordKind) -> &Partition {
+        &self.table(kind.module()).payloads
     }
     #[cfg(test)]
     pub(crate) fn test_lifecycle(&self) -> &Partition {
@@ -257,8 +267,7 @@ impl Scoped<'_> {
     pub(crate) fn head_locked(&self, record: &ContextRef) -> ContextResult<RecordHeader> {
         self.check_ref(record)?;
         let revision = self
-            .records
-            .table
+            .table(record.kind.module())
             .heads
             .get(record_key(record))?
             .ok_or_else(|| ContextError::NotFound(record.clone()))?;
@@ -280,8 +289,7 @@ impl Scoped<'_> {
             ));
         }
         let bytes = self
-            .records
-            .table
+            .table(pin.record.kind.module())
             .headers
             .get(revision_key(pin))?
             .ok_or_else(|| ContextError::NotFound(pin.record.clone()))?;
@@ -558,13 +566,10 @@ impl Scoped<'_> {
         batch: &mut mmdb_kernel::Batch,
         header: &RecordHeader,
     ) -> ContextResult<()> {
+        let table = self.table(header.pin.record.kind.module());
+        batch.insert(&table.headers, revision_key(&header.pin), encode(header)?);
         batch.insert(
-            &self.records.table.headers,
-            revision_key(&header.pin),
-            encode(header)?,
-        );
-        batch.insert(
-            &self.records.table.heads,
+            &table.heads,
             record_key(&header.pin.record),
             header.pin.revision.to_be_bytes(),
         );

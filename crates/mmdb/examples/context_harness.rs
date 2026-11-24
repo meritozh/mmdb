@@ -1,6 +1,6 @@
 //! A deterministic pair of harnesses sharing a context store across reopen.
 use mmdb::context::*;
-use mmdb::native_memory::MemoryDatabase;
+use mmdb::Store;
 use mmdb::{Actor, OperationId, Scope, TemporalFacts};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -9,7 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let temporary = tempfile::tempdir()?;
     let path = temporary.path().join("context");
     let (saved, relation) = {
-        let db = MemoryDatabase::create_context(&path)?;
+        let db = Store::create(&path)?;
         let mut access = ContextAccess::new("owner", Actor::System);
         access.agent = Some("research".into());
         let context = db.context(access)?;
@@ -97,7 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         (saved, relation)
     };
-    let db = MemoryDatabase::open_context(&path)?;
+    let db = Store::open(&path)?;
     let mut access = ContextAccess::new("owner", Actor::Assistant);
     access.agent = Some("trading".into());
     access.session = Some("trading-session".into());

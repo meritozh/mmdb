@@ -125,7 +125,7 @@ impl Scoped<'_> {
         self.put_header(batch, &header)?;
         if state == RecordState::Purged {
             batch.insert(
-                &self.records.table.pending,
+                &self.table(expected.record.kind.module()).pending,
                 record_key(&header.pin.record),
                 encode(&StagedUpload {
                     pin: header.pin.clone(),

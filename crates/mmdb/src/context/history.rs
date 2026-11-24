@@ -672,7 +672,10 @@ impl ContextStore<'_> {
         max_chunks: usize,
         max_uploads: usize,
     ) -> ContextResult<RecoveryReport> {
-        self.scoped
-            .recover_payloads(StoreModule::Session, max_chunks, max_uploads)
+        self.scoped.recover_payloads(
+            &[StoreModule::Session, StoreModule::Memory],
+            max_chunks,
+            max_uploads,
+        )
     }
 }

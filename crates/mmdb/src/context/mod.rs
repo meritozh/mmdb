@@ -1,8 +1,6 @@
-//! Harness-independent context on the native memory transaction kernel.
+//! Harness-independent context backed by the store's session and memory modules.
 //!
-//! Open a fresh context format with [`MemoryDatabase::create_context`], then
-//! obtain an owner-scoped handle with [`MemoryDatabase::context`]. The handle
-//! shares the native lease, write lock, keyspace and synchronous batch commit.
+//! Use [`crate::Store::context`] to obtain an owner-scoped handle.
 
 mod actions;
 mod catalog;
@@ -18,7 +16,6 @@ mod tests;
 
 pub use types::*;
 
-use super::MemoryDatabase;
 use crate::records::Scoped;
 pub use crate::records::{
     CheckpointMetadata, CheckpointScope, ContextAccess, ContextError, ContextRef, ContextResult,
@@ -29,20 +26,19 @@ pub use crate::records::{
 };
 use mmdb_kernel::{EraPartitions, KernelResult, Partition, WriteGuard};
 
-pub use crate::records::CONTEXT_STORE_FORMAT_ID;
-// The kernel schema and the handles must describe the same partitions.
+// Each module's partition declaration supplies both its schema and its handles.
 macro_rules! context_partitions {
-    ($($field:ident => $name:literal),+ $(,)?) => {
-        pub(super) const PARTITION_NAMES: &[&str] = &[$($name),+];
+    ($( $era:ident => $schema:ident { $($field:ident => $name:literal),+ $(,)? } )+) => {
+        $(pub(crate) const $schema: &[&str] = &[$($name),+];)+
 
         pub(crate) struct ContextPartitions {
-            $(pub(crate) $field: Partition,)+
+            $($(pub(crate) $field: Partition,)+)+
         }
 
         impl ContextPartitions {
-            pub(super) fn open(era: &EraPartitions) -> KernelResult<Self> {
+            pub(crate) fn open($($era: &EraPartitions),+) -> KernelResult<Self> {
                 Ok(Self {
-                    $($field: era.partition($name)?,)+
+                    $($($field: $era.partition($name)?,)+)+
                 })
             }
         }
@@ -50,21 +46,25 @@ macro_rules! context_partitions {
 }
 
 context_partitions! {
-    names => "context_type_names_v1",
-    action_names => "context_action_names_v1",
-    history_order => "context_history_order_v1",
-    history_heads => "context_history_heads_v1",
-    events => "context_history_events_v1",
-    calls => "context_tool_calls_v1",
-    results => "context_tool_results_v1",
-    postings => "context_postings_v1",
-    record_terms => "context_record_terms_v1",
-    adjacency => "context_adjacency_v1",
-    messages => "context_messages_v1",
-    checkpoints => "context_checkpoints_v1",
-    entity_identity => "context_entity_identity_v1",
-    extraction_receipts => "context_extraction_receipts_v1",
-    extraction_incomplete => "context_extraction_incomplete_v1",
+    session => SESSION_PARTITIONS {
+        history_order => "session_order_v1",
+        history_heads => "session_heads_v1",
+        events => "session_events_v1",
+        calls => "session_tool_calls_v1",
+        results => "session_tool_results_v1",
+        messages => "session_messages_v1",
+        checkpoints => "session_checkpoints_v1",
+    }
+    memory => MEMORY_PARTITIONS {
+        names => "context_type_names_v1",
+        action_names => "context_action_names_v1",
+        postings => "context_postings_v1",
+        record_terms => "context_record_terms_v1",
+        adjacency => "context_adjacency_v1",
+        entity_identity => "context_entity_identity_v1",
+        extraction_receipts => "context_extraction_receipts_v1",
+        extraction_incomplete => "context_extraction_incomplete_v1",
+    }
 }
 
 pub struct ContextStore<'a> {
@@ -87,19 +87,5 @@ pub struct CurrentSourcesGuard<'a> {
 impl CurrentSourcesGuard<'_> {
     pub fn availability_epoch(&self) -> u64 {
         self.availability_epoch
-    }
-}
-
-impl MemoryDatabase {
-    pub fn context(&self, access: ContextAccess) -> ContextResult<ContextStore<'_>> {
-        access.validate()?;
-        let (parts, records) = self
-            .context
-            .as_ref()
-            .ok_or(ContextError::UnsupportedFormat)?;
-        Ok(ContextStore {
-            scoped: records.scoped(access),
-            parts,
-        })
     }
 }

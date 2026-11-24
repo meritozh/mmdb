@@ -1,7 +1,7 @@
 //! Independent, read-only acceptance of a real harness-created context store.
 //! Usage: cargo run -p mmdb --example inspect_context_quality -- STORE REPORT
 use mmdb::context::*;
-use mmdb::native_memory::MemoryDatabase;
+use mmdb::Store;
 use mmdb::Actor;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.next().is_some() {
         return Err("expected STORE REPORT".into());
     }
-    let database = MemoryDatabase::open_context(&path)?;
+    let database = Store::open(&path)?;
     let mut access = ContextAccess::new("local-user", Actor::System);
     access.agent = Some("independent-mmdb-quality-reader".into());
     access.session = Some("independent-quality-session".into());

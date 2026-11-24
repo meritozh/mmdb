@@ -1,4 +1,5 @@
 use super::*;
+use crate::Store;
 use crate::{Actor, OperationId, RecordState, Scope, TemporalFacts};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -10,7 +11,7 @@ fn current_sources_guard_keeps_retraction_after_the_protected_commit() {
     use std::time::Duration;
 
     let dir = tempfile::tempdir().unwrap();
-    let db = Arc::new(MemoryDatabase::create_context(dir.path().join("context")).unwrap());
+    let db = Arc::new(Store::create(dir.path().join("context")).unwrap());
     let access = ContextAccess::new("owner", Actor::User);
     let context = db.context(access.clone()).unwrap();
     let pin = context
@@ -84,7 +85,7 @@ fn current_sources_guard_keeps_retraction_after_the_protected_commit() {
 #[test]
 fn current_sources_guard_rejects_stale_and_out_of_scope_sources_without_writing() {
     let dir = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(dir.path().join("context")).unwrap();
+    let db = Store::create(dir.path().join("context")).unwrap();
     let context = db
         .context(ContextAccess::new("owner", Actor::User))
         .unwrap();
@@ -139,7 +140,7 @@ fn committed_history_survives_a_lost_acknowledgement_without_duplication() {
         expected_sequence: Some(0),
     };
     let expected = {
-        let db = MemoryDatabase::create_context(&root).unwrap();
+        let db = Store::create(&root).unwrap();
         let store = db
             .context(ContextAccess::new("owner", Actor::Assistant))
             .unwrap();
@@ -150,7 +151,7 @@ fn committed_history_survives_a_lost_acknowledgement_without_duplication() {
         assert!(matches!(error, ContextError::CommitUnknown(id) if id == operation));
         store.operation_receipt(operation).unwrap().unwrap()
     };
-    let db = MemoryDatabase::open_context(&root).unwrap();
+    let db = Store::open(&root).unwrap();
     let store = db
         .context(ContextAccess::new("owner", Actor::Assistant))
         .unwrap();
@@ -187,7 +188,7 @@ fn committed_history_survives_a_lost_acknowledgement_without_duplication() {
 #[test]
 fn checksum_failure_is_reported_instead_of_returning_modified_source_bytes() {
     let dir = tempfile::tempdir().unwrap();
-    let db = MemoryDatabase::create_context(dir.path().join("context")).unwrap();
+    let db = Store::create(dir.path().join("context")).unwrap();
     let store = db
         .context(ContextAccess::new("owner", Actor::System))
         .unwrap();
@@ -210,14 +211,18 @@ fn checksum_failure_is_reported_instead_of_returning_modified_source_bytes() {
     let key = storage::payload_key(&receipt.pin, 0);
     let mut bytes = store
         .scoped
-        .test_payloads()
+        .test_payloads(receipt.pin.record.kind)
         .get(&key)
         .unwrap()
         .unwrap()
         .to_vec();
     bytes[32] ^= 1;
     let mut batch = store.scoped.batch();
-    batch.insert(store.scoped.test_payloads(), key, bytes);
+    batch.insert(
+        store.scoped.test_payloads(receipt.pin.record.kind),
+        key,
+        bytes,
+    );
     batch.commit().unwrap();
     assert!(matches!(
         store.read_payload(&receipt.pin, 0, 32),
@@ -230,7 +235,7 @@ fn assistant_cannot_retract_instruction_records_but_may_retract_others() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("context");
 
-    let owner = MemoryDatabase::create_context(&root).unwrap();
+    let owner = Store::create(&root).unwrap();
     let user = owner
         .context(ContextAccess::new("owner", Actor::User))
         .unwrap();
@@ -367,7 +372,7 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 fn fresh_store() -> (tempfile::TempDir, ContextStore<'static>) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("context");
-    let db = Box::leak(Box::new(MemoryDatabase::create_context(&root).unwrap()));
+    let db = Box::leak(Box::new(Store::create(&root).unwrap()));
     let store = db
         .context(ContextAccess::new("owner", Actor::User))
         .unwrap();
@@ -981,4 +986,50 @@ fn extraction_source_pins_preserved() {
     .unwrap();
     let record = store.read(&receipt.created_objects[0]).unwrap();
     assert_eq!(record.header.sources, vec![source]);
+}
+
+#[test]
+fn a_memory_purge_commits_its_head_epoch_and_receipt_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let access = ContextAccess::new("owner", Actor::User);
+    let operation = OperationId::new();
+    let (object, epoch) = {
+        let store = Store::create(&path).unwrap();
+        let context = store.context(access.clone()).unwrap();
+        let source = history_source(&context, "session", "input");
+        let object = context
+            .save_object(
+                OperationId::new(),
+                ObjectInput {
+                    type_pin: object_type(&context, "note"),
+                    scope: Scope::Personal,
+                    properties: BTreeMap::from([("text".into(), json!("private"))]),
+                    sources: vec![source],
+                    information: InformationKind::Inference,
+                    temporal: TemporalFacts::observed_at(10),
+                },
+            )
+            .unwrap()
+            .pin;
+        let epoch = context.availability_epoch().unwrap();
+        assert!(context.operation_receipt(operation).unwrap().is_none());
+        context.scoped.lose_next_commit_ack();
+        assert!(
+            matches!(context.purge(operation, object.clone()), Err(ContextError::CommitUnknown(id)) if id == operation)
+        );
+        (object, epoch)
+    };
+
+    let store = Store::open(&path).unwrap();
+    let context = store.context(access).unwrap();
+    let head = context.head(&object.record).unwrap();
+    assert_eq!(head.state, RecordState::Purged);
+    assert_eq!(head.pin.revision, object.revision + 1);
+    let receipt = context.operation_receipt(operation).unwrap().unwrap();
+    assert_eq!(receipt.pin, head.pin);
+    assert_eq!(context.availability_epoch().unwrap(), epoch + 1);
+    assert_eq!(context.purge(operation, object).unwrap(), receipt);
+    assert_eq!(context.availability_epoch().unwrap(), epoch + 1);
+    assert_eq!(context.recover_payloads(1, 1).unwrap().uploads_removed, 1);
 }

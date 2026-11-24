@@ -6,8 +6,8 @@ use std::io::{ErrorKind, Read};
 
 impl StreamedPayload {
     pub(crate) fn publish(&self, batch: &mut Batch) {
-        if let Some(pin) = &self.upload {
-            batch.remove(&self.pending, record_key(&pin.record));
+        if let Some((pin, pending)) = &self.upload {
+            batch.remove(pending, record_key(&pin.record));
         }
     }
 }
@@ -43,7 +43,11 @@ impl Scoped<'_> {
         let mut value = Vec::with_capacity(32 + bytes.len());
         value.extend_from_slice(&self.content_digest(bytes));
         value.extend_from_slice(bytes);
-        batch.insert(&self.records.table.payloads, payload_key(pin, chunk), value);
+        batch.insert(
+            &self.table(pin.record.kind.module()).payloads,
+            payload_key(pin, chunk),
+            value,
+        );
     }
 
     pub(crate) fn payload_slice_locked(
@@ -70,8 +74,7 @@ impl Scoped<'_> {
         while at < end {
             let chunk_index = at / PAYLOAD_CHUNK_BYTES as u64;
             let value = self
-                .records
-                .table
+                .table(payload_pin.record.kind.module())
                 .payloads
                 .get(payload_key(&payload_pin, chunk_index))?
                 .ok_or_else(|| ContextError::Corrupt("missing committed payload chunk".into()))?;
@@ -120,7 +123,7 @@ impl Scoped<'_> {
         if let Some((pin, operation)) = upload {
             let mut batch = self.records.kernel.batch();
             batch.insert(
-                &self.records.table.pending,
+                &self.table(pin.record.kind.module()).pending,
                 record_key(&pin.record),
                 encode(&StagedUpload {
                     pin: pin.clone(),
@@ -165,14 +168,18 @@ impl Scoped<'_> {
                 bytes: length,
                 digest: payload_digest,
             },
-            upload: upload.map(|(pin, _)| pin.clone()),
-            pending: self.records.table.pending.clone(),
+            upload: upload.map(|(pin, _)| {
+                (
+                    pin.clone(),
+                    self.table(pin.record.kind.module()).pending.clone(),
+                )
+            }),
         })
     }
 
     pub(crate) fn recover_payloads(
         &self,
-        _module: StoreModule,
+        modules: &[StoreModule],
         max_chunks: usize,
         max_uploads: usize,
     ) -> ContextResult<RecoveryReport> {
@@ -185,18 +192,26 @@ impl Scoped<'_> {
             uploads_removed: 0,
             more: false,
         };
-        for entry in self
-            .records
-            .table
-            .pending
-            .prefix(owner_key(&self.access().owner))
-        {
+        let owner = owner_key(&self.access().owner);
+        let pending = modules.iter().flat_map(|&module| {
+            let table = self.table(module);
+            table
+                .pending
+                .prefix(&owner)
+                .map(move |entry| (module, table, entry))
+        });
+        for (module, table, entry) in pending {
             let (key, bytes) = entry?;
             if report.chunks_removed == max_chunks || report.uploads_removed == max_uploads {
                 report.more = true;
                 break;
             }
             let staged: StagedUpload = decode(&bytes)?;
+            if staged.pin.record.kind.module() != module {
+                return Err(ContextError::Corrupt(
+                    "pending upload belongs to another module".into(),
+                ));
+            }
             self.check_ref(&staged.pin.record)?;
             let head = self.head_locked(&staged.pin.record);
             match (staged.purge, head) {
@@ -217,17 +232,17 @@ impl Scoped<'_> {
             let remaining = max_chunks - report.chunks_removed;
             let mut batch = self.records.kernel.batch();
             let mut complete = true;
-            for (seen, chunk) in self.records.table.payloads.prefix(prefix).enumerate() {
+            for (seen, chunk) in table.payloads.prefix(prefix).enumerate() {
                 if seen == remaining {
                     complete = false;
                     break;
                 }
                 let (chunk_key, _) = chunk?;
-                batch.remove(&self.records.table.payloads, chunk_key);
+                batch.remove(&table.payloads, chunk_key);
                 report.chunks_removed += 1;
             }
             if complete {
-                batch.remove(&self.records.table.pending, key);
+                batch.remove(&table.pending, key);
                 report.uploads_removed += 1;
             }
             batch.commit()?;

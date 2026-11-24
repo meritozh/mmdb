@@ -3,8 +3,6 @@ use crate::OperationId;
 use mmdb_kernel::KernelError;
 use std::fmt;
 
-pub const CONTEXT_STORE_FORMAT_ID: &str = "mmdb-context-dev7";
-
 #[derive(Debug)]
 pub enum ContextError {
     Storage(KernelError),
@@ -33,7 +31,7 @@ impl fmt::Display for ContextError {
             Self::Serialization(e) => write!(f, "context serialization: {e}"),
             Self::InvalidInput(e) => write!(f, "invalid context input: {e}"),
             Self::Corrupt(e) => write!(f, "corrupt context: {e}"),
-            Self::UnsupportedFormat => write!(f, "context operations require a fresh {CONTEXT_STORE_FORMAT_ID} store; reset rather than migrate legacy data"),
+            Self::UnsupportedFormat => write!(f, "unsupported context store format"),
             Self::AccessDenied => write!(f, "context reference is outside the allowed owner or scope"),
             Self::NotFound(r) => write!(f, "context record not found: {}", r.id),
             Self::Unavailable(r) => write!(f, "context record or its source is unavailable: {}", r.id),

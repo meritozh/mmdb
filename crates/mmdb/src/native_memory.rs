@@ -6,28 +6,19 @@
 
 use crate::records::InvalidTemporalFacts;
 use crate::{Actor, EraId, OperationId, RecordState, Scope, TemporalFacts, MAX_ACCESS_SCOPES};
-use mmdb_kernel::store_format::{StoreFormatDescriptor, StoreFormatError};
-use mmdb_kernel::{Batch, EraPartitions, Kernel, KernelError, ModuleId, ModuleSpec, Partition};
+use mmdb_kernel::store_format::StoreFormatError;
+use mmdb_kernel::{Batch, EraPartitions, Kernel, KernelError, Partition};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use ulid::Ulid;
-
-#[path = "context/mod.rs"]
-pub mod context;
-
-/// Exact outer format recognized by both native opening and reset planning.
-pub const MEMORY_STORE_FORMAT_ID: &str = "mmdb-native-memory-dev7";
-
-const MEMORY: ModuleId = ModuleId("memory");
 
 macro_rules! native_partition_names {
     ($($constant:ident => $name:literal),+ $(,)?) => {
         $(const $constant: &str = $name;)+
-        const NATIVE_PARTITIONS: &[&str] = &[$($constant),+];
+        pub(crate) const NATIVE_PARTITIONS: &[&str] = &[$($constant),+];
     };
 }
 
@@ -87,27 +78,6 @@ native_partition_names! {
     PART_AUDIT => "native_audit_events_v1",
     PART_OPERATIONS => "native_operations_v1",
 }
-
-const NATIVE_MODULES: &[ModuleSpec] = &[ModuleSpec {
-    id: MEMORY,
-    partitions: NATIVE_PARTITIONS,
-}];
-const CONTEXT_PARTITIONS: [&str;
-    NATIVE_PARTITIONS.len() + context::PARTITION_NAMES.len() + crate::records::PARTITION_NAMES.len()] = {
-    let mut partitions = [""; NATIVE_PARTITIONS.len()
-        + context::PARTITION_NAMES.len()
-        + crate::records::PARTITION_NAMES.len()];
-    let (native, context) = partitions.split_at_mut(NATIVE_PARTITIONS.len());
-    native.copy_from_slice(NATIVE_PARTITIONS);
-    let (context, records) = context.split_at_mut(context::PARTITION_NAMES.len());
-    context.copy_from_slice(context::PARTITION_NAMES);
-    records.copy_from_slice(crate::records::PARTITION_NAMES);
-    partitions
-};
-const CONTEXT_MODULES: &[ModuleSpec] = &[ModuleSpec {
-    id: MEMORY,
-    partitions: &CONTEXT_PARTITIONS,
-}];
 
 const MAX_RECALL_LIMIT: usize = 100;
 const MAX_RECALL_TERMS: usize = 64;
@@ -1596,7 +1566,6 @@ struct ArtifactEvidenceInsert<'a> {
 
 pub struct MemoryDatabase {
     pub(crate) kernel: Kernel,
-    context: Option<(context::ContextPartitions, crate::records::Records)>,
     era_id: EraId,
     evidence: Partition,
     evidence_availability: Partition,
@@ -1655,71 +1624,8 @@ pub struct MemoryDatabase {
 }
 
 impl MemoryDatabase {
-    /// Explicitly initialize a new store at an absent path, write the sole
-    /// outer marker, and then open it through the same validation path as every
-    /// later process.
-    pub fn create(root: impl AsRef<Path>) -> MemoryResult<Self> {
-        let format = StoreFormatDescriptor::new(MEMORY_STORE_FORMAT_ID)?;
-        let kernel = Self::create_kernel(root.as_ref(), &format, NATIVE_MODULES)?;
-        let era = kernel.module(MEMORY);
-        Self::on_era(kernel, &era)
-    }
-
-    /// Create a fresh context store. Existing roots are never adopted or reset.
-    pub fn create_context(root: impl AsRef<Path>) -> MemoryResult<Self> {
-        let format = StoreFormatDescriptor::new(context::CONTEXT_STORE_FORMAT_ID)?;
-        Self::with_context(Self::create_kernel(
-            root.as_ref(),
-            &format,
-            CONTEXT_MODULES,
-        )?)
-    }
-
-    fn create_kernel(
-        root: &Path,
-        format: &StoreFormatDescriptor,
-        modules: &'static [ModuleSpec],
-    ) -> MemoryResult<Kernel> {
-        match Kernel::create(root, format, modules) {
-            Err(KernelError::Format(StoreFormatError::Io { source, .. }))
-                if source.kind() == io::ErrorKind::AlreadyExists =>
-            {
-                Err(MemoryError::StoreAlreadyExists(root.to_owned()))
-            }
-            result => Ok(result?),
-        }
-    }
-
-    /// Open only an existing root with the exact native store format.
-    pub fn open(root: impl AsRef<Path>) -> MemoryResult<Self> {
-        let format = StoreFormatDescriptor::new(MEMORY_STORE_FORMAT_ID)?;
-        let kernel = Kernel::open(root.as_ref(), &format, NATIVE_MODULES)?;
-        let era = kernel.module(MEMORY);
-        Self::on_era(kernel, &era)
-    }
-
-    /// Open the context format without converting or modifying an older format.
-    pub fn open_context(root: impl AsRef<Path>) -> MemoryResult<Self> {
-        let format = StoreFormatDescriptor::new(context::CONTEXT_STORE_FORMAT_ID)?;
-        Self::with_context(Kernel::open(root.as_ref(), &format, CONTEXT_MODULES)?)
-    }
-
-    fn with_context(kernel: Kernel) -> MemoryResult<Self> {
-        let era = kernel.module(MEMORY);
-        let mut database = Self::on_era(kernel, &era)?;
-        let parts = context::ContextPartitions::open(&era)?;
-        let records = crate::records::Records::open(
-            database.kernel.clone(),
-            &era,
-            Box::new(parts.log_gate()),
-        )?;
-        database.context = Some((parts, records));
-        Ok(database)
-    }
-
     pub(crate) fn on_era(kernel: Kernel, era: &EraPartitions) -> MemoryResult<Self> {
         Ok(Self {
-            context: None,
             evidence: era.partition(PART_EVIDENCE)?,
             evidence_availability: era.partition(PART_EVIDENCE_AVAILABILITY)?,
             evidence_heads: era.partition(PART_EVIDENCE_HEADS)?,
@@ -8469,6 +8375,7 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Store, StoreError, STORE_FORMAT_ID};
     use mmdb_kernel::store_format::{
         ResetPlan, ResetSafety, StoreEraId, StoreManifest as OuterStoreManifest,
         STORE_MANIFEST_FILE,
@@ -8476,46 +8383,46 @@ mod tests {
     use std::fs;
     use std::time::Duration;
 
-    fn create_test_database() -> (tempfile::TempDir, PathBuf, MemoryDatabase) {
+    fn create_test_database() -> (tempfile::TempDir, PathBuf, Store) {
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("memory");
-        let database = MemoryDatabase::create(&root).unwrap();
+        let database = Store::create(&root).unwrap();
         (parent, root, database)
     }
 
     #[test]
     fn fresh_store_gets_a_stable_era_and_foreign_roots_are_refused() {
-        assert_eq!(MEMORY_STORE_FORMAT_ID, "mmdb-native-memory-dev7");
+        assert_eq!(STORE_FORMAT_ID, "mmdb-store-dev9");
         let fresh = tempfile::tempdir().unwrap();
         let fresh_root = fresh.path().join("memory");
         let first_era = {
-            let database = MemoryDatabase::create(&fresh_root).unwrap();
-            database.era_id()
+            let database = Store::create(&fresh_root).unwrap();
+            database.memory().era_id()
         };
-        let reopened = MemoryDatabase::open(&fresh_root).unwrap();
-        assert_eq!(reopened.era_id(), first_era);
+        let reopened = Store::open(&fresh_root).unwrap();
+        assert_eq!(reopened.memory().era_id(), first_era);
         assert!(fresh_root.join(STORE_MANIFEST_FILE).is_file());
         assert!(!fresh_root.join("mmdb-native-manifest.json").exists());
 
         let existing_empty = tempfile::tempdir().unwrap();
         assert!(matches!(
-            MemoryDatabase::open(existing_empty.path()),
-            Err(MemoryError::StoreFormat(
+            Store::open(existing_empty.path()),
+            Err(StoreError::Kernel(KernelError::Format(
                 StoreFormatError::MissingManagedMarker(_)
-            ))
+            )))
         ));
         assert!(matches!(
-            MemoryDatabase::create(existing_empty.path()),
-            Err(MemoryError::StoreAlreadyExists(path)) if path == existing_empty.path()
+            Store::create(existing_empty.path()),
+            Err(StoreError::Kernel(KernelError::Format(StoreFormatError::Io { source, .. }))) if source.kind() == std::io::ErrorKind::AlreadyExists
         ));
 
         let foreign = tempfile::tempdir().unwrap();
         fs::write(foreign.path().join("legacy.data"), b"legacy").unwrap();
         assert!(matches!(
-            MemoryDatabase::open(foreign.path()),
-            Err(MemoryError::StoreFormat(
+            Store::open(foreign.path()),
+            Err(StoreError::Kernel(KernelError::Format(
                 StoreFormatError::MissingManagedMarker(_)
-            ))
+            )))
         ));
     }
 
@@ -8523,41 +8430,42 @@ mod tests {
     fn memory_database_holds_an_exclusive_root_lease_for_its_lifetime() {
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("memory");
-        let database = MemoryDatabase::create(&root).unwrap();
+        let database_store = Store::create(&root).unwrap();
 
-        let error = match MemoryDatabase::open(&root) {
+        let error = match Store::open(&root) {
             Ok(_) => panic!("a second database handle must not open the same root"),
             Err(error) => error,
         };
         assert!(matches!(
             error,
-            MemoryError::StoreFormat(StoreFormatError::StoreBusy(path))
+            StoreError::Kernel(KernelError::Format(StoreFormatError::StoreBusy(path)))
                 if path == std::fs::canonicalize(&root).unwrap()
         ));
 
-        drop(database);
-        MemoryDatabase::open(&root).expect("dropping the owner releases the root lease");
+        drop(database_store);
+        Store::open(&root).expect("dropping the owner releases the root lease");
     }
 
     #[test]
     fn reset_plan_recognizes_the_memory_database_outer_manifest() {
-        let (_parent, root, database) = create_test_database();
+        let (_parent, root, database_store) = create_test_database();
+        let database = database_store.memory();
         let era = database.kernel.store_era().clone();
-        drop(database);
+        drop(database_store);
         let safety = ResetSafety::new(None, Vec::new()).unwrap();
         let canonical_root = fs::canonicalize(&root).unwrap();
         let plan = ResetPlan::build(
             std::slice::from_ref(&canonical_root),
-            MEMORY_STORE_FORMAT_ID,
-            MEMORY_STORE_FORMAT_ID,
+            STORE_FORMAT_ID,
+            STORE_FORMAT_ID,
             UNIX_EPOCH + Duration::from_secs(1_000),
             Duration::from_secs(600),
             &safety,
         )
         .unwrap();
 
-        assert_eq!(plan.source_format_id(), MEMORY_STORE_FORMAT_ID);
-        assert_eq!(plan.replacement_format_id(), MEMORY_STORE_FORMAT_ID);
+        assert_eq!(plan.source_format_id(), STORE_FORMAT_ID);
+        assert_eq!(plan.replacement_format_id(), STORE_FORMAT_ID);
         assert_eq!(plan.targets().len(), 1);
         assert_eq!(plan.targets()[0].store_era_id().as_str(), era.to_string());
     }
@@ -8574,12 +8482,12 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            MemoryDatabase::open(&root),
-            Err(MemoryError::StoreFormat(StoreFormatError::FormatMismatch {
+            Store::open(&root),
+            Err(StoreError::Kernel(KernelError::Format(StoreFormatError::FormatMismatch {
                 expected,
                 found,
                 ..
-            })) if expected == MEMORY_STORE_FORMAT_ID && found == "some-other-format"
+            }))) if expected == STORE_FORMAT_ID && found == "some-other-format"
         ));
         let entries: Vec<_> = fs::read_dir(&root).unwrap().collect();
         assert_eq!(entries.len(), 1, "opening must not touch a mismatched root");
@@ -8589,22 +8497,23 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlink_store_roots_are_refused() {
-        let (parent, root, database) = create_test_database();
-        drop(database);
+        let (parent, root, database_store) = create_test_database();
+        drop(database_store);
         let linked = parent.path().join("linked-memory");
         std::os::unix::fs::symlink(&root, &linked).unwrap();
 
         assert!(matches!(
-            MemoryDatabase::open(&linked),
-            Err(MemoryError::StoreFormat(
+            Store::open(&linked),
+            Err(StoreError::Kernel(KernelError::Format(
                 StoreFormatError::StoreRootIsNotDirectory(path)
-            )) if path == linked
+            ))) if path == linked
         ));
     }
 
     #[test]
     fn evidence_preserves_exact_bytes_while_rejecting_blank_input() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let exact = " \n\t{\"value\":\" exact tool payload \"}\r\n ".to_string();
         let captured = database
             .capture_evidence(
@@ -8648,7 +8557,8 @@ mod tests {
 
     #[test]
     fn evidence_over_lexical_term_budget_roundtrips_exactly_and_recalls_an_indexed_prefix() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let mut exact = String::from("lexical_prefix_marker\n");
         for index in 0..(MAX_INDEX_TERMS_PER_RECORD + 64) {
             exact.push_str(&format!("evidence_term_{index:05} "));
@@ -8698,7 +8608,8 @@ mod tests {
 
     #[test]
     fn evidence_authority_claim_cas_and_operation_replay_are_enforced() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let evidence_operation = OperationContext::new(Actor::User);
         let evidence_input = NewEvidence {
             class: EvidenceClass::UserAssertion,
@@ -8791,7 +8702,8 @@ mod tests {
 
     #[test]
     fn semantic_relation_identity_is_stable_across_cas_retraction() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let evidence = database
             .capture_evidence(
                 OperationContext::new(Actor::User),
@@ -8854,8 +8766,9 @@ mod tests {
 
     #[test]
     fn relation_kinds_enforce_endpoint_shapes_for_direct_and_proposed_writes() {
-        let (_parent, _root, database) = create_test_database();
-        let source = imported_source(&database, "relation endpoint source");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "relation endpoint source");
         let make_claim = |text: &str| {
             database
                 .create_claim(
@@ -8946,7 +8859,8 @@ mod tests {
 
     #[test]
     fn unicode_lexical_and_time_recall_returns_revision_citations_and_ids_only_case() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let earlier = database
             .capture_evidence(
                 OperationContext::new(Actor::User),
@@ -9052,7 +8966,8 @@ mod tests {
 
     #[test]
     fn recall_exposes_typed_evidence_truth_but_never_direct_assistant_utterances() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let scope = Scope::Session(Ulid::new());
         let raw_source_event_id = "run-018f-private-linkage";
         let outcome = database
@@ -9122,7 +9037,8 @@ mod tests {
 
     #[test]
     fn purge_preview_makes_exact_payload_unavailable_and_invalidates_dependency_closure() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let evidence = database
             .capture_evidence(
                 OperationContext::new(Actor::User),
@@ -9244,7 +9160,8 @@ mod tests {
 
     #[test]
     fn purge_after_retraction_removes_every_descendant_payload_without_reinvalidating_it() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let evidence = database
             .capture_evidence(
                 OperationContext::new(Actor::User),
@@ -9320,9 +9237,10 @@ mod tests {
     #[test]
     fn privacy_retraction_and_purge_do_not_refuse_more_than_4096_reverse_edges() {
         const OLD_REFUSAL_THRESHOLD: usize = 4_096;
-        let (_parent, _root, database) = create_test_database();
-        let source = imported_source(&database, "large privacy fanout source");
-        let recall_case = recall_case_for(&database, "large privacy fanout source");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "large privacy fanout source");
+        let recall_case = recall_case_for(database, "large privacy fanout source");
         let mut sample_claims = Vec::new();
         for bundle in 0..33 {
             let changes = (0..MAX_PROPOSAL_CHANGES)
@@ -9348,7 +9266,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            let review = approve_proposal(&database, &proposal, &recall_case);
+            let review = approve_proposal(database, &proposal, &recall_case);
             let applied = database
                 .adjudicate_proposal(
                     OperationContext::new(Actor::Operator),
@@ -9397,7 +9315,8 @@ mod tests {
 
     #[test]
     fn observed_range_candidate_limit_keeps_the_newest_records() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let mut ids = Vec::new();
         for observed_at_ms in [100, 200, 300] {
             let receipt = database
@@ -9427,7 +9346,8 @@ mod tests {
 
     #[test]
     fn recall_rejects_an_unbounded_scope_set() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let scopes = (0..=MAX_ACCESS_SCOPES)
             .map(|_| Scope::Session(Ulid::new()))
             .collect();
@@ -9450,7 +9370,8 @@ mod tests {
 
     #[test]
     fn oversized_payload_is_rejected_before_any_durable_write() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let oversized = "x".repeat(MAX_EVIDENCE_TEXT_BYTES + 1);
 
         let error = database
@@ -9486,7 +9407,8 @@ mod tests {
 
     #[test]
     fn claim_source_fanout_is_bounded_before_source_reads() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let evidence_ids = (0..=MAX_EVIDENCE_SOURCES)
             .map(|_| EvidenceId::new())
             .collect();
@@ -9510,7 +9432,8 @@ mod tests {
 
     #[test]
     fn utterances_never_support_claims_and_commitments_require_a_completed_terminal_turn() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         assert!(matches!(
             database.capture_evidence(
                 OperationContext::new(Actor::Assistant),
@@ -9681,7 +9604,8 @@ mod tests {
 
     #[test]
     fn assistant_cannot_activate_claims_or_semantic_relations() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let evidence = database
             .capture_evidence(
                 OperationContext::new(Actor::User),
@@ -9730,7 +9654,8 @@ mod tests {
 
     #[test]
     fn purge_preview_expires_after_ten_minutes() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let evidence = database
             .capture_evidence(
                 OperationContext::new(Actor::User),
@@ -9769,8 +9694,9 @@ mod tests {
         use std::thread;
         use std::time::Instant;
 
-        let (_parent, _root, database) = create_test_database();
-        let database = Arc::new(database);
+        let (_parent, _root, database_store) = create_test_database();
+        let database_store = Arc::new(database_store);
+        let database = database_store.memory();
         let proposal_source = database
             .capture_evidence(
                 OperationContext::new(Actor::System),
@@ -9799,9 +9725,9 @@ mod tests {
         }
 
         let begin_operation = OperationContext::new(Actor::User);
-        let begin_database = Arc::clone(&database);
+        let begin_store = Arc::clone(&database_store);
         let begin = thread::spawn(move || {
-            begin_database.begin_turn_recall(
+            begin_store.memory().begin_turn_recall(
                 begin_operation,
                 NewEvidence {
                     class: EvidenceClass::UserAssertion,
@@ -9844,9 +9770,9 @@ mod tests {
             thread::yield_now();
         }
 
-        let writer_database = Arc::clone(&database);
+        let writer_store = Arc::clone(&database_store);
         let writer = thread::spawn(move || {
-            writer_database.create_claim(
+            writer_store.memory().create_claim(
                 OperationContext::new(Actor::System),
                 NewClaim {
                     domain: ClaimDomain::ExternalFact,
@@ -9893,7 +9819,8 @@ mod tests {
 
     #[test]
     fn generic_retraction_cas_removes_recall_and_invalidates_dependents_once() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let evidence = database
             .capture_evidence(
                 OperationContext::new(Actor::User),
@@ -10006,7 +9933,8 @@ mod tests {
 
     #[test]
     fn remember_user_claim_commits_assertion_and_user_note_as_one_idempotent_operation() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let operation = OperationContext::new(Actor::User);
         let input = RememberUserClaim {
             domain: ClaimDomain::UserNote,
@@ -10091,7 +10019,8 @@ mod tests {
 
     #[test]
     fn correct_user_claim_atomically_supersedes_and_replaces_the_target() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let remembered = database
             .remember_user_claim(
                 OperationContext::new(Actor::User),
@@ -10270,7 +10199,8 @@ mod tests {
 
     #[test]
     fn generic_inspect_selects_head_or_an_exact_structural_revision() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let remembered = database
             .remember_user_claim(
                 OperationContext::new(Actor::User),
@@ -10386,9 +10316,10 @@ mod tests {
 
     #[test]
     fn adjudication_requires_real_authority_and_audits_the_structural_decision() {
-        let (_parent, _root, database) = create_test_database();
-        let source = imported_source(&database, "audited authority source");
-        let recall_case = recall_case_for(&database, "audited authority source");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "audited authority source");
+        let recall_case = recall_case_for(database, "audited authority source");
         let proposal = database
             .submit_proposal(
                 OperationContext::new(Actor::Assistant),
@@ -10410,7 +10341,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let review = approve_proposal(&database, &proposal, &recall_case);
+        let review = approve_proposal(database, &proposal, &recall_case);
         let base = ProposalAdjudication {
             proposal_id: proposal.id,
             expected_proposal_revision: review.proposal.revision,
@@ -10443,8 +10374,9 @@ mod tests {
 
     #[test]
     fn review_findings_accept_only_exact_same_scope_sources_and_approve_fails_closed() {
-        let (_parent, _root, database) = create_test_database();
-        let source = imported_source(&database, "review_pin_marker proposal source");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "review_pin_marker proposal source");
         let session_scope = Scope::Session(Ulid::new());
         let cross_scope = database
             .capture_evidence(
@@ -10472,7 +10404,7 @@ mod tests {
             .inspect_recall_case(recalled.case_id)
             .unwrap()
             .unwrap();
-        let unrelated = imported_source(&database, "not present in the pinned recall case");
+        let unrelated = imported_source(database, "not present in the pinned recall case");
         let proposal = database
             .submit_proposal(
                 OperationContext::new(Actor::Assistant),
@@ -10587,9 +10519,10 @@ mod tests {
 
     #[test]
     fn proposal_drafts_are_not_recalled_and_operator_accept_maps_all_drafts_atomically() {
-        let (_parent, root, database) = create_test_database();
-        let source = imported_source(&database, "Ada wrote proposal_atomic_marker");
-        let recall_case = recall_case_for(&database, "proposal_atomic_marker");
+        let (_parent, root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "Ada wrote proposal_atomic_marker");
+        let recall_case = recall_case_for(database, "proposal_atomic_marker");
         let entity_draft = ProposalDraftId::new();
         let claim_draft = ProposalDraftId::new();
         let relation_draft = ProposalDraftId::new();
@@ -10646,7 +10579,7 @@ mod tests {
             .iter()
             .all(|citation| !matches!(citation.record, RecordRef::Entity(_))));
 
-        let review = approve_proposal(&database, &proposal, &recall_case);
+        let review = approve_proposal(database, &proposal, &recall_case);
         let adjudication = ProposalAdjudication {
             proposal_id: proposal.id,
             expected_proposal_revision: review.proposal.revision,
@@ -10731,8 +10664,9 @@ mod tests {
         assert!(unavailable.canonical_name.is_none());
         assert!(unavailable.aliases.is_empty());
 
-        drop(database);
-        let reopened = MemoryDatabase::open(&root).unwrap();
+        drop(database_store);
+        let reopened_store = Store::open(&root).unwrap();
+        let reopened = reopened_store.memory();
         assert_eq!(
             reopened
                 .adjudicate_proposal(operation, adjudication)
@@ -10743,8 +10677,9 @@ mod tests {
 
     #[test]
     fn proposal_source_job_and_operation_replay_survive_reopen() {
-        let (_parent, root, database) = create_test_database();
-        let source = imported_source(&database, "durable proposal source");
+        let (_parent, root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "durable proposal source");
         let source_job_id = ProposalSourceJobId::new();
         let operation = OperationContext::new(Actor::Assistant);
         let input = NewProposalBundle {
@@ -10765,9 +10700,10 @@ mod tests {
         };
         let first = database.submit_proposal(operation, input.clone()).unwrap();
         assert_eq!(database.submit_proposal(operation, input).unwrap(), first);
-        drop(database);
+        drop(database_store);
 
-        let reopened = MemoryDatabase::open(&root).unwrap();
+        let reopened_store = Store::open(&root).unwrap();
+        let reopened = reopened_store.memory();
         assert_eq!(
             reopened
                 .proposal_by_source_job(source_job_id)
@@ -10781,9 +10717,10 @@ mod tests {
 
     #[test]
     fn proposal_operator_reads_are_bounded_and_latest_review_is_directly_addressable() {
-        let (_parent, _root, database) = create_test_database();
-        let source = imported_source(&database, "operator proposal listing source");
-        let recall_case = recall_case_for(&database, "operator proposal listing source");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "operator proposal listing source");
+        let recall_case = recall_case_for(database, "operator proposal listing source");
         let submit = |name: &str| {
             database
                 .submit_proposal(
@@ -10810,7 +10747,7 @@ mod tests {
         let first = submit("first pending");
         let reviewed = submit("reviewed proposal");
         let third = submit("third pending");
-        let review = approve_proposal(&database, &reviewed, &recall_case);
+        let review = approve_proposal(database, &reviewed, &recall_case);
 
         let listed = database.list_proposals(2).unwrap();
         assert_eq!(listed.len(), 2);
@@ -10867,8 +10804,9 @@ mod tests {
 
     #[test]
     fn proposal_bundle_has_an_aggregate_encoded_byte_budget() {
-        let (_parent, _root, database) = create_test_database();
-        let source = imported_source(&database, "aggregate proposal byte source");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "aggregate proposal byte source");
         let changes = (0..17)
             .map(|index| ProposalChange::CreateClaim {
                 draft_id: ProposalDraftId::new(),
@@ -10901,8 +10839,9 @@ mod tests {
 
     #[test]
     fn proposal_bundle_has_an_aggregate_alias_budget() {
-        let (_parent, _root, database) = create_test_database();
-        let source = imported_source(&database, "aggregate proposal alias source");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "aggregate proposal alias source");
         let changes = (0..17)
             .map(|entity| ProposalChange::CreateEntity {
                 draft_id: ProposalDraftId::new(),
@@ -10938,9 +10877,10 @@ mod tests {
 
     #[test]
     fn proposal_bundle_has_an_aggregate_dependency_edge_budget() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let sources: Vec<_> = (0..MAX_EVIDENCE_SOURCES)
-            .map(|index| imported_source(&database, &format!("edge source {index}")))
+            .map(|index| imported_source(database, &format!("edge source {index}")))
             .collect();
         let source_evidence: Vec<_> = sources
             .iter()
@@ -10979,9 +10919,10 @@ mod tests {
 
     #[test]
     fn stale_source_pin_prevents_any_proposal_change_from_applying() {
-        let (_parent, _root, database) = create_test_database();
-        let source = imported_source(&database, "stale proposal source marker");
-        let recall_case = recall_case_for(&database, "stale proposal source marker");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "stale proposal source marker");
+        let recall_case = recall_case_for(database, "stale proposal source marker");
         let proposal = database
             .submit_proposal(
                 OperationContext::new(Actor::Assistant),
@@ -11003,7 +10944,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let review = approve_proposal(&database, &proposal, &recall_case);
+        let review = approve_proposal(database, &proposal, &recall_case);
         database
             .retract(
                 OperationContext::new(Actor::Operator),
@@ -11056,10 +10997,11 @@ mod tests {
 
     #[test]
     fn stale_recall_candidate_pin_marks_acceptance_stale_without_partial_writes() {
-        let (_parent, _root, database) = create_test_database();
-        let source = imported_source(&database, "independent proposal source");
-        let candidate = imported_source(&database, "lawyer_candidate_marker");
-        let recall_case = recall_case_for(&database, "lawyer_candidate_marker");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "independent proposal source");
+        let candidate = imported_source(database, "lawyer_candidate_marker");
+        let recall_case = recall_case_for(database, "lawyer_candidate_marker");
         assert_eq!(
             recall_case.candidates[0].record,
             RecordRef::Evidence(candidate.id)
@@ -11085,7 +11027,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let review = approve_proposal(&database, &proposal, &recall_case);
+        let review = approve_proposal(database, &proposal, &recall_case);
         database
             .retract(
                 OperationContext::new(Actor::Operator),
@@ -11124,9 +11066,10 @@ mod tests {
 
     #[test]
     fn purge_during_review_removes_entity_proposal_and_review_payloads_and_blocks_accept() {
-        let (_parent, _root, database) = create_test_database();
-        let source = imported_source(&database, "purge_review_marker");
-        let recall_case = recall_case_for(&database, "purge_review_marker");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "purge_review_marker");
+        let recall_case = recall_case_for(database, "purge_review_marker");
         let proposal = database
             .submit_proposal(
                 OperationContext::new(Actor::Assistant),
@@ -11148,7 +11091,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let review = approve_proposal(&database, &proposal, &recall_case);
+        let review = approve_proposal(database, &proposal, &recall_case);
         let preview = database
             .preview_purge(Actor::Operator, RecordRef::Evidence(source.id))
             .unwrap();
@@ -11202,9 +11145,10 @@ mod tests {
 
     #[test]
     fn recall_feedback_is_structured_idempotent_and_does_not_correct_memory() {
-        let (_parent, _root, database) = create_test_database();
-        let source = imported_source(&database, "feedback_marker");
-        let recall_case = recall_case_for(&database, "feedback_marker");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "feedback_marker");
+        let recall_case = recall_case_for(database, "feedback_marker");
         let operation = OperationContext::new(Actor::User);
         let input = NewRecallFeedback {
             recall_case_id: recall_case.id,
@@ -11239,9 +11183,10 @@ mod tests {
 
     #[test]
     fn recall_feedback_kind_determines_whether_a_candidate_is_allowed() {
-        let (_parent, _root, database) = create_test_database();
-        let source = imported_source(&database, "feedback candidate semantics");
-        let recall_case = recall_case_for(&database, "feedback candidate semantics");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let source = imported_source(database, "feedback candidate semantics");
+        let recall_case = recall_case_for(database, "feedback candidate semantics");
         let candidate = RecordRevisionPin {
             record: RecordRef::Evidence(source.id),
             revision: 1,
@@ -11275,8 +11220,10 @@ mod tests {
 
     #[test]
     fn operational_fingerprint_is_keyed_stable_and_store_specific() {
-        let (first_parent, first_root, first) = create_test_database();
-        let (_, _, second) = create_test_database();
+        let (first_parent, first_root, first_store) = create_test_database();
+        let first = first_store.memory();
+        let (_, _, second_store) = create_test_database();
+        let second = second_store.memory();
         let fingerprint = first
             .operational_fingerprint("assistant-memory-ledger", b"same durable input")
             .unwrap();
@@ -11298,8 +11245,9 @@ mod tests {
                 .operational_fingerprint("assistant-memory-ledger", b"same durable input")
                 .unwrap()
         );
-        drop(first);
-        let reopened = MemoryDatabase::open(&first_root).unwrap();
+        drop(first_store);
+        let reopened_store = Store::open(&first_root).unwrap();
+        let reopened = reopened_store.memory();
         assert_eq!(
             fingerprint,
             reopened
@@ -11338,7 +11286,8 @@ mod tests {
 
     #[test]
     fn artifact_snapshot_is_exact_immutable_and_replay_safe() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let collection = database
             .create_artifact_collection(
                 OperationContext::new(Actor::User),
@@ -11424,8 +11373,9 @@ mod tests {
 
     #[test]
     fn artifact_passage_batch_preserves_exact_text_locator_and_lineage() {
-        let (_parent, _root, database) = create_test_database();
-        let (collection, snapshot) = artifact_snapshot_fixture(&database, vec![1; 100]);
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let (collection, snapshot) = artifact_snapshot_fixture(database, vec![1; 100]);
         let operation = OperationContext::new(Actor::System);
         let input = NewArtifactPassageBatch {
             snapshot_id: snapshot.id,
@@ -11495,8 +11445,9 @@ mod tests {
 
     #[test]
     fn artifact_recall_citations_carry_typed_provenance_and_locator() {
-        let (_parent, _root, database) = create_test_database();
-        let (collection, snapshot) = artifact_snapshot_fixture(&database, vec![7; 100]);
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let (collection, snapshot) = artifact_snapshot_fixture(database, vec![7; 100]);
         let passage = database
             .create_artifact_passages(
                 OperationContext::new(Actor::System),
@@ -11568,8 +11519,9 @@ mod tests {
 
     #[test]
     fn passage_ordinals_are_unique_across_batches_without_partial_write() {
-        let (_parent, root, database) = create_test_database();
-        let (_collection, snapshot) = artifact_snapshot_fixture(&database, vec![1; 100]);
+        let (_parent, root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let (_collection, snapshot) = artifact_snapshot_fixture(database, vec![1; 100]);
         database
             .create_artifact_passages(
                 OperationContext::new(Actor::System),
@@ -11636,8 +11588,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(retry.passages.len(), 1);
-        drop(database);
-        let reopened = MemoryDatabase::open(&root).unwrap();
+        drop(database_store);
+        let reopened_store = Store::open(&root).unwrap();
+        let reopened = reopened_store.memory();
         assert!(matches!(
             reopened.create_artifact_passages(
                 OperationContext::new(Actor::System),
@@ -11661,8 +11614,9 @@ mod tests {
 
     #[test]
     fn artifact_inputs_are_bounded_before_any_partial_write() {
-        let (_parent, _root, database) = create_test_database();
-        let (collection, snapshot) = artifact_snapshot_fixture(&database, vec![1; 100]);
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let (collection, snapshot) = artifact_snapshot_fixture(database, vec![1; 100]);
         let oversized_snapshot_operation = OperationContext::new(Actor::System);
         assert!(matches!(
             database.import_artifact_snapshot(
@@ -11772,7 +11726,8 @@ mod tests {
 
     #[test]
     fn generic_capture_cannot_forge_artifact_evidence_and_purge_closes_lineage() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         for class in [
             EvidenceClass::ArtifactSnapshot,
             EvidenceClass::ArtifactPassage,
@@ -11791,7 +11746,7 @@ mod tests {
                 Err(MemoryError::InvalidInput(message)) if message.contains("first-class artifact API")
             ));
         }
-        let (_collection, snapshot) = artifact_snapshot_fixture(&database, vec![9; 100]);
+        let (_collection, snapshot) = artifact_snapshot_fixture(database, vec![9; 100]);
         let passages = database
             .create_artifact_passages(
                 OperationContext::new(Actor::System),
@@ -11859,9 +11814,10 @@ mod tests {
 
     #[test]
     fn artifact_materialization_and_purge_are_linearized_at_the_blob_boundary() {
-        let (_parent, _root, database) = create_test_database();
-        let database = std::sync::Arc::new(database);
-        let (_collection, snapshot) = artifact_snapshot_fixture(&database, vec![7; 128]);
+        let (_parent, _root, database_store) = create_test_database();
+        let database_store = std::sync::Arc::new(database_store);
+        let database = database_store.memory();
+        let (_collection, snapshot) = artifact_snapshot_fixture(database, vec![7; 128]);
         let preview = database
             .preview_purge(Actor::Operator, RecordRef::ArtifactSnapshot(snapshot.id))
             .unwrap();
@@ -11869,14 +11825,16 @@ mod tests {
         let metadata_observed = std::sync::Arc::new(std::sync::Barrier::new(2));
         let continue_materialization = std::sync::Arc::new(std::sync::Barrier::new(2));
         let materializer = {
-            let database = database.clone();
+            let store = database_store.clone();
             let metadata_observed = metadata_observed.clone();
             let continue_materialization = continue_materialization.clone();
             std::thread::spawn(move || {
-                database.materialize_artifact_snapshot_with_observer(snapshot.id, || {
-                    metadata_observed.wait();
-                    continue_materialization.wait();
-                })
+                store
+                    .memory()
+                    .materialize_artifact_snapshot_with_observer(snapshot.id, || {
+                        metadata_observed.wait();
+                        continue_materialization.wait();
+                    })
             })
         };
 
@@ -11885,12 +11843,13 @@ mod tests {
         let purge_started = std::sync::Arc::new(std::sync::Barrier::new(2));
         let (finished, result) = std::sync::mpsc::channel();
         let purger = {
-            let database = database.clone();
+            let store = database_store.clone();
             let purge_started = purge_started.clone();
             std::thread::spawn(move || {
                 purge_started.wait();
-                let receipt =
-                    database.commit_purge(OperationContext::new(Actor::Operator), preview);
+                let receipt = store
+                    .memory()
+                    .commit_purge(OperationContext::new(Actor::Operator), preview);
                 finished.send(()).unwrap();
                 receipt
             })
@@ -11913,8 +11872,9 @@ mod tests {
 
     #[test]
     fn collection_purge_closes_artifact_evidence_and_derived_claim_lineage() {
-        let (_parent, _root, database) = create_test_database();
-        let (collection, snapshot) = artifact_snapshot_fixture(&database, vec![5; 100]);
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let (collection, snapshot) = artifact_snapshot_fixture(database, vec![5; 100]);
         let passage = database
             .create_artifact_passages(
                 OperationContext::new(Actor::System),
@@ -11994,8 +11954,9 @@ mod tests {
 
     #[test]
     fn artifact_evidence_purge_closes_passage_and_derived_claim_lineage() {
-        let (_parent, _root, database) = create_test_database();
-        let (collection, snapshot) = artifact_snapshot_fixture(&database, vec![6; 100]);
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let (collection, snapshot) = artifact_snapshot_fixture(database, vec![6; 100]);
         let passage = database
             .create_artifact_passages(
                 OperationContext::new(Actor::System),
@@ -12058,9 +12019,10 @@ mod tests {
 
     #[test]
     fn maximum_snapshot_metadata_operations_do_not_materialize_the_blob() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let (_collection, snapshot) =
-            artifact_snapshot_fixture(&database, vec![0xa5; MAX_ARTIFACT_SNAPSHOT_BYTES]);
+            artifact_snapshot_fixture(database, vec![0xa5; MAX_ARTIFACT_SNAPSHOT_BYTES]);
         let metadata = database
             .inspect_artifact_snapshot(snapshot.id)
             .unwrap()
@@ -12097,7 +12059,8 @@ mod tests {
 
     #[test]
     fn relation_evaluator_definitions_are_operator_owned_versioned_and_idempotent() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let evaluator_id = RelationEvaluatorId::new();
         let input = NewRelationEvaluatorRevision {
             id: evaluator_id,
@@ -12165,7 +12128,8 @@ mod tests {
 
     #[test]
     fn relation_profiles_pin_an_exact_evaluator_and_reject_duplicate_heads() {
-        let (_parent, _root, database) = create_test_database();
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
         let evaluator_id = RelationEvaluatorId::new();
         let evaluator = database
             .put_relation_evaluator(
@@ -12244,9 +12208,10 @@ mod tests {
 
     #[test]
     fn relation_signals_are_versioned_fixed_point_sidecars_with_computed_staleness() {
-        let (_parent, _root, database) = create_test_database();
-        let first = imported_source(&database, "signal source alpha");
-        let second = imported_source(&database, "signal source beta");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let first = imported_source(database, "signal source alpha");
+        let second = imported_source(database, "signal source beta");
         let evaluator_id = RelationEvaluatorId::new();
         let evaluator = database
             .put_relation_evaluator(
@@ -12386,10 +12351,11 @@ mod tests {
 
     #[test]
     fn shadow_activation_is_one_hop_deterministic_structural_and_non_authoritative() {
-        let (_parent, _root, database) = create_test_database();
-        imported_source(&database, "shadow_query_marker common alpha");
-        imported_source(&database, "shadow_query_marker common beta");
-        let recall_case = recall_case_for(&database, "shadow_query_marker common");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        imported_source(database, "shadow_query_marker common alpha");
+        imported_source(database, "shadow_query_marker common beta");
+        let recall_case = recall_case_for(database, "shadow_query_marker common");
         assert_eq!(recall_case.candidates.len(), 2);
         let baseline = recall_case.clone();
         let candidate_pins: Vec<_> = recall_case
@@ -12502,9 +12468,10 @@ mod tests {
 
     #[test]
     fn canonical_purge_exactly_erases_dependent_relation_signal_payloads() {
-        let (_parent, _root, database) = create_test_database();
-        let first = imported_source(&database, "purge signal private alpha");
-        let second = imported_source(&database, "purge signal private beta");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let first = imported_source(database, "purge signal private alpha");
+        let second = imported_source(database, "purge signal private beta");
         let evaluator = database
             .put_relation_evaluator(
                 OperationContext::new(Actor::Operator),
@@ -12560,7 +12527,7 @@ mod tests {
             .unwrap()
             .signals[0];
 
-        let recall_case = recall_case_for(&database, "purge signal private");
+        let recall_case = recall_case_for(database, "purge signal private");
         let trace = database
             .shadow_activate(
                 OperationContext::new(Actor::System),
@@ -12620,9 +12587,10 @@ mod tests {
 
     #[test]
     fn definition_retraction_stales_and_definition_purge_erases_dependent_signals() {
-        let (_parent, _root, database) = create_test_database();
-        let first = imported_source(&database, "definition lifecycle alpha");
-        let second = imported_source(&database, "definition lifecycle beta");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let first = imported_source(database, "definition lifecycle alpha");
+        let second = imported_source(database, "definition lifecycle beta");
         let evaluator = database
             .put_relation_evaluator(
                 OperationContext::new(Actor::Operator),
@@ -12678,7 +12646,7 @@ mod tests {
             .unwrap()
             .signals[0];
 
-        let recall_case = recall_case_for(&database, "definition lifecycle");
+        let recall_case = recall_case_for(database, "definition lifecycle");
         let trace = database
             .shadow_activate(
                 OperationContext::new(Actor::System),
@@ -12764,9 +12732,10 @@ mod tests {
 
     #[test]
     fn relation_signal_owner_indexes_follow_evaluator_changes_exactly() {
-        let (_parent, _root, database) = create_test_database();
-        let first = imported_source(&database, "evaluator migration alpha");
-        let second = imported_source(&database, "evaluator migration beta");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let first = imported_source(database, "evaluator migration alpha");
+        let second = imported_source(database, "evaluator migration beta");
         let evaluator_one = database
             .put_relation_evaluator(
                 OperationContext::new(Actor::Operator),
@@ -12892,9 +12861,10 @@ mod tests {
 
     #[test]
     fn relation_signal_and_activation_inputs_enforce_aggregate_bounds_and_uniqueness() {
-        let (_parent, _root, database) = create_test_database();
-        let first = imported_source(&database, "bound alpha");
-        let second = imported_source(&database, "bound beta");
+        let (_parent, _root, database_store) = create_test_database();
+        let database = database_store.memory();
+        let first = imported_source(database, "bound alpha");
+        let second = imported_source(database, "bound beta");
         let evaluator = database
             .put_relation_evaluator(
                 OperationContext::new(Actor::Operator),

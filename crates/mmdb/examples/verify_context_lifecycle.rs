@@ -1,7 +1,7 @@
 //! Native acceptance on a temporary copy of a closed real-task context store.
 //! Usage: verify_context_lifecycle STORE BUSINESS_PINS_JSON REPORT_JSON
 use mmdb::context::*;
-use mmdb::native_memory::MemoryDatabase;
+use mmdb::Store;
 use mmdb::{Actor, OperationId, Scope, TemporalFacts};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -79,7 +79,7 @@ fn main() -> Result<()> {
         &mut copied_bytes,
     )?;
     let report = {
-        let db = MemoryDatabase::open_context(&copied)?;
+        let db = Store::open(&copied)?;
         let store = db.context(ContextAccess::new("local-user", Actor::System))?;
         for pin in pins.values() {
             store.read(pin)?;
@@ -284,7 +284,7 @@ fn main() -> Result<()> {
             "privateWorkspaceDenied":true,"foreignOwnerDenied":true,"purgedSource":source,"derivedRecordsHidden":9})
     };
     // A second independent open must observe the committed purge.
-    let db = MemoryDatabase::open_context(&copied)?;
+    let db = Store::open(&copied)?;
     let store = db.context(ContextAccess::new("local-user", Actor::System))?;
     if !matches!(store.read(&target), Err(ContextError::Unavailable(_))) {
         return Err("purge was not durable after reopen".into());
