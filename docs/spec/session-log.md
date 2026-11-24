@@ -153,7 +153,7 @@ pub enum KernelError {
     StaleEra { module: &'static str, era: EraId },
     /// 提交结果不确定。
     CommitUnknown,
-    /// 切换 era 的提交结果不确定之后，这个 `Kernel` 的每个操作都返回它。
+    /// 切换 era 的提交结果不确定之后，这个 `Kernel` 访问存储的操作都返回它。
     Poisoned,
 }
 pub type KernelResult<T> = Result<T, KernelError>;
@@ -171,7 +171,7 @@ pub type KernelResult<T> = Result<T, KernelError>;
 - Errors:
   - 格式不符返回 `Format(FormatMismatch)`，目录被占返回 `Format(StoreBusy)`；元数据缺失或与清单不一致返回 `Corrupt`；分区名不在 spec 里返回 `UnknownPartition`。
   - 普通批次提交失败返回 `CommitUnknown`，之后引擎拒绝写入。
-  - `commit_module_reset` 提交之前失败时，什么都没变，准备好的分区由下次 `open` 删除。提交本身返回错误时，结果为 `CommitUnknown`，内核随即中毒，之后只返回 `Poisoned`；重新打开时按持久化的元数据决定当前 era，删除另一组分区。提交成功、删除旧分区失败时，`cleanup_pending` 为 true，下次 `open` 接着删。
+  - `commit_module_reset` 提交之前失败时，什么都没变，准备好的分区由下次 `open` 删除。提交本身返回错误时，结果为 `CommitUnknown`，内核随即中毒。中毒只作用于访问存储的操作：`EraPartitions::partition`、`Partition` 的读取、`Batch::commit`、`prepare_module_reset` 和 `commit_module_reset` 都返回 `Poisoned`。`era`、`era_state`、`module`、`canonical_root`、`store_era`、`keyed_hasher` 和 `write_lock` 不读存储，签名不变，照常返回内存里的值，era 停在重置之前；因为所有读写都会失败，这个过时的 era 不会让调用方读到任何数据。重新打开时按持久化的元数据决定当前 era，删除另一组分区。提交成功、删除旧分区失败时，`cleanup_pending` 为 true，下次 `open` 接着删。
 - Configuration: 无。
 - Performance:
   - `open` 的开销与分区数成正比。
