@@ -22,9 +22,9 @@ pub const STORE_MANIFEST_FILE: &str = ".mmdb-clean-store";
 const STORE_MANIFEST_MAGIC: &str = "MMDB-CLEAN-STORE";
 const STORE_MANIFEST_VERSION: u32 = 1;
 const MAX_STORE_MANIFEST_BYTES: u64 = 4 * 1024;
-const RESET_PLAN_VERSION: u32 = 1;
+const RESET_PLAN_VERSION: u32 = 2;
 const RESET_JOURNAL_MAGIC: &str = "MMDB-RESET-JOURNAL";
-const RESET_JOURNAL_VERSION: u32 = 1;
+const RESET_JOURNAL_VERSION: u32 = 2;
 const MAX_RESET_JOURNAL_BYTES: u64 = 16 * 1024;
 pub const MAX_RESET_PLAN_TTL: Duration = Duration::from_secs(15 * 60);
 const MAX_RESET_SNAPSHOT_ENTRIES: u64 = 1_000_000;
@@ -457,7 +457,8 @@ impl ResetTarget {
 /// Read-only evidence for a future destructive reset commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResetPlan {
-    expected_format_id: String,
+    source_format_id: String,
+    replacement_format_id: String,
     issued_at_unix_ms: u64,
     expires_at_unix_ms: u64,
     targets: Vec<ResetTarget>,
@@ -467,14 +468,16 @@ pub struct ResetPlan {
 impl ResetPlan {
     pub fn build(
         targets: &[PathBuf],
-        expected_format_id: &str,
+        source_format_id: &str,
+        replacement_format_id: &str,
         issued_at: SystemTime,
         ttl: Duration,
         safety: &ResetSafety,
     ) -> StoreFormatResult<Self> {
         Self::build_with_snapshot_limits(
             targets,
-            expected_format_id,
+            source_format_id,
+            replacement_format_id,
             issued_at,
             ttl,
             safety,
@@ -484,13 +487,15 @@ impl ResetPlan {
 
     fn build_with_snapshot_limits(
         targets: &[PathBuf],
-        expected_format_id: &str,
+        source_format_id: &str,
+        replacement_format_id: &str,
         issued_at: SystemTime,
         ttl: Duration,
         safety: &ResetSafety,
         snapshot_limits: SnapshotLimits,
     ) -> StoreFormatResult<Self> {
-        validate_format_id(expected_format_id)?;
+        validate_format_id(source_format_id)?;
+        validate_format_id(replacement_format_id)?;
         if targets.is_empty() {
             return Err(StoreFormatError::EmptyResetTargetSet);
         }
@@ -514,7 +519,7 @@ impl ResetPlan {
                     source,
                 })?;
             safety.validate_target(&canonical_target)?;
-            let managed = require_managed_store(target, expected_format_id)?;
+            let managed = require_managed_store(target, source_format_id)?;
             let metadata = snapshot_tree_with_limits(managed.canonical_root(), snapshot_limits)?;
             resolved.push(ResetTarget {
                 canonical_path: managed.canonical_root,
@@ -540,13 +545,15 @@ impl ResetPlan {
         }
 
         let digest = digest_reset_plan(
-            expected_format_id,
+            source_format_id,
+            replacement_format_id,
             issued_at_unix_ms,
             expires_at_unix_ms,
             &resolved,
         );
         Ok(Self {
-            expected_format_id: expected_format_id.to_owned(),
+            source_format_id: source_format_id.to_owned(),
+            replacement_format_id: replacement_format_id.to_owned(),
             issued_at_unix_ms,
             expires_at_unix_ms,
             targets: resolved,
@@ -554,8 +561,12 @@ impl ResetPlan {
         })
     }
 
-    pub fn expected_format_id(&self) -> &str {
-        &self.expected_format_id
+    pub fn source_format_id(&self) -> &str {
+        &self.source_format_id
+    }
+
+    pub fn replacement_format_id(&self) -> &str {
+        &self.replacement_format_id
     }
 
     pub fn issued_at_unix_ms(&self) -> u64 {
@@ -595,21 +606,13 @@ impl ResetPlan {
                 now_unix_ms: now_ms,
             });
         }
-        let expected_digest = digest_reset_plan(
-            &self.expected_format_id,
-            self.issued_at_unix_ms,
-            self.expires_at_unix_ms,
-            &self.targets,
-        );
-        if expected_digest != self.digest || presented_digest != self.digest.as_str() {
-            return Err(StoreFormatError::ResetPlanDigestMismatch);
-        }
+        validate_plan_digest_envelope(self, presented_digest)?;
 
         let mut canonical_targets = Vec::with_capacity(self.targets.len());
         for target in &self.targets {
             ensure_explicit_non_symlink_path(&target.canonical_path)?;
             safety.validate_target(&target.canonical_path)?;
-            let managed = require_managed_store(&target.canonical_path, &self.expected_format_id)?;
+            let managed = require_managed_store(&target.canonical_path, &self.source_format_id)?;
             if managed.manifest.store_era_id != target.store_era_id {
                 return Err(StoreFormatError::ResetTargetChanged(
                     target.canonical_path.clone(),
@@ -758,7 +761,8 @@ struct ResetJournal {
     plan_digest: ResetPlanDigest,
     issued_at_unix_ms: u64,
     expires_at_unix_ms: u64,
-    expected_format_id: String,
+    source_format_id: String,
+    replacement_format_id: String,
     old_store_era_id: StoreEraId,
     new_store_era_id: StoreEraId,
     old_metadata: MetadataSnapshot,
@@ -780,7 +784,8 @@ impl ResetJournal {
             plan_digest: plan.digest.clone(),
             issued_at_unix_ms: plan.issued_at_unix_ms,
             expires_at_unix_ms: plan.expires_at_unix_ms,
-            expected_format_id: plan.expected_format_id.clone(),
+            source_format_id: plan.source_format_id.clone(),
+            replacement_format_id: plan.replacement_format_id.clone(),
             old_store_era_id: target.store_era_id.clone(),
             new_store_era_id,
             old_metadata: target.metadata.clone(),
@@ -789,12 +794,13 @@ impl ResetJournal {
 
     fn encode(&self) -> String {
         let body = format!(
-            "{RESET_JOURNAL_MAGIC}\njournal-version:{RESET_JOURNAL_VERSION}\nroot-digest:{}\nplan-digest:{}\nissued-at-unix-ms:{}\nexpires-at-unix-ms:{}\nformat-id:{}\nold-store-era-id:{}\nnew-store-era-id:{}\nmetadata-digest:{}\nentry-count:{}\ntotal-file-bytes:{}\n",
+            "{RESET_JOURNAL_MAGIC}\njournal-version:{RESET_JOURNAL_VERSION}\nroot-digest:{}\nplan-digest:{}\nissued-at-unix-ms:{}\nexpires-at-unix-ms:{}\nsource-format-id:{}\nreplacement-format-id:{}\nold-store-era-id:{}\nnew-store-era-id:{}\nmetadata-digest:{}\nentry-count:{}\ntotal-file-bytes:{}\n",
             self.root_digest,
             self.plan_digest,
             self.issued_at_unix_ms,
             self.expires_at_unix_ms,
-            self.expected_format_id,
+            self.source_format_id,
+            self.replacement_format_id,
             self.old_store_era_id,
             self.new_store_era_id,
             self.old_metadata.digest,
@@ -813,7 +819,8 @@ impl ResetJournal {
         let plan_digest = parse_prefixed(lines.next(), "plan-digest:");
         let issued_at_unix_ms = parse_prefixed_u64(lines.next(), "issued-at-unix-ms:");
         let expires_at_unix_ms = parse_prefixed_u64(lines.next(), "expires-at-unix-ms:");
-        let expected_format_id = parse_prefixed(lines.next(), "format-id:");
+        let source_format_id = parse_prefixed(lines.next(), "source-format-id:");
+        let replacement_format_id = parse_prefixed(lines.next(), "replacement-format-id:");
         let old_store_era_id = parse_prefixed(lines.next(), "old-store-era-id:");
         let new_store_era_id = parse_prefixed(lines.next(), "new-store-era-id:");
         let metadata_digest = parse_prefixed(lines.next(), "metadata-digest:");
@@ -831,7 +838,8 @@ impl ResetJournal {
             Some(plan_digest),
             Some(issued_at_unix_ms),
             Some(expires_at_unix_ms),
-            Some(expected_format_id),
+            Some(source_format_id),
+            Some(replacement_format_id),
             Some(old_store_era_id),
             Some(new_store_era_id),
             Some(metadata_digest),
@@ -843,7 +851,8 @@ impl ResetJournal {
             plan_digest,
             issued_at_unix_ms,
             expires_at_unix_ms,
-            expected_format_id,
+            source_format_id,
+            replacement_format_id,
             old_store_era_id,
             new_store_era_id,
             metadata_digest,
@@ -867,7 +876,8 @@ impl ResetJournal {
         {
             return Err(StoreFormatError::InvalidResetJournal(path.to_path_buf()));
         }
-        validate_format_id(expected_format_id)
+        validate_format_id(source_format_id)
+            .and_then(|()| validate_format_id(replacement_format_id))
             .map_err(|_| StoreFormatError::InvalidResetJournal(path.to_path_buf()))?;
         let old_store_era_id = StoreEraId::parse(old_store_era_id)
             .map_err(|_| StoreFormatError::InvalidResetJournal(path.to_path_buf()))?;
@@ -881,7 +891,8 @@ impl ResetJournal {
             plan_digest: ResetPlanDigest(plan_digest.to_owned()),
             issued_at_unix_ms,
             expires_at_unix_ms,
-            expected_format_id: expected_format_id.to_owned(),
+            source_format_id: source_format_id.to_owned(),
+            replacement_format_id: replacement_format_id.to_owned(),
             old_store_era_id,
             new_store_era_id,
             old_metadata: MetadataSnapshot {
@@ -912,7 +923,8 @@ impl ResetJournal {
             metadata: self.old_metadata.clone(),
         };
         if digest_reset_plan(
-            &self.expected_format_id,
+            &self.source_format_id,
+            &self.replacement_format_id,
             self.issued_at_unix_ms,
             self.expires_at_unix_ms,
             &[target],
@@ -1057,7 +1069,8 @@ fn validate_plan_digest_envelope(
     presented_digest: &str,
 ) -> StoreFormatResult<()> {
     let expected_digest = digest_reset_plan(
-        &plan.expected_format_id,
+        &plan.source_format_id,
+        &plan.replacement_format_id,
         plan.issued_at_unix_ms,
         plan.expires_at_unix_ms,
         &plan.targets,
@@ -1079,8 +1092,13 @@ fn drive_reset_transaction(
     let quarantine_path = journal.quarantine_path(canonical_root);
     let staging_path = journal.staging_path(canonical_root);
 
-    let root_era = managed_era_if_present(canonical_root, &journal.expected_format_id)?;
-    let quarantine_era = managed_era_if_present(&quarantine_path, &journal.expected_format_id)?;
+    let quarantine_era = managed_era_if_present(&quarantine_path, &journal.source_format_id)?;
+    let root_format = if quarantine_era.is_some() {
+        &journal.replacement_format_id
+    } else {
+        &journal.source_format_id
+    };
+    let root_era = managed_era_if_present(canonical_root, root_format)?;
     match (root_era.as_ref(), quarantine_era.as_ref()) {
         (Some(root), None) if root == &journal.old_store_era_id => {
             let current_metadata = snapshot_tree(canonical_root)?;
@@ -1115,8 +1133,8 @@ fn drive_reset_transaction(
         }
     }
 
-    let root_era = managed_era_if_present(canonical_root, &journal.expected_format_id)?;
-    let quarantine_era = managed_era_if_present(&quarantine_path, &journal.expected_format_id)?;
+    let root_era = managed_era_if_present(canonical_root, &journal.replacement_format_id)?;
+    let quarantine_era = managed_era_if_present(&quarantine_path, &journal.source_format_id)?;
     if root_era.is_none() && quarantine_era.as_ref() == Some(&journal.old_store_era_id) {
         ensure_fresh_staging(canonical_root, journal, fail_after)?;
         fs::rename(&staging_path, canonical_root).map_err(|source| {
@@ -1179,7 +1197,7 @@ fn ensure_fresh_staging(
     match inspected.state() {
         StoreRootState::Empty => {
             StoreManifest::new(
-                journal.expected_format_id.clone(),
+                journal.replacement_format_id.clone(),
                 journal.new_store_era_id.clone(),
             )?
             .write_new(&staging_path)?;
@@ -1190,7 +1208,7 @@ fn ensure_fresh_staging(
             )?;
         }
         StoreRootState::Managed(manifest)
-            if manifest.format_id() == journal.expected_format_id
+            if manifest.format_id() == journal.replacement_format_id
                 && manifest.store_era_id() == &journal.new_store_era_id
                 && directory_contains_only_manifest(&staging_path)? => {}
         StoreRootState::Managed(_) | StoreRootState::UnrecognizedNonEmpty => {
@@ -1234,10 +1252,10 @@ fn validate_committed_layout(
     canonical_root: &Path,
     journal: &ResetJournal,
 ) -> StoreFormatResult<()> {
-    let root_era = managed_era_if_present(canonical_root, &journal.expected_format_id)?;
+    let root_era = managed_era_if_present(canonical_root, &journal.replacement_format_id)?;
     let quarantine_era = managed_era_if_present(
         &journal.quarantine_path(canonical_root),
-        &journal.expected_format_id,
+        &journal.source_format_id,
     )?;
     if root_era.as_ref() != Some(&journal.new_store_era_id)
         || quarantine_era.as_ref() != Some(&journal.old_store_era_id)
@@ -1273,7 +1291,7 @@ fn validate_staging_residue(
     match inspected.state() {
         StoreRootState::Empty => Ok(()),
         StoreRootState::Managed(manifest)
-            if manifest.format_id() == journal.expected_format_id
+            if manifest.format_id() == journal.replacement_format_id
                 && manifest.store_era_id() == &journal.new_store_era_id
                 && directory_contains_only_manifest(&staging_path)? =>
         {
@@ -1290,7 +1308,7 @@ fn validate_committed_receipt(
     journal: &ResetJournal,
 ) -> StoreFormatResult<()> {
     let quarantine_path = journal.quarantine_path(canonical_root);
-    let quarantine_era = managed_era_if_present(&quarantine_path, &journal.expected_format_id)?;
+    let quarantine_era = managed_era_if_present(&quarantine_path, &journal.source_format_id)?;
     if quarantine_era.as_ref() != Some(&journal.old_store_era_id) {
         return Err(StoreFormatError::InvalidResetLayout(quarantine_path));
     }
@@ -2311,7 +2329,8 @@ fn update_metadata(hasher: &mut blake3::Hasher, metadata: &fs::Metadata) {
 }
 
 fn digest_reset_plan(
-    expected_format_id: &str,
+    source_format_id: &str,
+    replacement_format_id: &str,
     issued_at_unix_ms: u64,
     expires_at_unix_ms: u64,
     targets: &[ResetTarget],
@@ -2319,7 +2338,8 @@ fn digest_reset_plan(
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"mmdb-reset-plan");
     hasher.update(&RESET_PLAN_VERSION.to_le_bytes());
-    update_bytes(&mut hasher, expected_format_id.as_bytes());
+    update_bytes(&mut hasher, source_format_id.as_bytes());
+    update_bytes(&mut hasher, replacement_format_id.as_bytes());
     hasher.update(&issued_at_unix_ms.to_le_bytes());
     hasher.update(&expires_at_unix_ms.to_le_bytes());
     hasher.update(&(targets.len() as u64).to_le_bytes());
@@ -2526,6 +2546,7 @@ mod tests {
         let plan = ResetPlan::build(
             std::slice::from_ref(&canonical_root),
             "memory-v1",
+            "memory-v1",
             issued_at,
             Duration::from_secs(300),
             &safety,
@@ -2652,6 +2673,7 @@ mod tests {
         let error = ResetPlan::build_with_snapshot_limits(
             std::slice::from_ref(&root),
             "memory-v1",
+            "memory-v1",
             UNIX_EPOCH + Duration::from_secs(1_000),
             Duration::from_secs(300),
             &safety,
@@ -2694,6 +2716,7 @@ mod tests {
         let issued_at = UNIX_EPOCH + Duration::from_secs(1_000);
         let plan = ResetPlan::build(
             std::slice::from_ref(&canonical_root),
+            "memory-v1",
             "memory-v1",
             issued_at,
             Duration::from_secs(300),
@@ -2831,6 +2854,60 @@ mod tests {
             assert_eq!(
                 std::fs::read(recovered.quarantine_path().join("evidence.data"))
                     .expect("old evidence remains in quarantine"),
+                b"recoverable old evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn reset_replaces_a_store_with_another_format() {
+        for transition in ResetTransition::ALL {
+            let fixture = ResetFixture::new(transition.name());
+            let replacement = ResetPlan::build(
+                std::slice::from_ref(&fixture.root),
+                "memory-v1",
+                "memory-v2",
+                fixture.issued_at,
+                Duration::from_secs(300),
+                &fixture.safety,
+            )
+            .unwrap();
+            assert_ne!(replacement.digest(), fixture.plan.digest());
+
+            let now = fixture.issued_at + Duration::from_secs(1);
+            let interrupted = commit_reset_with_environment(
+                &replacement,
+                replacement.digest().as_str(),
+                fixture.new_era.clone(),
+                now,
+                &fixture.safety,
+                Some(*transition),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                interrupted,
+                StoreFormatError::ResetInterrupted { .. }
+                    | StoreFormatError::ResetCommitOutcomeUnknown { .. }
+            ));
+            let lease = StoreLease::acquire(&fixture.root).expect("recover on ordinary open");
+            let installed = require_managed_store(&fixture.root, "memory-v2").unwrap();
+            assert_eq!(installed.manifest().store_era_id(), &fixture.new_era);
+            assert!(directory_contains_only_manifest(&fixture.root).unwrap());
+            drop(lease);
+
+            let receipt = commit_reset_with_environment(
+                &replacement,
+                replacement.digest().as_str(),
+                fixture.new_era,
+                now,
+                &fixture.safety,
+                None,
+            )
+            .unwrap();
+            let old = require_managed_store(receipt.quarantine_path(), "memory-v1").unwrap();
+            assert_eq!(old.manifest().store_era_id(), &fixture.old_era);
+            assert_eq!(
+                fs::read(receipt.quarantine_path().join("evidence.data")).unwrap(),
                 b"recoverable old evidence"
             );
         }
@@ -3033,6 +3110,7 @@ mod tests {
             let plan = ResetPlan::build(
                 std::slice::from_ref(&root),
                 "memory-v1",
+                "memory-v1",
                 issued_at,
                 Duration::from_secs(300),
                 &safety,
@@ -3069,6 +3147,7 @@ mod tests {
 
         let error = ResetPlan::build(
             &[PathBuf::from("/")],
+            "memory-v1",
             "memory-v1",
             UNIX_EPOCH + Duration::from_secs(1_000),
             Duration::from_secs(300),
@@ -3131,6 +3210,7 @@ mod tests {
         let error = ResetPlan::build(
             std::slice::from_ref(&linked_root),
             "memory-v1",
+            "memory-v1",
             UNIX_EPOCH + Duration::from_secs(1_000),
             Duration::from_secs(300),
             &safety,
@@ -3162,6 +3242,7 @@ mod tests {
         let error = ResetPlan::build(
             std::slice::from_ref(&canonical_root),
             "memory-v1",
+            "memory-v1",
             UNIX_EPOCH + Duration::from_secs(1_000),
             Duration::from_secs(300),
             &safety,
@@ -3191,6 +3272,7 @@ mod tests {
         let home_error = ResetPlan::build(
             std::slice::from_ref(&canonical_home),
             "memory-v1",
+            "memory-v1",
             UNIX_EPOCH + Duration::from_secs(1_000),
             Duration::from_secs(300),
             &home_safety,
@@ -3218,6 +3300,7 @@ mod tests {
         let workspace_error = ResetPlan::build(
             std::slice::from_ref(&canonical_workspace),
             "memory-v1",
+            "memory-v1",
             UNIX_EPOCH + Duration::from_secs(1_000),
             Duration::from_secs(300),
             &workspace_safety,
@@ -3244,6 +3327,7 @@ mod tests {
         let issued_at = UNIX_EPOCH + Duration::from_secs(1_000);
         let plan = ResetPlan::build(
             &[canonical_root],
+            "memory-v1",
             "memory-v1",
             issued_at,
             Duration::from_secs(300),
@@ -3277,6 +3361,7 @@ mod tests {
         let issued_at = UNIX_EPOCH + Duration::from_secs(1_000);
         let plan = ResetPlan::build(
             std::slice::from_ref(&canonical_root),
+            "memory-v1",
             "memory-v1",
             issued_at,
             Duration::from_secs(300),
@@ -3326,6 +3411,7 @@ mod tests {
         let error = ResetPlan::build(
             &[canonical_inner.clone(), canonical_outer.clone()],
             "memory-v1",
+            "memory-v1",
             UNIX_EPOCH + Duration::from_secs(1_000),
             Duration::from_secs(300),
             &safety,
@@ -3354,6 +3440,7 @@ mod tests {
         let issued_at = UNIX_EPOCH + Duration::from_secs(1_000);
         let plan = ResetPlan::build(
             &[canonical_root],
+            "memory-v1",
             "memory-v1",
             issued_at,
             Duration::from_secs(300),
@@ -3391,6 +3478,7 @@ mod tests {
         let plan = ResetPlan::build(
             &[canonical_root],
             "memory-v1",
+            "memory-v1",
             issued_at,
             Duration::from_secs(300),
             &safety,
@@ -3423,6 +3511,7 @@ mod tests {
 
         let error = ResetPlan::build(
             &[canonical_root],
+            "memory-v1",
             "memory-v1",
             UNIX_EPOCH + Duration::from_secs(1_000),
             Duration::from_nanos(1),

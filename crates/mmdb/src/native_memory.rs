@@ -8705,13 +8705,15 @@ mod tests {
         let plan = ResetPlan::build(
             std::slice::from_ref(&canonical_root),
             MEMORY_STORE_FORMAT_ID,
+            MEMORY_STORE_FORMAT_ID,
             UNIX_EPOCH + Duration::from_secs(1_000),
             Duration::from_secs(600),
             &safety,
         )
         .unwrap();
 
-        assert_eq!(plan.expected_format_id(), MEMORY_STORE_FORMAT_ID);
+        assert_eq!(plan.source_format_id(), MEMORY_STORE_FORMAT_ID);
+        assert_eq!(plan.replacement_format_id(), MEMORY_STORE_FORMAT_ID);
         assert_eq!(plan.targets().len(), 1);
         assert_eq!(plan.targets()[0].store_era_id().as_str(), era.to_string());
     }

@@ -825,6 +825,7 @@ fn reset_creates_a_new_context_era_without_importing_previous_history() {
     let plan = ResetPlan::build(
         std::slice::from_ref(&root),
         CONTEXT_STORE_FORMAT_ID,
+        CONTEXT_STORE_FORMAT_ID,
         SystemTime::now(),
         Duration::from_secs(60),
         &safety,
