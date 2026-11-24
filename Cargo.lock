@@ -1192,6 +1192,13 @@ name = "mmdb-kernel"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "fjall",
+ "getrandom 0.3.4",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
  "ulid",
 ]
 

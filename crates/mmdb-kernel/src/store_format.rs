@@ -1479,9 +1479,9 @@ fn managed_era_if_present(
     Ok(Some(managed.manifest.store_era_id))
 }
 
-fn directory_contains_only_manifest(path: &Path) -> StoreFormatResult<bool> {
+pub(crate) fn directory_contains_only_manifest(path: &Path) -> StoreFormatResult<bool> {
     let mut entries = fs::read_dir(path).map_err(|source| StoreFormatError::Io {
-        operation: "read reset staging directory",
+        operation: "read managed store directory",
         path: path.to_path_buf(),
         source,
     })?;
@@ -1489,7 +1489,7 @@ fn directory_contains_only_manifest(path: &Path) -> StoreFormatResult<bool> {
         return Ok(false);
     };
     let entry = entry.map_err(|source| StoreFormatError::Io {
-        operation: "read reset staging entry",
+        operation: "read managed store entry",
         path: path.to_path_buf(),
         source,
     })?;
