@@ -667,6 +667,56 @@ fn entity_merge_idempotent() {
     );
 }
 
+#[test]
+fn entity_writes_refuse_an_operation_id_a_session_event_holds() {
+    let (_dir, store, log) = fresh_store();
+    let operation = OperationId::new();
+    let input = EventInput {
+        sources: Vec::new(),
+        session: "entity-session".into(),
+        event_id: "event-1".into(),
+        scope: Scope::Personal,
+        kind: EventKind::UserMessage,
+        media_type: "text/plain".into(),
+        occurred_at_ms: 1,
+        expected_sequence: None,
+    };
+    let receipt = log
+        .append(operation, input.clone(), b"hello".as_slice())
+        .unwrap();
+    let primary = EntityRef::new("ns", "person", "erin");
+    let other = EntityRef::new("ns", "person", "frank");
+    block_on(store.resolve_or_create_entity(OperationId::new(), primary.clone())).unwrap();
+    block_on(store.resolve_or_create_entity(OperationId::new(), other.clone())).unwrap();
+    let alias = EntityRef::new("ns", "person", "erin-alias");
+    assert!(matches!(
+        store.add_entity_alias(operation, &primary, alias.clone()),
+        Err(ContextError::IdempotencyConflict)
+    ));
+    assert!(matches!(
+        store.merge_entities(operation, &other, &primary),
+        Err(ContextError::IdempotencyConflict)
+    ));
+    assert_eq!(log.operation_receipt(operation).unwrap(), Some(receipt.clone()));
+    assert_eq!(
+        log.append(operation, input, b"hello".as_slice()).unwrap(),
+        receipt
+    );
+
+    // An identity write retried under its own operation ID replays.
+    let alias_operation = OperationId::new();
+    let aliased = store
+        .add_entity_alias(alias_operation, &primary, alias.clone())
+        .unwrap();
+    assert_eq!(
+        store
+            .add_entity_alias(alias_operation, &primary, alias)
+            .unwrap(),
+        aliased
+    );
+    assert!(store.operation_receipt(alias_operation).unwrap().is_some());
+}
+
 // ---------------------------------------------------------------------------
 // Feature A3 — extraction transaction
 // ---------------------------------------------------------------------------

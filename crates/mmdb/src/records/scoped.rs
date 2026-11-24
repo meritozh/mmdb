@@ -559,6 +559,10 @@ impl Scoped<'_> {
         digest: [u8; 32],
         receipt: WriteReceipt,
     ) -> ContextResult<WriteReceipt> {
+        // An operation ID names one write across both modules; a receipt is never replaced.
+        if self.has_operation(operation)? {
+            return Err(ContextError::IdempotencyConflict);
+        }
         batch.insert(
             &self.records.operations,
             operation_key(&self.access.owner, operation),

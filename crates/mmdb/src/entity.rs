@@ -251,14 +251,13 @@ impl ContextStore<'_> {
                 "alias must differ from the primary reference".into(),
             ));
         }
-        let primary_row = self.identity_locked(primary)?.ok_or_else(|| {
-            ContextError::NotFound(ContextRef {
-                era: self.scoped.era(StoreModule::Memory),
-                owner: self.scoped.access().owner.clone(),
-                kind: RecordKind::Object,
-                id: Ulid::nil(),
-            })
-        })?;
+        let digest = self.scoped.digest("entity-alias", &(primary, &alias))?;
+        if self.scoped.replay(op, digest)?.is_some() {
+            return self
+                .identity_locked(&alias)?
+                .ok_or_else(|| self.missing_entity());
+        }
+        let primary_row = self.identity_locked(primary)?.ok_or_else(|| self.missing_entity())?;
         if self.identity_locked(&alias)?.is_some() {
             return Err(ContextError::IdempotencyConflict);
         }
@@ -281,9 +280,9 @@ impl ContextStore<'_> {
         self.scoped.commit_operation(
             batch,
             op,
-            self.scoped.digest("entity-alias", &(primary, &alias))?,
+            digest,
             crate::context::WriteReceipt {
-                pin: self.scoped.fresh_pin(RecordKind::Object),
+                pin: self.node_pin(primary_row.node_id)?,
                 sequence: None,
             },
         )?;
@@ -302,22 +301,12 @@ impl ContextStore<'_> {
         let _guard = self.scoped.lock();
         self.check_entity_ref(source)?;
         self.check_entity_ref(target)?;
-        let source_row = self.identity_locked(source)?.ok_or_else(|| {
-            ContextError::NotFound(ContextRef {
-                era: self.scoped.era(StoreModule::Memory),
-                owner: self.scoped.access().owner.clone(),
-                kind: RecordKind::Object,
-                id: Ulid::nil(),
-            })
-        })?;
-        let target_row = self.identity_locked(target)?.ok_or_else(|| {
-            ContextError::NotFound(ContextRef {
-                era: self.scoped.era(StoreModule::Memory),
-                owner: self.scoped.access().owner.clone(),
-                kind: RecordKind::Object,
-                id: Ulid::nil(),
-            })
-        })?;
+        let digest = self.scoped.digest("entity-merge", &(source, target))?;
+        if self.scoped.replay(op, digest)?.is_some() {
+            return Ok(());
+        }
+        let source_row = self.identity_locked(source)?.ok_or_else(|| self.missing_entity())?;
+        let target_row = self.identity_locked(target)?.ok_or_else(|| self.missing_entity())?;
         if source_row.entity_ref.entity_type != target_row.entity_ref.entity_type {
             return Err(ContextError::TypeConflict(format!(
                 "cannot merge entities of different types: {} vs {}",
@@ -353,9 +342,9 @@ impl ContextStore<'_> {
             .commit_operation(
                 batch,
                 op,
-                self.scoped.digest("entity-merge", &(source, target))?,
+                digest,
                 crate::context::WriteReceipt {
-                    pin: self.scoped.fresh_pin(RecordKind::Object),
+                    pin: self.node_pin(target_row.node_id)?,
                     sequence: None,
                 },
             )
@@ -428,6 +417,26 @@ impl ContextStore<'_> {
             return Ok(None);
         };
         Ok(Some(decode_identity(&bytes)?.into()))
+    }
+
+    fn missing_entity(&self) -> ContextError {
+        ContextError::NotFound(ContextRef {
+            era: self.scoped.era(StoreModule::Memory),
+            owner: self.scoped.access().owner.clone(),
+            kind: RecordKind::Object,
+            id: Ulid::nil(),
+        })
+    }
+
+    /// The current pin of an entity's node, recorded as the receipt of an identity write.
+    fn node_pin(&self, node_id: Ulid) -> ContextResult<RecordPin> {
+        let node = ContextRef {
+            era: self.scoped.era(StoreModule::Memory),
+            owner: self.scoped.access().owner.clone(),
+            kind: RecordKind::Object,
+            id: node_id,
+        };
+        Ok(self.scoped.head_locked(&node)?.pin)
     }
 
     fn identity_from_pin(&self, pin: &RecordPin) -> ContextResult<EntityIdentity> {
