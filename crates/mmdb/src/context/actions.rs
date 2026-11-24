@@ -48,7 +48,7 @@ impl ContextStore<'_> {
         expected: Option<RecordPin>,
         definition: ActionDefinition,
     ) -> ContextResult<WriteReceipt> {
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         let digest = self.digest("define-action", &(&expected, &definition))?;
         if let Some(receipt) = self.replay(operation, digest)? {
             return Ok(receipt);
@@ -119,7 +119,7 @@ impl ContextStore<'_> {
                 return Err(ContextError::TypeConflict(definition.name));
             }
             return self.commit_operation(
-                self.db.durable_batch(),
+                self.db.kernel.batch(),
                 operation,
                 digest,
                 WriteReceipt {
@@ -141,7 +141,7 @@ impl ContextStore<'_> {
             information,
             &bytes,
         );
-        let mut batch = self.db.durable_batch();
+        let mut batch = self.db.kernel.batch();
         if pin.revision > 1 {
             self.advance_availability_epoch(&mut batch)?;
         }
@@ -164,7 +164,7 @@ impl ContextStore<'_> {
         scope: &Scope,
         name: &str,
     ) -> ContextResult<Option<(RecordPin, ActionDefinition)>> {
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         self.check_scope(scope)?;
         validate_name(name, "action name")?;
         let Some(bytes) =
@@ -191,7 +191,7 @@ impl ContextStore<'_> {
                 "action page limit must be 1..=100".into(),
             ));
         }
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         let target_record = self.current_action_target(target)?;
         let RecordBody::Object(properties) = target_record.body else {
             return Err(ContextError::InvalidInput(
@@ -280,7 +280,7 @@ impl ContextStore<'_> {
         operation: OperationId,
         invocation: ActionInvocation,
     ) -> ContextResult<ActionPreparation> {
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         self.require_action_harness()?;
         let digest = self.digest("prepare-action", &invocation)?;
         if let Some(receipt) = self.replay(operation, digest)? {
@@ -342,7 +342,7 @@ impl ContextStore<'_> {
             InformationKind::Observation,
             &bytes,
         );
-        let mut batch = self.db.durable_batch();
+        let mut batch = self.db.kernel.batch();
         self.put_payload(&mut batch, &pin, &bytes);
         self.put_header(&mut batch, &header)?;
         Ok(ActionPreparation {
@@ -369,7 +369,7 @@ impl ContextStore<'_> {
         result: Value,
         result_sources: Vec<RecordPin>,
     ) -> ContextResult<WriteReceipt> {
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         self.require_action_harness()?;
         let digest = self.digest(
             "finish-action",
@@ -417,7 +417,7 @@ impl ContextStore<'_> {
             InformationKind::Observation,
             &bytes,
         );
-        let mut batch = self.db.durable_batch();
+        let mut batch = self.db.kernel.batch();
         self.advance_availability_epoch(&mut batch)?;
         self.put_payload(&mut batch, &pin, &bytes);
         self.put_header(&mut batch, &header)?;

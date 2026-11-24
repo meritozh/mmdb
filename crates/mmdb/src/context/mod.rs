@@ -18,13 +18,13 @@ mod tests;
 
 pub use types::*;
 
-use super::{MemoryDatabase, MemoryError, MemoryResult};
+use super::MemoryDatabase;
 use crate::records::InvalidTemporalFacts;
 use crate::{OperationId, MAX_ACCESS_SCOPES};
-use fjall::{Keyspace, PartitionHandle};
+use mmdb_kernel::{EraPartitions, KernelError, KernelResult, Partition, WriteGuard};
 use std::fmt;
 
-pub const CONTEXT_STORE_FORMAT_ID: &str = "mmdb-context-dev4";
+pub const CONTEXT_STORE_FORMAT_ID: &str = "mmdb-context-dev7";
 pub const PAYLOAD_CHUNK_BYTES: usize = 32 * 1024;
 pub const MAX_PAYLOAD_PAGE_BYTES: usize = 1024 * 1024;
 pub const MAX_RECORD_BYTES: usize = 128 * 1024;
@@ -33,7 +33,7 @@ pub const MAX_CONTEXT_SOURCES: usize = 64;
 
 #[derive(Debug)]
 pub enum ContextError {
-    Native(MemoryError),
+    Storage(KernelError),
     Io(std::io::Error),
     Serialization(serde_json::Error),
     InvalidInput(String),
@@ -54,7 +54,7 @@ pub enum ContextError {
 impl fmt::Display for ContextError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Native(e) => write!(f, "{e}"),
+            Self::Storage(e) => write!(f, "{e}"),
             Self::Io(e) => write!(f, "context input I/O: {e}"),
             Self::Serialization(e) => write!(f, "context serialization: {e}"),
             Self::InvalidInput(e) => write!(f, "invalid context input: {e}"),
@@ -75,11 +75,6 @@ impl fmt::Display for ContextError {
 }
 
 impl std::error::Error for ContextError {}
-impl From<MemoryError> for ContextError {
-    fn from(e: MemoryError) -> Self {
-        Self::Native(e)
-    }
-}
 impl From<InvalidTemporalFacts> for ContextError {
     fn from(error: InvalidTemporalFacts) -> Self {
         Self::InvalidInput(error.to_string())
@@ -95,76 +90,59 @@ impl From<serde_json::Error> for ContextError {
         Self::Serialization(e)
     }
 }
-impl From<fjall::Error> for ContextError {
-    fn from(e: fjall::Error) -> Self {
-        Self::Native(super::storage_error(e))
+impl From<KernelError> for ContextError {
+    fn from(e: KernelError) -> Self {
+        Self::Storage(e)
     }
 }
 
 pub type ContextResult<T> = Result<T, ContextError>;
 
-pub(crate) struct ContextPartitions {
-    pub(crate) headers: PartitionHandle,
-    pub(crate) heads: PartitionHandle,
-    pub(crate) payloads: PartitionHandle,
-    pub(crate) names: PartitionHandle,
-    pub(crate) action_names: PartitionHandle,
-    pub(crate) operations: PartitionHandle,
-    pub(crate) history_order: PartitionHandle,
-    pub(crate) history_heads: PartitionHandle,
-    pub(crate) events: PartitionHandle,
-    pub(crate) calls: PartitionHandle,
-    pub(crate) results: PartitionHandle,
-    pub(crate) postings: PartitionHandle,
-    pub(crate) record_terms: PartitionHandle,
-    pub(crate) adjacency: PartitionHandle,
-    pub(crate) pending: PartitionHandle,
-    pub(crate) messages: PartitionHandle,
-    pub(crate) checkpoints: PartitionHandle,
-    pub(crate) lifecycle: PartitionHandle,
-    /// Entity identity MVP (A2): secondary index mapping the globally-unique
-    /// `(namespace, entity_type, external_key)` triple (and its aliases) to a
-    /// context record id. Mirrors the `names` / `action_names` secondary
-    /// indexes but is dedicated to entity identity resolution.
-    pub(crate) entity_identity: PartitionHandle,
-    /// Extraction transactions (A3): persisted `ExtractionReceipt` keyed by the
-    /// caller-supplied operation id, plus an `Incomplete` crash-marker set
-    /// before the durable batch commits.
-    pub(crate) extraction_receipts: PartitionHandle,
-    pub(crate) extraction_incomplete: PartitionHandle,
-    #[cfg(test)]
-    pub(crate) fail_commit_ack: std::sync::atomic::AtomicBool,
+// The kernel schema and the handles must describe the same partitions.
+macro_rules! context_partitions {
+    ($($field:ident => $name:literal),+ $(,)?) => {
+        pub(super) const PARTITION_NAMES: &[&str] = &[$($name),+];
+
+        pub(crate) struct ContextPartitions {
+            $(pub(crate) $field: Partition,)+
+            #[cfg(test)]
+            pub(crate) fail_commit_ack: std::sync::atomic::AtomicBool,
+        }
+
+        impl ContextPartitions {
+            pub(super) fn open(era: &EraPartitions) -> KernelResult<Self> {
+                Ok(Self {
+                    $($field: era.partition($name)?,)+
+                    #[cfg(test)]
+                    fail_commit_ack: std::sync::atomic::AtomicBool::new(false),
+                })
+            }
+        }
+    };
 }
 
-impl ContextPartitions {
-    pub(super) fn open(keyspace: &Keyspace) -> MemoryResult<Self> {
-        let p = |name| super::open_partition(keyspace, name);
-        Ok(Self {
-            headers: p("context_headers_v1")?,
-            heads: p("context_heads_v1")?,
-            payloads: p("context_payloads_v1")?,
-            names: p("context_type_names_v1")?,
-            action_names: p("context_action_names_v1")?,
-            operations: p("context_operations_v1")?,
-            history_order: p("context_history_order_v1")?,
-            history_heads: p("context_history_heads_v1")?,
-            events: p("context_history_events_v1")?,
-            calls: p("context_tool_calls_v1")?,
-            results: p("context_tool_results_v1")?,
-            postings: p("context_postings_v1")?,
-            record_terms: p("context_record_terms_v1")?,
-            adjacency: p("context_adjacency_v1")?,
-            pending: p("context_pending_uploads_v1")?,
-            messages: p("context_messages_v1")?,
-            checkpoints: p("context_checkpoints_v1")?,
-            lifecycle: p("context_lifecycle_v1")?,
-            entity_identity: p("context_entity_identity_v1")?,
-            extraction_receipts: p("context_extraction_receipts_v1")?,
-            extraction_incomplete: p("context_extraction_incomplete_v1")?,
-            #[cfg(test)]
-            fail_commit_ack: std::sync::atomic::AtomicBool::new(false),
-        })
-    }
+context_partitions! {
+    headers => "context_headers_v1",
+    heads => "context_heads_v1",
+    payloads => "context_payloads_v1",
+    names => "context_type_names_v1",
+    action_names => "context_action_names_v1",
+    operations => "context_operations_v1",
+    history_order => "context_history_order_v1",
+    history_heads => "context_history_heads_v1",
+    events => "context_history_events_v1",
+    calls => "context_tool_calls_v1",
+    results => "context_tool_results_v1",
+    postings => "context_postings_v1",
+    record_terms => "context_record_terms_v1",
+    adjacency => "context_adjacency_v1",
+    pending => "context_pending_uploads_v1",
+    messages => "context_messages_v1",
+    checkpoints => "context_checkpoints_v1",
+    lifecycle => "context_lifecycle_v1",
+    entity_identity => "context_entity_identity_v1",
+    extraction_receipts => "context_extraction_receipts_v1",
+    extraction_incomplete => "context_extraction_incomplete_v1",
 }
 
 pub struct ContextStore<'a> {
@@ -181,7 +159,7 @@ pub struct ContextStore<'a> {
 /// store, always acquire this guard before that store's write lock.
 #[must_use = "source validity is protected only while the guard is held"]
 pub struct CurrentSourcesGuard<'a> {
-    _lock: parking_lot::MutexGuard<'a, ()>,
+    _lock: WriteGuard<'a>,
     availability_epoch: u64,
 }
 

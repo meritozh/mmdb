@@ -10,7 +10,7 @@ struct CheckpointVisibility {
 
 impl ContextStore<'_> {
     pub fn availability_epoch(&self) -> ContextResult<u64> {
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         self.availability_epoch_locked()
     }
     pub(crate) fn availability_epoch_locked(&self) -> ContextResult<u64> {
@@ -57,7 +57,7 @@ impl ContextStore<'_> {
 
     pub(crate) fn advance_availability_epoch(
         &self,
-        batch: &mut fjall::Batch,
+        batch: &mut mmdb_kernel::Batch,
     ) -> ContextResult<u64> {
         let current = self.availability_epoch_locked()?;
         let next = current.checked_add(1).ok_or(ContextError::BudgetExceeded)?;
@@ -80,7 +80,7 @@ impl ContextStore<'_> {
 
     pub(crate) fn invalidate_checkpoint_payloads(
         &self,
-        batch: &mut fjall::Batch,
+        batch: &mut mmdb_kernel::Batch,
         epoch: u64,
     ) -> ContextResult<()> {
         batch.insert(
@@ -127,7 +127,7 @@ impl ContextStore<'_> {
                 "checkpoint exceeds 128 KiB".into(),
             ));
         }
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         let digest = self.digest("save-checkpoint", &input)?;
         if let Some(receipt) = self.replay(operation, digest)? {
             return Ok(receipt);
@@ -196,7 +196,7 @@ impl ContextStore<'_> {
                 availability_epoch: self.availability_epoch_locked()?,
             }),
         };
-        let mut batch = self.db.durable_batch();
+        let mut batch = self.db.kernel.batch();
         self.put_payload(&mut batch, &pin, &bytes);
         self.put_header(&mut batch, &header)?;
         batch.insert(&self.parts.checkpoints, key, encode(&pin)?);
@@ -213,7 +213,7 @@ impl ContextStore<'_> {
 
     pub fn latest_checkpoint(&self, session: &str) -> ContextResult<Option<RecordHeader>> {
         validate_name(session, "session")?;
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         self.parts
             .checkpoints
             .get(session_key(&self.access.owner, session))?
@@ -229,7 +229,7 @@ impl ContextStore<'_> {
     ) -> ContextResult<Option<RecordHeader>> {
         validate_name(session, "session")?;
         validate_name(run, "run")?;
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         self.parts
             .checkpoints
             .get(checkpoint_key(
@@ -264,7 +264,7 @@ mod tests {
         let store = db
             .context(ContextAccess::new("owner", Actor::System))
             .unwrap();
-        let mut batch = db.durable_batch();
+        let mut batch = db.kernel.batch();
         store.advance_availability_epoch(&mut batch).unwrap();
         batch.commit().unwrap();
         let anchor = store
@@ -301,25 +301,25 @@ mod tests {
             .pin;
         assert!(store.read(&checkpoint).is_ok());
         // Simulate an older binary advancing only the original lifecycle key.
-        store
-            .parts
-            .lifecycle
-            .insert(owner_key("owner"), encode(&2u64).unwrap())
-            .unwrap();
+        let mut batch = db.kernel.batch();
+        batch.insert(
+            &store.parts.lifecycle,
+            owner_key("owner"),
+            encode(&2u64).unwrap(),
+        );
+        batch.commit().unwrap();
         assert!(matches!(
             store.read(&checkpoint),
             Err(ContextError::Unavailable(_))
         ));
-        store
-            .parts
-            .lifecycle
-            .remove(store.checkpoint_redaction_key())
-            .unwrap();
+        let mut batch = db.kernel.batch();
+        batch.remove(&store.parts.lifecycle, store.checkpoint_redaction_key());
+        batch.commit().unwrap();
         assert!(matches!(
             store.read(&checkpoint),
             Err(ContextError::Unavailable(_))
         ));
-        let mut batch = db.durable_batch();
+        let mut batch = db.kernel.batch();
         assert_eq!(store.advance_availability_epoch(&mut batch).unwrap(), 3);
         batch.commit().unwrap();
         assert_eq!(store.checkpoint_redaction_epoch_locked().unwrap(), 2);

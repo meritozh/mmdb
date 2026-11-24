@@ -96,7 +96,7 @@ fn find_bytes(haystack: &[u8], needle: &[u8], table: &[usize]) -> Option<usize> 
 impl ContextStore<'_> {
     pub(crate) fn replace_postings(
         &self,
-        batch: &mut fjall::Batch,
+        batch: &mut mmdb_kernel::Batch,
         header: &RecordHeader,
         properties: Option<&Properties>,
     ) -> ContextResult<()> {
@@ -131,7 +131,7 @@ impl ContextStore<'_> {
 
     pub(crate) fn replace_adjacency(
         &self,
-        batch: &mut fjall::Batch,
+        batch: &mut mmdb_kernel::Batch,
         previous: Option<&RecordHeader>,
         header: &RecordHeader,
     ) -> ContextResult<()> {
@@ -201,7 +201,7 @@ impl ContextStore<'_> {
             ));
         }
         let mut memo = BTreeMap::new();
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         let endpoint = self.head_locked(&query.endpoint)?;
         if self
             .current_candidate(&endpoint.pin, query.valid_at_ms, &mut memo)?
@@ -306,7 +306,7 @@ impl ContextStore<'_> {
             ));
         }
         let mut memo = BTreeMap::new();
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         let mut candidates: BTreeMap<ContextRef, (RecordPin, usize, Vec<RecordPin>)> =
             BTreeMap::new();
         let mut candidates_examined = 0;
@@ -465,7 +465,7 @@ impl ContextStore<'_> {
         if let Some(session) = &query.session {
             validate_name(session, "session")?;
         }
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         let needle = query.text.as_bytes().to_ascii_lowercase();
         let table = prefix_table(&needle);
         let digest = self.digest(

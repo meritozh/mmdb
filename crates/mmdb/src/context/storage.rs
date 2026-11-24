@@ -189,12 +189,12 @@ impl ContextStore<'_> {
     }
 
     pub fn head(&self, record: &ContextRef) -> ContextResult<RecordHeader> {
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         self.head_locked(record)
     }
 
     pub fn inspect_header(&self, pin: &RecordPin) -> ContextResult<RecordHeader> {
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         self.header_locked(pin)
     }
 
@@ -381,15 +381,20 @@ impl ContextStore<'_> {
     }
 
     pub(crate) fn digest<T: Serialize>(&self, domain: &str, input: &T) -> ContextResult<[u8; 32]> {
-        let mut h = blake3::Hasher::new_keyed(&self.db.digest_key);
-        h.update(b"mmdb-context-v1\0");
+        let mut h = self.db.kernel.keyed_hasher("context-operation");
         h.update(domain.as_bytes());
         h.update(&encode(&(&self.access.owner, self.provenance(), input))?);
         Ok(*h.finalize().as_bytes())
     }
 
     pub(crate) fn content_digest(&self, bytes: &[u8]) -> [u8; 32] {
-        *blake3::keyed_hash(&self.db.digest_key, bytes).as_bytes()
+        *self
+            .db
+            .kernel
+            .keyed_hasher("context-content")
+            .update(bytes)
+            .finalize()
+            .as_bytes()
     }
 
     pub(crate) fn stored_operation(
@@ -404,7 +409,7 @@ impl ContextStore<'_> {
     }
 
     pub fn operation_receipt(&self, operation: OperationId) -> ContextResult<Option<WriteReceipt>> {
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         let stored = self.stored_operation(operation)?;
         if let Some(stored) = &stored {
             self.header_locked(&stored.receipt.pin)?;
@@ -429,7 +434,7 @@ impl ContextStore<'_> {
 
     pub(crate) fn commit_operation(
         &self,
-        mut batch: fjall::Batch,
+        mut batch: mmdb_kernel::Batch,
         operation: OperationId,
         digest: [u8; 32],
         receipt: WriteReceipt,
@@ -458,7 +463,7 @@ impl ContextStore<'_> {
 
     pub(crate) fn put_header(
         &self,
-        batch: &mut fjall::Batch,
+        batch: &mut mmdb_kernel::Batch,
         header: &RecordHeader,
     ) -> ContextResult<()> {
         batch.insert(
@@ -474,7 +479,12 @@ impl ContextStore<'_> {
         Ok(())
     }
 
-    pub(crate) fn put_payload(&self, batch: &mut fjall::Batch, pin: &RecordPin, bytes: &[u8]) {
+    pub(crate) fn put_payload(
+        &self,
+        batch: &mut mmdb_kernel::Batch,
+        pin: &RecordPin,
+        bytes: &[u8],
+    ) {
         for (chunk, bytes) in bytes.chunks(PAYLOAD_CHUNK_BYTES).enumerate() {
             let mut value = Vec::with_capacity(32 + bytes.len());
             value.extend_from_slice(&self.content_digest(bytes));
@@ -541,7 +551,7 @@ impl ContextStore<'_> {
         offset: u64,
         limit: usize,
     ) -> ContextResult<PayloadPage> {
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         let header = self.header_locked(pin)?;
         if !self.available_locked(pin, false)? {
             return Err(ContextError::Unavailable(pin.record.clone()));
@@ -596,7 +606,7 @@ impl ContextStore<'_> {
     }
 
     pub fn read(&self, pin: &RecordPin) -> ContextResult<ContextRecord> {
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         self.read_locked(pin)
     }
 

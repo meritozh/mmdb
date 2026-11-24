@@ -7,7 +7,7 @@
 //!   same id returns the cached receipt (`replayed = true`) with no duplicate
 //!   rows.
 //! * A transaction that crashed after writing its `Incomplete` marker but before
-//!   committing leaves no partial rows (fjall batches commit atomically). The
+//!   committing leaves no partial rows (storage batches commit atomically). The
 //!   next submission notices the marker, clears it, and re-executes.
 
 use crate::context::storage::{decode, encode, owner_key, segment};
@@ -88,13 +88,13 @@ impl ContextStore<'_> {
                 "extraction batch exceeds {MAX_BATCH_SIZE} operations"
             )));
         }
-        let _guard = self.db.lock_write();
+        let _guard = self.db.kernel.write_lock();
         let op_key = extraction_key(&self.access.owner, operation_id);
 
         // Completed memo -> replay.
         if let Some(bytes) = self.parts.extraction_receipts.get(op_key.clone())? {
             let mut receipt: ExtractionReceipt = decode(&bytes)?;
-            let _ = self.parts.extraction_incomplete.remove(op_key.clone())?;
+            self.clear_extraction_marker(&op_key)?;
             receipt.replayed = true;
             return Ok(receipt);
         }
@@ -107,11 +107,11 @@ impl ContextStore<'_> {
             .get(op_key.clone())?
             .is_some()
         {
-            self.parts.extraction_incomplete.remove(op_key.clone())?;
+            self.clear_extraction_marker(&op_key)?;
         }
 
         // Persist the Incomplete marker in its own durable commit first.
-        let mut marker = self.db.durable_batch();
+        let mut marker = self.db.kernel.batch();
         marker.insert(&self.parts.extraction_incomplete, op_key.clone(), b"1");
         marker.commit()?;
 
@@ -127,7 +127,7 @@ impl ContextStore<'_> {
                 match batch.commit() {
                     Ok(()) => Ok(receipt),
                     Err(error) => {
-                        let _ = self.parts.extraction_incomplete.remove(op_key)?;
+                        self.clear_extraction_marker(&op_key)?;
                         Err(ContextError::from(error))
                     }
                 }
@@ -136,12 +136,18 @@ impl ContextStore<'_> {
         }
     }
 
+    fn clear_extraction_marker(&self, key: &[u8]) -> ContextResult<()> {
+        let mut batch = self.db.kernel.batch();
+        batch.remove(&self.parts.extraction_incomplete, key);
+        Ok(batch.commit()?)
+    }
+
     fn build_extraction_batch(
         &self,
         operation_id: Ulid,
         ops: &[ExtractionOp],
-    ) -> ContextResult<(ExtractionReceipt, fjall::Batch)> {
-        let mut batch = self.db.durable_batch();
+    ) -> ContextResult<(ExtractionReceipt, mmdb_kernel::Batch)> {
+        let mut batch = self.db.kernel.batch();
         let mut receipt = ExtractionReceipt {
             operation_id,
             created_objects: Vec::new(),
@@ -290,7 +296,7 @@ impl ContextStore<'_> {
     #[allow(clippy::too_many_arguments)]
     fn write_record(
         &self,
-        batch: &mut fjall::Batch,
+        batch: &mut mmdb_kernel::Batch,
         pin: &RecordPin,
         scope: Scope,
         type_pin: Option<RecordPin>,

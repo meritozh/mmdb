@@ -42,7 +42,7 @@ impl ContextStore<'_> {
         if let Some(after) = after {
             validate_name(after, "session cursor")?;
         }
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         let prefix = owner_key(&self.access.owner);
         let start = after.map_or_else(
             || prefix.clone(),
@@ -96,7 +96,7 @@ impl ContextStore<'_> {
         mut payload: R,
     ) -> ContextResult<WriteReceipt> {
         self.validate_history_input(&input)?;
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         let event_key = identity_key(&self.access.owner, &input.session, &input.event_id);
         let previous_operation = self.stored_operation(operation)?;
         let previous_event: Option<StoredEvent> = self
@@ -145,7 +145,7 @@ impl ContextStore<'_> {
         };
         let pin = self.fresh_pin(RecordKind::History);
         if writing {
-            let mut batch = self.db.durable_batch();
+            let mut batch = self.db.kernel.batch();
             batch.insert(
                 &self.parts.pending,
                 record_key(&pin.record),
@@ -158,7 +158,7 @@ impl ContextStore<'_> {
             batch.commit()?;
         }
         let mut buffer = vec![0; PAYLOAD_CHUNK_BYTES];
-        let mut hasher = blake3::Hasher::new_keyed(&self.db.digest_key);
+        let mut hasher = self.db.kernel.keyed_hasher("context-history-payload");
         let mut length = 0_u64;
         let mut chunk = 0_u64;
         loop {
@@ -182,7 +182,7 @@ impl ContextStore<'_> {
                 let mut value = Vec::with_capacity(32 + used);
                 value.extend_from_slice(&self.content_digest(&buffer[..used]));
                 value.extend_from_slice(&buffer[..used]);
-                let mut batch = self.db.durable_batch();
+                let mut batch = self.db.kernel.batch();
                 batch.insert(&self.parts.payloads, payload_key(&pin, chunk), value);
                 batch.commit()?;
             }
@@ -202,7 +202,7 @@ impl ContextStore<'_> {
             }
             self.header_locked(&previous.receipt.pin)?;
             return self.commit_operation(
-                self.db.durable_batch(),
+                self.db.kernel.batch(),
                 operation,
                 digest,
                 previous.receipt,
@@ -247,7 +247,7 @@ impl ContextStore<'_> {
             pin: pin.clone(),
             history_sequence: Some(next_sequence),
         };
-        let mut batch = self.db.durable_batch();
+        let mut batch = self.db.kernel.batch();
         if let Some((key, state)) = message_transition {
             batch.insert(&self.parts.messages, key, encode(&state)?);
         }
@@ -396,7 +396,7 @@ impl ContextStore<'_> {
     ) -> ContextResult<Option<MessageState>> {
         validate_name(session, "session")?;
         validate_name(message_id, "assistant message identity")?;
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         let head: Option<SessionHead> = self
             .parts
             .history_heads
@@ -469,7 +469,7 @@ impl ContextStore<'_> {
 
     pub(crate) fn withdraw_history(
         &self,
-        batch: &mut fjall::Batch,
+        batch: &mut mmdb_kernel::Batch,
         history: &HistoryEntry,
     ) -> ContextResult<()> {
         let id = match &history.kind {
@@ -562,7 +562,7 @@ impl ContextStore<'_> {
 
     pub fn history_position(&self, session: &str) -> ContextResult<u64> {
         validate_name(session, "session")?;
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         let head: Option<SessionHead> = self
             .parts
             .history_heads
@@ -586,7 +586,7 @@ impl ContextStore<'_> {
     ) -> ContextResult<(Option<RecordHeader>, Option<RecordHeader>)> {
         validate_name(session, "session")?;
         validate_name(call_id, "tool call identity")?;
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         let key = identity_key(&self.access.owner, session, call_id);
         let call = self
             .call_index(session, call_id)?
@@ -613,7 +613,7 @@ impl ContextStore<'_> {
                 "history page limit must be 1..=100".into(),
             ));
         }
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         let prefix = session_key(&self.access.owner, session);
         let mut start = prefix.clone();
         start.extend_from_slice(&after_sequence.to_be_bytes());
@@ -654,7 +654,7 @@ impl ContextStore<'_> {
         if max_chunks == 0 || max_chunks > 4096 || max_uploads == 0 || max_uploads > 100 {
             return Err(ContextError::InvalidInput("invalid cleanup budget".into()));
         }
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         let mut report = RecoveryReport {
             chunks_removed: 0,
             uploads_removed: 0,
@@ -685,7 +685,7 @@ impl ContextStore<'_> {
                 revision_key(&staged.pin)
             };
             let remaining = max_chunks - report.chunks_removed;
-            let mut batch = self.db.durable_batch();
+            let mut batch = self.db.kernel.batch();
             let mut complete = true;
             for (seen, chunk) in self.parts.payloads.prefix(prefix).enumerate() {
                 if seen == remaining {

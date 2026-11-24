@@ -17,7 +17,7 @@ impl ContextStore<'_> {
         operation: OperationId,
         definition: TypeDefinition,
     ) -> ContextResult<WriteReceipt> {
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         self.validate_definition(&definition)?;
         let digest = self.digest("define-type", &definition)?;
         if let Some(receipt) = self.replay(operation, digest)? {
@@ -32,7 +32,7 @@ impl ContextStore<'_> {
                 return Err(ContextError::TypeConflict(definition.name));
             }
             return self.commit_operation(
-                self.db.durable_batch(),
+                self.db.kernel.batch(),
                 operation,
                 digest,
                 WriteReceipt {
@@ -83,7 +83,7 @@ impl ContextStore<'_> {
         expected: RecordPin,
         definition: TypeDefinition,
     ) -> ContextResult<WriteReceipt> {
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         self.validate_definition(&definition)?;
         let digest = self.digest("revise-type", &(&expected, &definition))?;
         if let Some(receipt) = self.replay(operation, digest)? {
@@ -131,7 +131,7 @@ impl ContextStore<'_> {
             history: None,
             checkpoint: None,
         };
-        let mut batch = self.db.durable_batch();
+        let mut batch = self.db.kernel.batch();
         if pin.revision > 1 {
             self.advance_availability_epoch(&mut batch)?;
         }
@@ -158,7 +158,7 @@ impl ContextStore<'_> {
         scope: &Scope,
         name: &str,
     ) -> ContextResult<Option<(RecordPin, TypeDefinition)>> {
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         self.check_scope(scope)?;
         validate_name(name, "type name")?;
         let Some(bytes) = self
@@ -182,7 +182,7 @@ impl ContextStore<'_> {
                 "type page limit must be 1..=100".into(),
             ));
         }
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         let mut prefix = owner_key(&self.access.owner);
         prefix.push(kind_byte(RecordKind::Type));
         let start = if let Some(after) = after {

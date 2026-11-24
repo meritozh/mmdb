@@ -165,7 +165,7 @@ impl ContextStore<'_> {
         op: OperationId,
         entity_ref: EntityRef,
     ) -> ContextResult<EntityIdentity> {
-        let _guard = self.db.lock_write();
+        let _guard = self.db.kernel.write_lock();
         self.check_entity_ref(&entity_ref)?;
         if let Some(existing) = self.identity_locked(&entity_ref)? {
             return Ok(existing);
@@ -211,7 +211,7 @@ impl ContextStore<'_> {
             created_at_ms: now,
             source_operation: Some(op.0),
         };
-        let mut batch = self.db.durable_batch();
+        let mut batch = self.db.kernel.batch();
         self.put_payload(&mut batch, &pin, &bytes);
         self.put_header(&mut batch, &header)?;
         self.replace_postings(&mut batch, &header, Some(&properties))?;
@@ -235,7 +235,7 @@ impl ContextStore<'_> {
 
     /// Look up an entity without creating it.
     pub fn get_entity(&self, entity_ref: &EntityRef) -> ContextResult<Option<EntityIdentity>> {
-        let _guard = self.db.lock_write();
+        let _guard = self.db.kernel.write_lock();
         self.identity_locked(entity_ref)
     }
 
@@ -247,7 +247,7 @@ impl ContextStore<'_> {
         primary: &EntityRef,
         alias: EntityRef,
     ) -> ContextResult<EntityIdentity> {
-        let _guard = self.db.lock_write();
+        let _guard = self.db.kernel.write_lock();
         self.check_entity_ref(primary)?;
         self.check_entity_ref(&alias)?;
         if primary == &alias {
@@ -276,7 +276,7 @@ impl ContextStore<'_> {
             created_at_ms: now,
             source_operation: Some(op.0),
         };
-        let mut batch = self.db.durable_batch();
+        let mut batch = self.db.kernel.batch();
         batch.insert(
             &self.parts.entity_identity,
             identity_key(&self.access.owner, &alias),
@@ -303,7 +303,7 @@ impl ContextStore<'_> {
         source: &EntityRef,
         target: &EntityRef,
     ) -> ContextResult<()> {
-        let _guard = self.db.lock_write();
+        let _guard = self.db.kernel.write_lock();
         self.check_entity_ref(source)?;
         self.check_entity_ref(target)?;
         let source_row = self.identity_locked(source)?.ok_or_else(|| {
@@ -334,7 +334,7 @@ impl ContextStore<'_> {
         {
             return Ok(());
         }
-        let mut batch = self.db.durable_batch();
+        let mut batch = self.db.kernel.batch();
         let mut rewritten = 0usize;
         let prefix = owner_key(&self.access.owner);
         for entry in self.parts.entity_identity.range(prefix.clone()..) {
@@ -379,7 +379,7 @@ impl ContextStore<'_> {
                 "entity list limit must be 1..={MAX_ENTITY_LIST}"
             )));
         }
-        let _guard = self.db.lock_write();
+        let _guard = self.db.kernel.write_lock();
         let prefix = identity_prefix(&self.access.owner, namespace, entity_type);
         let start = match after {
             Some(key) => {
@@ -398,7 +398,7 @@ impl ContextStore<'_> {
             if out.len() >= limit {
                 break;
             }
-            if after.is_some() && row_key == start {
+            if after.is_some() && row_key.as_ref() == start.as_slice() {
                 continue;
             }
             out.push(decode_identity(&value)?.into());

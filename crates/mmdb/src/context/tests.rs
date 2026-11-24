@@ -211,7 +211,9 @@ fn checksum_failure_is_reported_instead_of_returning_modified_source_bytes() {
     let key = storage::payload_key(&receipt.pin, 0);
     let mut bytes = store.parts.payloads.get(&key).unwrap().unwrap().to_vec();
     bytes[32] ^= 1;
-    store.parts.payloads.insert(key, bytes).unwrap();
+    let mut batch = store.db.kernel.batch();
+    batch.insert(&store.parts.payloads, key, bytes);
+    batch.commit().unwrap();
     assert!(matches!(
         store.read_payload(&receipt.pin, 0, 32),
         Err(ContextError::Corrupt(_))
@@ -932,7 +934,9 @@ fn extraction_crash_recovery() {
     // Simulate a previous crash: an Incomplete marker exists but no receipt.
     let mut key = crate::context::storage::owner_key("owner");
     crate::context::storage::segment(&mut key, op.0.to_be_bytes().as_slice());
-    store.parts.extraction_incomplete.insert(key, b"1").unwrap();
+    let mut batch = store.db.kernel.batch();
+    batch.insert(&store.parts.extraction_incomplete, key, b"1");
+    batch.commit().unwrap();
 
     let receipt = block_on(store.extraction_transaction(
         op,

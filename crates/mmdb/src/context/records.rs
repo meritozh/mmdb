@@ -28,7 +28,7 @@ impl ContextStore<'_> {
         if pins.len() > MAX_CONTEXT_SOURCES {
             return Err(ContextError::BudgetExceeded);
         }
-        let guard = self.db.write_lock.lock();
+        let guard = self.db.kernel.write_lock();
         let availability_epoch = self.availability_epoch_locked()?;
         if let Some(expected) = expected_epoch {
             if expected != availability_epoch {
@@ -116,7 +116,7 @@ impl ContextStore<'_> {
         input: ObjectInput,
         endpoints: Option<Endpoints>,
     ) -> ContextResult<WriteReceipt> {
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         let kind = if endpoints.is_some() {
             RecordKind::Relation
         } else {
@@ -195,7 +195,7 @@ impl ContextStore<'_> {
             history: None,
             checkpoint: None,
         };
-        let mut batch = self.db.durable_batch();
+        let mut batch = self.db.kernel.batch();
         if previous.is_some() {
             self.advance_availability_epoch(&mut batch)?;
         }
@@ -262,7 +262,7 @@ impl ContextStore<'_> {
                 "current-valid query limit must be 1..=1000".into(),
             ));
         }
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         let now = crate::now_ms();
         let mut out = Vec::new();
         for kind in [RecordKind::Object, RecordKind::Relation] {
@@ -334,7 +334,7 @@ impl ContextStore<'_> {
         expected: RecordPin,
         state: RecordState,
     ) -> ContextResult<WriteReceipt> {
-        let _guard = self.db.write_lock.lock();
+        let _guard = self.db.kernel.write_lock();
         if expected.record.kind == RecordKind::Type {
             return Err(ContextError::InvalidInput(
                 "type versions cannot be retracted or purged".into(),
@@ -370,7 +370,7 @@ impl ContextStore<'_> {
         header.state = state;
         header.provenance = self.provenance();
         header.recorded_at_ms = super::super::now_ms();
-        let mut batch = self.db.durable_batch();
+        let mut batch = self.db.kernel.batch();
         let epoch = self.advance_availability_epoch(&mut batch)?;
         if state == RecordState::Purged || header.history.is_some() {
             self.invalidate_checkpoint_payloads(&mut batch, epoch)?;
