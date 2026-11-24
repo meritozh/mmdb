@@ -19,7 +19,7 @@ This spec is open until the feature ships, and `/go-work` carries it out. Do not
 | Does: 写入时分配单调序号，切换窗口仍追加到原会话 | `SessionLog::append` | `concurrent_appends_allocate_one_session_order` |
 | Does 追加：事件 ID、预期位置、重试取回原序号、同身份不同内容冲突、完整写入后一起发布 | `SessionLog::append`、`records::Scoped::replay` | `append_retries_preserve_identity_and_order_even_after_later_events`、`committed_history_survives_a_lost_acknowledgement_without_duplication`、`one_operation_id_names_one_write_across_the_log_and_context`（新）、`a_log_retry_after_a_memory_reset_returns_the_original_receipt`（新） |
 | Does 消息：撤回或清除一个事件后整条消息不可读；工具结果关联同会话唯一调用，调用不可读时结果也不可读 | `session::LogGate` 与消息状态、工具调用索引 | `a_withdrawn_fragment_hides_its_whole_message`（新）、`tool_results_require_their_call_and_follow_its_purge_state` |
-| Does 来源：追加时来源必须可读；日志事件写入后只读；读取需要来源的 scope；当前检查照常沿来源；清除日志事件后派生内容不可用 | `records::Scoped` 的来源检查与 `session::LogGate` | `log_copies_stay_readable_after_their_sources_change`（改写自 `history_copies_old_object_and_type_pins_but_purge_blocks_object_copies`）、`copied_history_tracks_source_availability_and_session_catalog_pages`（改写：来源变化只影响当前检查）、`a_log_copy_needs_the_scopes_of_its_sources`（新）、`purging_a_log_event_hides_what_was_derived_from_it`（新）、`tool_results_link_historical_call_sources_and_still_follow_purge` |
+| Does 来源：追加时来源必须可读；日志事件写入后只读；读取需要来源的 scope；当前检查照常沿来源；清除日志事件后派生内容不可用 | `records::Scoped` 的来源检查与 `session::LogGate` | `log_copies_stay_readable_after_their_sources_change`（改写自 `history_copies_old_object_and_type_pins_but_purge_blocks_object_copies`）、`copied_history_tracks_source_availability_and_session_catalog_pages`（改写：来源变化只影响当前检查）、`a_log_copy_needs_the_scopes_of_its_sources`（新）、`purging_a_log_event_hides_what_was_derived_from_it`（新）、`tool_results_stay_readable_after_their_call_source_is_purged`（改写自 `tool_results_link_historical_call_sources_and_still_follow_purge`）、`live_revision_keeps_checkpoint_derived_originals_and_pairs_the_completed_tool`（改写：清除原始日志事件后，检查点和派生对象不可读，调用和结果仍可读、不再通过当前检查） |
 | Does 读取：按位置翻页、按 pin 读载荷、列出会话、工具调用配对 | `SessionLog::{events, read_payload, sessions, tool_pair}` | `complete_large_history_is_searchable_across_chunks_and_query_pages`、`copied_history_tracks_source_availability_and_session_catalog_pages` |
 | Does 搜索：固定引用、字节位置、续查游标、跨块与跨页、跨会话按键序、同会话按序号、大小写规则 | `SessionLog::search` | `complete_large_history_is_searchable_across_chunks_and_query_pages`、`search_walks_sessions_in_key_order_and_events_in_sequence`（新） |
 | Does 重置记忆：计划、凭摘要提交、一次提交换 era、旧记录立刻不可见、清理旧分区、会话模块不受影响 | `Store::{plan_memory_reset, reset_memory}`、`Kernel::{prepare_module_reset, commit_module_reset}` | `memory_reset_keeps_the_session_log_and_hides_old_memory`（新） |
@@ -39,7 +39,8 @@ This spec is open until the feature ships, and `/go-work` carries it out. Do not
 
 Replaces:
 - `reset_creates_a_new_context_era_without_importing_previous_history`：改写为整库重置测试。
-- `history_copies_old_object_and_type_pins_but_purge_blocks_object_copies`：改写为只读规则的测试。
+- `history_copies_old_object_and_type_pins_but_purge_blocks_object_copies`、`tool_results_link_historical_call_sources_and_still_follow_purge`，以及 `live_revision_keeps_checkpoint_derived_originals_and_pairs_the_completed_tool` 末尾的清除断言：改写为只读规则的测试。
+- `context/checkpoints.rs` 的 `missing_and_stale_visibility_markers_do_not_restore_old_checkpoint_payloads`：它测的是第 13 步删去的旧写入者兼容分支，随之删除。
 - `native_memory.rs` 中检查 `native_internal_metadata_v1` 与 `StoreEraMismatch` 的测试：元数据改由内核持有，改写为 kernel 测试 `store_metadata_is_created_once_and_checked_against_the_manifest`。
 - `native_memory.rs` 测试里对 `MEMORY_STORE_FORMAT_ID` 的断言：随格式 ID 改写。
 
@@ -682,6 +683,9 @@ reconcile_runtime_memory_era(&runtime, &receipt.new_memory_era.to_string())?;
    - 测试：
      - 改写 `history_copies_old_object_and_type_pins_but_purge_blocks_object_copies`，成为 `log_copies_stay_readable_after_their_sources_change`；
      - 改写 `copied_history_tracks_source_availability_and_session_catalog_pages`；
+     - 改写 `tool_results_link_historical_call_sources_and_still_follow_purge`，成为 `tool_results_stay_readable_after_their_call_source_is_purged`：清除调用引用的对象后，调用和结果仍可读，当前检查失败；清除调用本身后，结果不可读；
+     - 改写 `live_revision_keeps_checkpoint_derived_originals_and_pairs_the_completed_tool` 末尾的断言：清除原始日志事件后，检查点和派生对象不可读，调用和结果仍可读；
+     - 现有测试里，凡是断言「日志事件或工具结果因为来源被清除、撤回或修订而读不到」的，都照同样的规则改写：事件仍可读，当前检查失败；
      - 加入 `a_log_copy_needs_the_scopes_of_its_sources`、`purging_a_log_event_hides_what_was_derived_from_it`、`a_withdrawn_fragment_hides_its_whole_message`。
    - After: 3. Check: `cargo test --workspace --locked`
 5. 在 `mmdb-kernel` 里加入内核存储。
@@ -709,7 +713,7 @@ reconcile_runtime_memory_era(&runtime, &receipt.new_memory_era.to_string())?;
    - `MemoryDatabase` 的四个打开函数改走 `Kernel`，只有一个 `memory` 模块，内部经 `MemoryDatabase::on_era` 打开。
    - 原生元数据分区交给内核。
    - 格式改为 `mmdb-context-dev7` 和 `mmdb-native-memory-dev7`，同步原生测试里的格式断言。
-   - `native_memory`、`context`、`entity`、`extraction` 里的 fjall 类型全部换成内核类型。
+   - `native_memory`、`context`、`entity`、`extraction` 里的 fjall 类型全部换成内核类型。crate 内部测试里直接写分区的地方（注入损坏、模拟旧写入者）改用 `Batch`。
    - After: 6. Check: `cargo test --workspace --locked`
 8. 从领域上下文抽出记录层，只重构。
    - 新增 `records::{Records, RecordTable, Scoped, Gate, Availability, StreamedPayload, HeadPage}`，此时仍只有一张表。
@@ -733,7 +737,7 @@ reconcile_runtime_memory_era(&runtime, &receipt.new_memory_era.to_string())?;
 10. 加入会话模块。
     - `context/history.rs`、`checkpoints.rs` 和 `search_history` 搬进 `session/`。`SessionLog`（先沿用旧方法名）和 `LogGate` 也放在这里，由 `Store::session_log` 提供。
     - `ContextStore` 删去日志方法：保留只用于记忆种类的 `read_payload`；召回只返回记忆记录；所有句柄先检查记录种类。
-    - 日志相关测试改用 `store.session_log`。
+    - 日志相关测试改用 `store.session_log`：对日志事件的 `read` 改用 `SessionLog::read_payload`，对检查点的 `read` 改用 `read_checkpoint`；`validate_current` 仍在 `ContextStore` 上。
     - 新测试：`session_log_and_context_reject_the_same_invalid_access`、`access_bound_to_a_session_appends_only_to_it`、`log_permissions_follow_the_actor`、`log_reads_and_searches_refuse_budgets_over_their_limits`、`search_walks_sessions_in_key_order_and_events_in_sequence`、`a_streaming_append_blocks_memory_writes_until_it_ends`、`recall_reaches_through_log_events_but_returns_memory_records`、`one_operation_id_names_one_write_across_the_log_and_context`。
     - `tests/layering.rs` 加上 `src/session/`。
     - 磁盘布局不变。
@@ -755,7 +759,8 @@ reconcile_runtime_memory_era(&runtime, &receipt.new_memory_era.to_string())?;
       - `memory_reset_needs_the_exact_plan_digest`；
       - `memory_reset_keeps_the_session_log_and_hides_old_memory`：先写入原生证据、本体对象和关系、动作、以记忆为来源的日志事件、会话和运行检查点，以及一个日志回执；重置并重开后，断言日志可读、能追加下一个序号、读取旧记忆返回 `Reset`、原生召回为空；
       - `log_events_that_copied_reset_memory_stay_readable_and_current`、`checkpoints_saved_before_a_memory_reset_cannot_resume`、`a_checkpoint_generated_before_a_memory_reset_is_refused`、`a_log_retry_after_a_memory_reset_returns_the_original_receipt`、`reset_purged_and_foreign_refs_fail_differently`、`memory_reset_refuses_a_plan_for_another_time_era_or_directory`、`a_failed_memory_reset_leaves_the_store_usable`；
-      - 改写 `whole_store_reset_quarantines_the_directory_and_starts_new_eras`。
+      - 改写 `whole_store_reset_quarantines_the_directory_and_starts_new_eras`；
+      - 删除 `missing_and_stale_visibility_markers_do_not_restore_old_checkpoint_payloads`。
     - 文档与收尾：
       - 更新 AGENTS.md 的重置 gotcha 和 README；
       - 把 session-log 和 context-checkpoints 两份 feature doc 中指向已搬走文件的链接改到 `session/`；
