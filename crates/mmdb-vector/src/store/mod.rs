@@ -14,7 +14,7 @@ use dashmap::DashMap;
 use fjall::{Keyspace, PartitionCreateOptions, PartitionHandle};
 use mmdb_core::{Error, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{atomic::AtomicUsize, Arc};
 use ulid::Ulid;
 
@@ -72,13 +72,15 @@ pub(crate) struct SnapshotManifest {
 }
 
 impl VectorStore {
-    pub fn open(keyspace: Keyspace) -> Result<Self> {
-        Self::open_with_snapshot_dir(keyspace, None::<PathBuf>)
+    /// Keep HNSW snapshots in `vector_hnsw_snapshots/` under the MMDB root.
+    pub fn open(keyspace: Keyspace, root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_snapshot_dir(keyspace, root.as_ref().join(SNAPSHOT_DIR_NAME))
     }
 
+    /// Read and write this store's HNSW snapshots in the supplied directory.
     pub fn open_with_snapshot_dir(
         keyspace: Keyspace,
-        snapshot_dir: impl Into<Option<PathBuf>>,
+        snapshot_dir: impl Into<PathBuf>,
     ) -> Result<Self> {
         let meta = keyspace
             .open_partition(PART_META, PartitionCreateOptions::default())
@@ -89,16 +91,12 @@ impl VectorStore {
         let tomb = keyspace
             .open_partition(PART_TOMB, PartitionCreateOptions::default())
             .map_err(|e| Error::Storage(e.to_string()))?;
-        let snapshot_dir = snapshot_dir
-            .into()
-            .unwrap_or_else(|| snapshot::default_snapshot_dir(&meta));
-
         let s = Self {
             keyspace,
             meta,
             rev,
             tomb,
-            snapshot_dir,
+            snapshot_dir: snapshot_dir.into(),
             indices: DashMap::new(),
             snapshot_reloads: AtomicUsize::new(0),
             model_names: DashMap::new(),

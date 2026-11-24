@@ -77,7 +77,7 @@ impl Database {
     ) -> Result<Self> {
         let path = path.as_ref();
         let storage = Arc::new(Storage::open(path)?);
-        let vector_store = Arc::new(VectorStore::open(storage.keyspace.clone())?);
+        let vector_store = Arc::new(VectorStore::open(storage.keyspace.clone(), path)?);
         let graph_store = Arc::new(GraphStore::open(storage.keyspace.clone())?);
         let blob_store = Arc::new(BlobStore::open(path)?);
         let audit_store = Arc::new(AuditStore::open(storage.keyspace.clone())?);

@@ -22,7 +22,9 @@ It wraps HNSW search while keeping a fjall-backed source of truth for rebuilds.
 | `vector_tomb` | `[tenant][model_hash][internal_id]` | empty tombstone marker |
 
 `vector_meta` is the durable source of truth. HNSW graph dumps are only a
-cold-start optimization.
+cold-start optimization. `VectorStore::open` takes the MMDB root and stores
+snapshots under `vector_hnsw_snapshots/` there. Use
+`VectorStore::open_with_snapshot_dir` to supply the snapshot directory directly.
 
 ## Model Identity
 

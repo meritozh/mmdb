@@ -41,7 +41,7 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
 fn main() {
     let dir = tempdir().unwrap();
     let ks = Config::new(dir.path()).open().unwrap();
-    let store = VectorStore::open(ks).unwrap();
+    let store = VectorStore::open(ks, dir.path()).unwrap();
 
     let mut seed: u64 = 0xdead_beef_cafe_babe;
     // Build dataset

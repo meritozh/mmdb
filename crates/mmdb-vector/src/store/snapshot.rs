@@ -1,9 +1,6 @@
 use super::keys::*;
-use super::{
-    RebuildGroup, SnapshotManifest, VectorStore, SNAPSHOT_DIR_NAME, SNAPSHOT_MANIFEST_VERSION,
-};
+use super::{RebuildGroup, SnapshotManifest, VectorStore, SNAPSHOT_MANIFEST_VERSION};
 use crate::{IndexKey, VectorIndex};
-use fjall::PartitionHandle;
 use mmdb_core::{Error, Result};
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
@@ -245,14 +242,6 @@ impl VectorStore {
         }
         Ok(max_internal_id)
     }
-}
-
-pub(super) fn default_snapshot_dir(meta: &PartitionHandle) -> PathBuf {
-    meta.path()
-        .parent()
-        .and_then(Path::parent)
-        .unwrap_or_else(|| meta.path())
-        .join(SNAPSHOT_DIR_NAME)
 }
 
 pub(super) fn snapshot_basename(tenant: u32, mh: u32) -> String {
