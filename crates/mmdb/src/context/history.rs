@@ -1,6 +1,6 @@
-use super::super::{Actor, OperationId, RecordState, Scope, TemporalFacts};
 use super::storage::*;
 use super::*;
+use crate::{Actor, OperationId, RecordState, Scope, TemporalFacts};
 use serde::{Deserialize, Serialize};
 use std::io::{ErrorKind, Read};
 

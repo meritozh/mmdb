@@ -1,6 +1,6 @@
-use super::super::{OperationId, RecordState, TemporalFacts};
 use super::storage::*;
 use super::*;
+use crate::{OperationId, RecordState, TemporalFacts};
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CheckpointVisibility {
@@ -254,7 +254,7 @@ fn checkpoint_key(owner: &str, session: &str, scope: CheckpointScope, run: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_memory::{Actor, Scope};
+    use crate::{Actor, Scope};
 
     #[test]
     fn missing_and_stale_visibility_markers_do_not_restore_old_checkpoint_payloads() {

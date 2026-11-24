@@ -1,5 +1,5 @@
-use super::super::{Actor, OperationId, RecordState, Scope};
 use super::*;
+use crate::{Actor, OperationId, RecordState, Scope};
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use ulid::Ulid;

@@ -16,7 +16,7 @@ use crate::context::{
     ContextError, ContextRef, ContextResult, ContextStore, InformationKind, Properties,
     RecordHeader, RecordKind, RecordPin, TypeKind,
 };
-use crate::native_memory::{OperationId, RecordState, Scope, TemporalFacts};
+use crate::{OperationId, RecordState, Scope, TemporalFacts};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;

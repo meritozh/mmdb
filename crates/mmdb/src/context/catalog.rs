@@ -1,6 +1,6 @@
-use super::super::{OperationId, RecordState, Scope, TemporalFacts};
 use super::storage::*;
 use super::*;
+use crate::{OperationId, RecordState, Scope, TemporalFacts};
 use serde_json::Value;
 use std::collections::BTreeMap;
 

@@ -1,7 +1,8 @@
 //! Native acceptance on a temporary copy of a closed real-task context store.
 //! Usage: verify_context_lifecycle STORE BUSINESS_PINS_JSON REPORT_JSON
 use mmdb::context::*;
-use mmdb::native_memory::{Actor, MemoryDatabase, OperationId, Scope, TemporalFacts};
+use mmdb::native_memory::MemoryDatabase;
+use mmdb::{Actor, OperationId, Scope, TemporalFacts};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::Path;

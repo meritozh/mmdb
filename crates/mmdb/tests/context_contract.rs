@@ -1,5 +1,6 @@
 use mmdb::context::*;
-use mmdb::native_memory::{Actor, MemoryDatabase, OperationId, RecordState, Scope, TemporalFacts};
+use mmdb::native_memory::MemoryDatabase;
+use mmdb::{Actor, OperationId, RecordState, Scope, TemporalFacts};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read};

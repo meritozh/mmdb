@@ -15,7 +15,7 @@ use crate::context::{
     ContextError, ContextRef, ContextResult, ContextStore, Endpoints, InformationKind, Properties,
     RecordHeader, RecordKind, RecordPin, TypeKind,
 };
-use crate::native_memory::{OperationId, RecordState, Scope, TemporalFacts};
+use crate::{OperationId, RecordState, Scope, TemporalFacts};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use ulid::Ulid;

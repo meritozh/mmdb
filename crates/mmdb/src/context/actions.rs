@@ -1,6 +1,6 @@
-use super::super::{Actor, OperationId, RecordState, Scope, TemporalFacts};
 use super::storage::*;
 use super::*;
+use crate::{Actor, OperationId, RecordState, Scope, TemporalFacts};
 use serde_json::Value;
 
 fn action_name_key(owner: &str, scope: &Scope, name: &str) -> ContextResult<Vec<u8>> {
@@ -462,7 +462,7 @@ impl ContextStore<'_> {
             || !self
                 .header_locked(pin)?
                 .temporal
-                .contains_valid_time(super::super::now_ms())
+                .is_valid_at(super::super::now_ms())
         {
             return Err(ContextError::Unavailable(pin.record.clone()));
         }

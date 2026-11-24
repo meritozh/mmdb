@@ -60,10 +60,12 @@ pub mod native_memory;
 pub use native_memory::context;
 mod query_impl;
 mod recall;
+mod records;
 mod runtime;
 mod search;
 mod state;
-pub use mmdb_kernel::store_format;
+pub use mmdb_kernel::{store_format, EraId, OperationId};
+pub use records::{Actor, RecordState, Scope, TemporalFacts, MAX_ACCESS_SCOPES};
 #[cfg(test)]
 mod tests;
 

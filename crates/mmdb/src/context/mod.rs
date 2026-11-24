@@ -18,7 +18,9 @@ mod tests;
 
 pub use types::*;
 
-use super::{MemoryDatabase, MemoryError, MemoryResult, OperationId};
+use super::{MemoryDatabase, MemoryError, MemoryResult};
+use crate::records::InvalidTemporalFacts;
+use crate::{OperationId, MAX_ACCESS_SCOPES};
 use fjall::{Keyspace, PartitionHandle};
 use std::fmt;
 
@@ -76,6 +78,11 @@ impl std::error::Error for ContextError {}
 impl From<MemoryError> for ContextError {
     fn from(e: MemoryError) -> Self {
         Self::Native(e)
+    }
+}
+impl From<InvalidTemporalFacts> for ContextError {
+    fn from(error: InvalidTemporalFacts) -> Self {
+        Self::InvalidInput(error.to_string())
     }
 }
 impl From<std::io::Error> for ContextError {
@@ -204,7 +211,7 @@ impl MemoryDatabase {
                 "a child run requires a distinct parent identity".into(),
             ));
         }
-        if access.scopes.is_empty() || access.scopes.len() > super::MAX_RECALL_SCOPES {
+        if access.scopes.is_empty() || access.scopes.len() > MAX_ACCESS_SCOPES {
             return Err(ContextError::InvalidInput(
                 "provide 1..=32 allowed scopes".into(),
             ));

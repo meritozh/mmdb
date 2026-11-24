@@ -1,6 +1,6 @@
-use super::super::{Actor, OperationId, RecordState, Scope};
 use super::storage::*;
 use super::*;
+use crate::{Actor, OperationId, RecordState, Scope};
 use ulid::Ulid;
 
 impl ContextStore<'_> {
@@ -43,7 +43,7 @@ impl ContextStore<'_> {
             let head = self.head_locked(&pin.record)?;
             if head.pin != *pin
                 || !self.available_memoized(pin, true, &mut memo)?
-                || valid_at_ms.is_some_and(|at| !head.temporal.contains_valid_time(at))
+                || valid_at_ms.is_some_and(|at| !head.temporal.is_valid_at(at))
             {
                 return Err(ContextError::Unavailable(pin.record.clone()));
             }

@@ -1,6 +1,7 @@
 //! A deterministic pair of harnesses sharing a context store across reopen.
 use mmdb::context::*;
-use mmdb::native_memory::{Actor, MemoryDatabase, OperationId, Scope, TemporalFacts};
+use mmdb::native_memory::MemoryDatabase;
+use mmdb::{Actor, OperationId, Scope, TemporalFacts};
 use serde_json::json;
 use std::collections::BTreeMap;
 

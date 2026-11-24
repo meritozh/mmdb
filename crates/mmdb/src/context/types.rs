@@ -1,4 +1,4 @@
-use super::super::{Actor, EraId, OperationId, RecordState, Scope, TemporalFacts};
+use crate::{Actor, EraId, OperationId, RecordState, Scope, TemporalFacts};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;

@@ -1,5 +1,5 @@
-use super::super::{Actor, OperationId, RecordState, Scope, TemporalFacts};
 use super::*;
+use crate::{Actor, OperationId, RecordState, Scope, TemporalFacts};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;

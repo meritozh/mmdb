@@ -4,6 +4,8 @@
 //! legacy `MemoryNode` database.  The manifest is checked before fjall is opened,
 //! so an old or otherwise unrecognised root is never adopted accidentally.
 
+use crate::records::InvalidTemporalFacts;
+use crate::{Actor, EraId, OperationId, RecordState, Scope, TemporalFacts, MAX_ACCESS_SCOPES};
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
 use mmdb_kernel::store_format::{
     require_managed_store, StoreEraId, StoreFormatError, StoreLease,
@@ -85,7 +87,6 @@ const PART_OPERATIONS: &str = "native_operations_v1";
 const MAX_RECALL_LIMIT: usize = 100;
 const MAX_RECALL_TERMS: usize = 64;
 const MAX_RECALL_CANDIDATES: usize = 4_096;
-pub const MAX_RECALL_SCOPES: usize = 32;
 pub const MAX_TEXT_BYTES: usize = 64 * 1024;
 /// Exact observations may be larger than derived semantic text. This keeps a
 /// normal long-form user turn lossless while retaining a hard per-record cap.
@@ -149,8 +150,6 @@ macro_rules! id_type {
     };
 }
 
-id_type!(EraId);
-id_type!(OperationId);
 id_type!(EvidenceId);
 id_type!(ClaimId);
 id_type!(RelationId);
@@ -296,15 +295,13 @@ impl From<StoreFormatError> for MemoryError {
     }
 }
 
-pub type MemoryResult<T> = std::result::Result<T, MemoryError>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Actor {
-    User,
-    Assistant,
-    System,
-    Operator,
+impl From<InvalidTemporalFacts> for MemoryError {
+    fn from(error: InvalidTemporalFacts) -> Self {
+        Self::InvalidInput(error.to_string())
+    }
 }
+
+pub type MemoryResult<T> = std::result::Result<T, MemoryError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationContext {
@@ -319,70 +316,6 @@ impl OperationContext {
             actor,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum Scope {
-    Personal,
-    Workspace(Ulid),
-    Session(Ulid),
-    Artifact(Ulid),
-    System,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TemporalFacts {
-    pub observed_at_ms: i64,
-    pub source_at_ms: Option<i64>,
-    pub valid_from_ms: Option<i64>,
-    pub valid_to_ms: Option<i64>,
-}
-
-impl TemporalFacts {
-    pub fn observed_at(observed_at_ms: i64) -> Self {
-        Self {
-            observed_at_ms,
-            source_at_ms: None,
-            valid_from_ms: None,
-            valid_to_ms: None,
-        }
-    }
-
-    fn validate(self) -> MemoryResult<()> {
-        if let (Some(from), Some(to)) = (self.valid_from_ms, self.valid_to_ms) {
-            if from >= to {
-                return Err(MemoryError::InvalidInput(
-                    "valid time must use a non-empty [from, to) interval".into(),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn contains_valid_time(self, at_ms: i64) -> bool {
-        self.valid_from_ms.is_none_or(|from| at_ms >= from)
-            && self.valid_to_ms.is_none_or(|to| at_ms < to)
-    }
-
-    /// Whether `at_ms` falls inside the record's explicit valid-time window.
-    ///
-    /// This deliberately only reasons about *valid time* (when the fact holds in
-    /// the world). It is distinct from `observed_at_ms`, which records when the
-    /// observation was captured, and from `recorded_at_ms` on the header, which
-    /// is when the row was written to the store. The three concepts are kept on
-    /// separate fields so they can never be conflated.
-    pub fn is_valid_at(&self, at_ms: i64) -> bool {
-        self.contains_valid_time(at_ms)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RecordState {
-    Active,
-    Retracted,
-    Superseded,
-    Unsupported,
-    Purged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -5002,9 +4935,9 @@ impl MemoryDatabase {
                 "recall requires at least one visible scope".into(),
             ));
         }
-        if query.scopes.len() > MAX_RECALL_SCOPES {
+        if query.scopes.len() > MAX_ACCESS_SCOPES {
             return Err(MemoryError::InvalidInput(format!(
-                "recall cannot include more than {MAX_RECALL_SCOPES} visible scopes"
+                "recall cannot include more than {MAX_ACCESS_SCOPES} visible scopes"
             )));
         }
         if let (Some(from), Some(to)) = (query.observed_from_ms, query.observed_to_ms) {
@@ -5084,7 +5017,7 @@ impl MemoryDatabase {
             }
             if query
                 .valid_at_ms
-                .is_some_and(|at| !citation.temporal.contains_valid_time(at))
+                .is_some_and(|at| !citation.temporal.is_valid_at(at))
             {
                 continue;
             }
@@ -9658,7 +9591,7 @@ mod tests {
     #[test]
     fn recall_rejects_an_unbounded_scope_set() {
         let (_parent, _root, database) = create_test_database();
-        let scopes = (0..=MAX_RECALL_SCOPES)
+        let scopes = (0..=MAX_ACCESS_SCOPES)
             .map(|_| Scope::Session(Ulid::new()))
             .collect();
 

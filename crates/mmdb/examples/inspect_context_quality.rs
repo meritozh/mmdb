@@ -1,7 +1,8 @@
 //! Independent, read-only acceptance of a real harness-created context store.
 //! Usage: cargo run -p mmdb --example inspect_context_quality -- STORE REPORT
 use mmdb::context::*;
-use mmdb::native_memory::{Actor, MemoryDatabase};
+use mmdb::native_memory::MemoryDatabase;
+use mmdb::Actor;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;

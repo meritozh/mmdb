@@ -1,6 +1,6 @@
-use super::super::{RecordState, Scope};
 use super::storage::*;
 use super::*;
+use crate::{RecordState, Scope};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 fn is_cjk(c: char) -> bool {
@@ -170,7 +170,7 @@ impl ContextStore<'_> {
             Err(ContextError::AccessDenied | ContextError::NotFound(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
-        if at.is_some_and(|at| !header.temporal.contains_valid_time(at))
+        if at.is_some_and(|at| !header.temporal.is_valid_at(at))
             || !self.available_memoized(pin, true, memo)?
         {
             return Ok(None);
@@ -182,7 +182,7 @@ impl ContextStore<'_> {
                     Err(ContextError::AccessDenied | ContextError::NotFound(_)) => return Ok(None),
                     Err(error) => return Err(error),
                 };
-                if at.is_some_and(|at| !endpoint.temporal.contains_valid_time(at))
+                if at.is_some_and(|at| !endpoint.temporal.is_valid_at(at))
                     || !self.available_memoized(&endpoint.pin, true, memo)?
                 {
                     return Ok(None);
