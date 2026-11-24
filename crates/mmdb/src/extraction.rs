@@ -280,6 +280,9 @@ impl ContextStore<'_> {
                 }
             }
         }
+        if !receipt.revised_objects.is_empty() || !receipt.revised_relations.is_empty() {
+            self.advance_availability_epoch(&mut batch)?;
+        }
         Ok((receipt, batch))
     }
 

@@ -131,6 +131,9 @@ impl ContextStore<'_> {
             checkpoint: None,
         };
         let mut batch = self.db.durable_batch();
+        if pin.revision > 1 {
+            self.advance_availability_epoch(&mut batch)?;
+        }
         self.put_payload(&mut batch, &pin, &bytes);
         self.put_header(&mut batch, &header)?;
         batch.insert(

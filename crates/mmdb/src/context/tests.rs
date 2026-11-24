@@ -684,6 +684,83 @@ fn entity_merge_idempotent() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn revising_a_type_or_extracting_advances_the_availability_epoch() {
+    let (_dir, store) = fresh_store();
+    let anchor = history_source(&store, "session", "anchor");
+    let original = object_type(&store, "note");
+    let checkpoint = |previous| {
+        store
+            .save_checkpoint(
+                OperationId::new(),
+                CheckpointInput {
+                    scope: CheckpointScope::Session,
+                    session: "session".into(),
+                    run: "run".into(),
+                    history_sequence: 1,
+                    expected_previous: previous,
+                    expected_availability_epoch: store.availability_epoch().unwrap(),
+                    sources: vec![anchor.clone()],
+                    payload: json!("summary"),
+                },
+            )
+            .unwrap()
+            .pin
+    };
+    let assert_stale = |pin: &RecordPin| {
+        assert!(matches!(
+            store.validate_current(std::slice::from_ref(pin), None),
+            Err(ContextError::Unavailable(record)) if record == pin.record
+        ));
+        assert!(store.read(pin).is_ok());
+    };
+
+    let first = checkpoint(None);
+    let (_, mut definition) = store.find_type(&Scope::Personal, "note").unwrap().unwrap();
+    definition.properties.clear();
+    let operation = OperationId::new();
+    let revise = |id| store.revise_type(id, original.clone(), definition.clone());
+    let revised = revise(operation).unwrap().pin;
+    assert_stale(&first);
+    assert_eq!(revise(operation).unwrap().pin, revised);
+    assert!(matches!(
+        revise(OperationId::new()),
+        Err(ContextError::RevisionConflict { .. })
+    ));
+    assert_eq!(store.availability_epoch().unwrap(), 1);
+
+    let second = checkpoint(Some(first));
+    let create = ExtractionOp::CreateObject {
+        type_ref: revised,
+        properties: BTreeMap::new(),
+        sources: vec![],
+    };
+    let created = block_on(store.extraction_transaction(Ulid::new(), vec![create; 2])).unwrap();
+    assert_eq!(store.availability_epoch().unwrap(), 1);
+    store
+        .validate_current(std::slice::from_ref(&second), None)
+        .unwrap();
+    let revisions: Vec<_> = created
+        .created_objects
+        .into_iter()
+        .map(|expected| ExtractionOp::ReviseObject {
+            expected,
+            properties: BTreeMap::new(),
+            sources: vec![],
+        })
+        .collect();
+    let extract = |id| block_on(store.extraction_transaction(id, revisions.clone()));
+    let operation = Ulid::new();
+    assert_eq!(extract(operation).unwrap().revised_objects.len(), 2);
+    assert_stale(&second);
+    assert!(extract(operation).unwrap().replayed);
+    assert!(matches!(
+        extract(Ulid::new()),
+        Err(ContextError::RevisionConflict { .. })
+    ));
+    assert_eq!(store.availability_epoch().unwrap(), 2);
+}
+
+#[test]
 fn extraction_batch_creates_objects_and_relations_atomically() {
     let (_dir, store) = fresh_store();
     let obj_type = object_type(&store, "thing");
