@@ -319,7 +319,7 @@ impl ContextStore<'_> {
             recorded_at_ms: now,
             payload: self.scoped.put_payload(batch, pin, &bytes),
             endpoints,
-            history: None,
+            event: None,
             checkpoint: None,
         };
         self.scoped.put_header(batch, &header)?;

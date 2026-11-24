@@ -9,7 +9,7 @@ use mmdb_kernel::{Kernel, KernelError, ModuleId, ModuleSpec};
 use std::fmt;
 use std::path::Path;
 
-pub const STORE_FORMAT_ID: &str = "mmdb-store-dev9";
+pub const STORE_FORMAT_ID: &str = "mmdb-store-dev11";
 const SESSION: ModuleId = ModuleId("session");
 const MEMORY: ModuleId = ModuleId("memory");
 

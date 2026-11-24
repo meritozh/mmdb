@@ -41,7 +41,7 @@ impl ContextStore<'_> {
                 digest,
                 WriteReceipt {
                     pin: header.pin,
-                    history_sequence: None,
+                    sequence: None,
                 },
             );
         }
@@ -131,7 +131,7 @@ impl ContextStore<'_> {
             recorded_at_ms: now,
             payload: self.scoped.put_payload(&mut batch, &pin, &bytes),
             endpoints: None,
-            history: None,
+            event: None,
             checkpoint: None,
         };
         if pin.revision > 1 {
@@ -153,7 +153,7 @@ impl ContextStore<'_> {
             digest,
             WriteReceipt {
                 pin,
-                history_sequence: None,
+                sequence: None,
             },
         )
     }
@@ -297,7 +297,8 @@ impl ContextStore<'_> {
     ) -> ContextResult<()> {
         if encode(properties)?.len() > MAX_RECORD_BYTES {
             return Err(ContextError::InvalidInput(
-                "structured context exceeds 128 KiB; retain large originals in history".into(),
+                "structured context exceeds 128 KiB; retain large originals in the session log"
+                    .into(),
             ));
         }
         for (name, property) in &definition.properties {

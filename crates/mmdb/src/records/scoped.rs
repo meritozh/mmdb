@@ -470,7 +470,7 @@ impl Scoped<'_> {
         self.check_scope(scope)?;
         if sources.len() > MAX_CONTEXT_SOURCES {
             return Err(ContextError::InvalidInput(
-                "history has too many source references".into(),
+                "copy has too many source references".into(),
             ));
         }
         let mut walk = SourceWalk::for_new_record();

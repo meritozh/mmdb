@@ -190,7 +190,7 @@ impl ContextStore<'_> {
             recorded_at_ms: super::super::now_ms(),
             payload: self.scoped.put_payload(&mut batch, &pin, &bytes),
             endpoints,
-            history: None,
+            event: None,
             checkpoint: None,
         };
         if previous.is_some() {
@@ -205,7 +205,7 @@ impl ContextStore<'_> {
             digest,
             WriteReceipt {
                 pin,
-                history_sequence: None,
+                sequence: None,
             },
         )
     }

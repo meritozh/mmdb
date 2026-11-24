@@ -12,7 +12,7 @@ pub struct MessageState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistoryInput {
+pub struct EventInput {
     /// Availability dependencies for material copied into this original (for
     /// example, a model request containing recalled records).
     #[serde(default)]
@@ -20,7 +20,7 @@ pub struct HistoryInput {
     pub session: String,
     pub event_id: String,
     pub scope: Scope,
-    pub kind: HistoryKind,
+    pub kind: EventKind,
     pub media_type: String,
     pub occurred_at_ms: i64,
     /// Last committed sequence; zero denotes an empty session. None appends
@@ -34,7 +34,7 @@ pub struct CheckpointInput {
     pub scope: CheckpointScope,
     pub session: String,
     pub run: String,
-    pub history_sequence: u64,
+    pub sequence: u64,
     pub expected_previous: Option<RecordPin>,
     /// Epoch captured before assembling/generating the summary.
     pub expected_availability_epoch: u64,
@@ -43,38 +43,38 @@ pub struct CheckpointInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistoryPage {
+pub struct EventPage {
     pub entries: Vec<RecordHeader>,
     pub next_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistorySearchCursor {
+pub struct LogSearchCursor {
     pub(super) query_digest: [u8; 32],
     pub(super) key: Vec<u8>,
     pub(super) offset: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistoryQuery {
+pub struct LogQuery {
     pub text: String,
     pub session: Option<String>,
-    pub cursor: Option<HistorySearchCursor>,
+    pub cursor: Option<LogSearchCursor>,
     pub max_events: usize,
     pub max_bytes: usize,
     pub limit: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistoryMatch {
+pub struct LogMatch {
     pub header: RecordHeader,
     pub byte_offset: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistorySearch {
-    pub matches: Vec<HistoryMatch>,
-    pub cursor: Option<HistorySearchCursor>,
+pub struct LogSearch {
+    pub matches: Vec<LogMatch>,
+    pub cursor: Option<LogSearchCursor>,
     pub bytes_examined: usize,
     pub events_examined: usize,
 }
@@ -87,7 +87,7 @@ pub(super) struct StoredEvent {
 
 /// Owner-scoped session catalog for trusted harness recovery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistorySessionPage {
+pub struct SessionPage {
     pub sessions: Vec<String>,
     pub next: Option<String>,
 }

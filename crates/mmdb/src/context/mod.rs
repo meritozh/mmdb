@@ -17,9 +17,9 @@ pub use types::*;
 use crate::records::Scoped;
 pub use crate::records::{
     CheckpointMetadata, CheckpointScope, ContextAccess, ContextError, ContextRef, ContextResult,
-    Endpoints, HistoryEntry, HistoryKind, InformationKind, MessageStatus, PayloadDescriptor,
-    PayloadPage, Provenance, RecordHeader, RecordKind, RecordPin, RecoveryReport, StoreModule,
-    ToolOutcome, WriteReceipt, MAX_CONTEXT_NAME_BYTES, MAX_CONTEXT_SOURCES, MAX_PAYLOAD_PAGE_BYTES,
+    Endpoints, EventKind, InformationKind, LogEvent, MessageStatus, PayloadDescriptor, PayloadPage,
+    Provenance, RecordHeader, RecordKind, RecordPin, RecoveryReport, StoreModule, ToolOutcome,
+    WriteReceipt, MAX_CONTEXT_NAME_BYTES, MAX_CONTEXT_SOURCES, MAX_PAYLOAD_PAGE_BYTES,
     MAX_RECORD_BYTES, PAYLOAD_CHUNK_BYTES,
 };
 use mmdb_kernel::WriteGuard;

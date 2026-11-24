@@ -121,7 +121,7 @@ impl Scoped<'_> {
             digest,
             WriteReceipt {
                 pin: header.pin,
-                history_sequence: header.history.as_ref().map(|history| history.sequence),
+                sequence: header.event.as_ref().map(|event| event.sequence),
             },
         )
     }

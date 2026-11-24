@@ -1,5 +1,5 @@
 use super::*;
-use crate::session::{CheckpointInput, HistoryInput, SessionLog};
+use crate::session::{CheckpointInput, EventInput, SessionLog};
 use crate::Store;
 use crate::{Actor, OperationId, RecordState, Scope, TemporalFacts};
 use serde_json::json;
@@ -16,7 +16,7 @@ fn current_sources_guard_keeps_retraction_after_the_protected_commit() {
     let access = ContextAccess::new("owner", Actor::User);
     let context = db.context(access.clone()).unwrap();
     let log = db.session_log(access.clone()).unwrap();
-    let pin = history_source(&log, "session", "request");
+    let pin = event_source(&log, "session", "request");
     let guard = context
         .validate_current_guard(std::slice::from_ref(&pin), None, Some(0))
         .unwrap();
@@ -75,7 +75,7 @@ fn current_sources_guard_rejects_stale_and_out_of_scope_sources_without_writing(
     let access = ContextAccess::new("owner", Actor::User);
     let context = db.context(access.clone()).unwrap();
     let log = db.session_log(access).unwrap();
-    let pin = history_source(&log, "session", "request");
+    let pin = event_source(&log, "session", "request");
     let other = db
         .context(ContextAccess::new("another-owner", Actor::System))
         .unwrap();
@@ -99,12 +99,12 @@ fn committed_history_survives_a_lost_acknowledgement_without_duplication() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("context");
     let operation = OperationId::new();
-    let input = HistoryInput {
+    let input = EventInput {
         sources: Vec::new(),
         session: "continuous-session".into(),
         event_id: "message-1".into(),
         scope: Scope::Personal,
-        kind: HistoryKind::AssistantMessage,
+        kind: EventKind::AssistantMessage,
         media_type: "text/plain".into(),
         occurred_at_ms: 1,
         expected_sequence: Some(0),
@@ -116,7 +116,7 @@ fn committed_history_survives_a_lost_acknowledgement_without_duplication() {
             .unwrap();
         store.scoped.lose_next_commit_ack();
         let error = store
-            .append_history(operation, input.clone(), b"durable answer".as_slice())
+            .append(operation, input.clone(), b"durable answer".as_slice())
             .unwrap_err();
         assert!(matches!(error, ContextError::CommitUnknown(id) if id == operation));
         store.operation_receipt(operation).unwrap().unwrap()
@@ -131,14 +131,14 @@ fn committed_history_survives_a_lost_acknowledgement_without_duplication() {
     );
     assert_eq!(
         store
-            .append_history(operation, input, b"durable answer".as_slice())
+            .append(operation, input, b"durable answer".as_slice())
             .unwrap(),
         expected
     );
-    assert_eq!(store.history_position("continuous-session").unwrap(), 1);
+    assert_eq!(store.position("continuous-session").unwrap(), 1);
     assert_eq!(
         store
-            .history("continuous-session", 0, 10)
+            .events("continuous-session", 0, 10)
             .unwrap()
             .entries
             .len(),
@@ -163,14 +163,14 @@ fn checksum_failure_is_reported_instead_of_returning_modified_source_bytes() {
         .session_log(ContextAccess::new("owner", Actor::System))
         .unwrap();
     let receipt = store
-        .append_history(
+        .append(
             OperationId::new(),
-            HistoryInput {
+            EventInput {
                 sources: Vec::new(),
                 session: "session".into(),
                 event_id: "message".into(),
                 scope: Scope::Personal,
-                kind: HistoryKind::UserMessage,
+                kind: EventKind::UserMessage,
                 media_type: "text/plain".into(),
                 occurred_at_ms: 1,
                 expected_sequence: None,
@@ -230,14 +230,14 @@ fn assistant_cannot_retract_instruction_records_but_may_retract_others() {
     let source = owner
         .session_log(ContextAccess::new("owner", Actor::User))
         .unwrap()
-        .append_history(
+        .append(
             OperationId::new(),
-            HistoryInput {
+            EventInput {
                 sources: Vec::new(),
                 session: "s".into(),
                 event_id: "e".into(),
                 scope: Scope::Personal,
-                kind: HistoryKind::UserMessage,
+                kind: EventKind::UserMessage,
                 media_type: "text/plain".into(),
                 occurred_at_ms: 1,
                 expected_sequence: None,
@@ -376,16 +376,16 @@ fn object_type(store: &ContextStore, name: &str) -> RecordPin {
         .pin
 }
 
-fn history_source(store: &SessionLog, session: &str, event: &str) -> RecordPin {
+fn event_source(store: &SessionLog, session: &str, event: &str) -> RecordPin {
     store
-        .append_history(
+        .append(
             OperationId::new(),
-            HistoryInput {
+            EventInput {
                 sources: Vec::new(),
                 session: session.into(),
                 event_id: event.into(),
                 scope: Scope::Personal,
-                kind: HistoryKind::UserMessage,
+                kind: EventKind::UserMessage,
                 media_type: "text/plain".into(),
                 occurred_at_ms: 1,
                 expected_sequence: None,
@@ -400,7 +400,7 @@ fn history_source(store: &SessionLog, session: &str, event: &str) -> RecordPin {
 fn temporal_fields_distinguishable() {
     let (_dir, store, log) = fresh_store();
     let typ = object_type(&store, "note");
-    let source = history_source(&log, "s", "e");
+    let source = event_source(&log, "s", "e");
     let temporal = TemporalFacts {
         observed_at_ms: 1000,
         source_at_ms: Some(500),
@@ -436,7 +436,7 @@ fn temporal_fields_distinguishable() {
 fn query_current_valid_filters_by_time_and_state() {
     let (_dir, store, log) = fresh_store();
     let typ = object_type(&store, "note");
-    let source = history_source(&log, "s", "e");
+    let source = event_source(&log, "s", "e");
 
     // Active, valid at now.
     let active = store
@@ -674,7 +674,7 @@ fn entity_merge_idempotent() {
 #[test]
 fn revising_a_type_or_extracting_advances_the_availability_epoch() {
     let (_dir, store, log) = fresh_store();
-    let anchor = history_source(&log, "session", "anchor");
+    let anchor = event_source(&log, "session", "anchor");
     let original = object_type(&store, "note");
     let checkpoint = |previous| {
         log.save_checkpoint(
@@ -683,7 +683,7 @@ fn revising_a_type_or_extracting_advances_the_availability_epoch() {
                 scope: CheckpointScope::Session,
                 session: "session".into(),
                 run: "run".into(),
-                history_sequence: 1,
+                sequence: 1,
                 expected_previous: previous,
                 expected_availability_epoch: store.availability_epoch().unwrap(),
                 sources: vec![anchor.clone()],
@@ -758,7 +758,7 @@ fn extraction_batch_creates_objects_and_relations_atomically() {
                 type_pin: obj_type.clone(),
                 scope: Scope::Personal,
                 properties: BTreeMap::from([("text".into(), json!("a"))]),
-                sources: vec![history_source(&log, "s", "e1")],
+                sources: vec![event_source(&log, "s", "e1")],
                 information: InformationKind::Observation,
                 temporal: TemporalFacts::observed_at(1),
             },
@@ -772,7 +772,7 @@ fn extraction_batch_creates_objects_and_relations_atomically() {
                 type_pin: obj_type.clone(),
                 scope: Scope::Personal,
                 properties: BTreeMap::from([("text".into(), json!("b"))]),
-                sources: vec![history_source(&log, "s", "e2")],
+                sources: vec![event_source(&log, "s", "e2")],
                 information: InformationKind::Observation,
                 temporal: TemporalFacts::observed_at(1),
             },
@@ -949,7 +949,7 @@ fn extraction_crash_recovery() {
 fn extraction_source_pins_preserved() {
     let (_dir, store, log) = fresh_store();
     let obj_type = object_type(&store, "thing");
-    let source = history_source(&log, "s", "e");
+    let source = event_source(&log, "s", "e");
     let receipt = block_on(store.extraction_transaction(
         Ulid::new(),
         vec![ExtractionOp::CreateObject {
@@ -972,7 +972,7 @@ fn a_memory_purge_commits_its_head_epoch_and_receipt_together() {
     let (object, epoch) = {
         let store = Store::create(&path).unwrap();
         let context = store.context(access.clone()).unwrap();
-        let source = history_source(
+        let source = event_source(
             &store.session_log(access.clone()).unwrap(),
             "session",
             "input",
@@ -1049,14 +1049,14 @@ fn a_streaming_append_blocks_memory_writes_until_it_ends() {
     let context = store.context(access).unwrap();
     std::thread::scope(|threads| {
         let append = threads.spawn(move || {
-            log.append_history(
+            log.append(
                 OperationId::new(),
-                HistoryInput {
+                EventInput {
                     sources: vec![],
                     session: "s".into(),
                     event_id: "event".into(),
                     scope: Scope::Personal,
-                    kind: HistoryKind::UserMessage,
+                    kind: EventKind::UserMessage,
                     media_type: "text/plain".into(),
                     occurred_at_ms: 1,
                     expected_sequence: Some(0),
@@ -1084,7 +1084,7 @@ fn a_streaming_append_blocks_memory_writes_until_it_ends() {
             while_streaming,
             Err(mpsc::RecvTimeoutError::Timeout)
         ));
-        assert_eq!(append.join().unwrap().history_sequence, Some(1));
+        assert_eq!(append.join().unwrap().sequence, Some(1));
         assert!(written_rx
             .recv_timeout(Duration::from_secs(5))
             .unwrap()

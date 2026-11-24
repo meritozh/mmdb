@@ -37,9 +37,9 @@ scope and tool permissions.
 
 `TypeDefinition::note(scope)` is an optional starting schema registered through
 the same catalog as custom types. Complete raw events stream into checksummed
-chunks; history search uses bounded, resumable substring scans. Objects use
+chunks. `SessionLog::search` uses bounded, resumable substring scans. Objects use
 lexical postings and explicit relation paths. This contract currently requires
-the `mmdb-store-dev9` format. Use an explicit whole-store reset to replace a
+the `mmdb-store-dev11` format. Use an explicit whole-store reset to replace a
 legacy directory.
 One process holds the store lease at a time.
 

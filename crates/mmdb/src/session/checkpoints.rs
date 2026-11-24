@@ -13,9 +13,9 @@ impl SessionLog<'_> {
         Ok(CheckpointRecord { header, payload })
     }
 
-    /// Checkpoints are immutable recovery records, fixed to committed history.
+    /// Checkpoints are immutable recovery records, fixed to the committed session log.
     /// A correction invalidates older checkpoints for current recovery while
-    /// exact historical reads remain available. Purge or history withdrawal
+    /// exact historical reads remain available. Purge or event withdrawal
     /// also hides older payloads, including unlisted inputs to a summary.
     pub fn save_checkpoint(
         &self,
@@ -86,7 +86,7 @@ impl SessionLog<'_> {
         } else {
             1
         };
-        let anchor = self.history_anchor_locked(&input.session, input.history_sequence)?;
+        let anchor = self.event_anchor_locked(&input.session, input.sequence)?;
         let mut sources = input.sources;
         if !sources.contains(&anchor.pin) {
             sources.push(anchor.pin);
@@ -113,13 +113,13 @@ impl SessionLog<'_> {
             recorded_at_ms: now,
             payload: self.scoped.put_payload(&mut batch, &pin, &bytes),
             endpoints: None,
-            history: None,
+            event: None,
             checkpoint: Some(CheckpointMetadata {
                 scope: input.scope,
                 session: input.session,
                 run: input.run,
                 window,
-                history_sequence: input.history_sequence,
+                sequence: input.sequence,
                 previous,
                 availability_epoch: self.scoped.availability_epoch_locked()?,
             }),
@@ -132,7 +132,7 @@ impl SessionLog<'_> {
             digest,
             WriteReceipt {
                 pin,
-                history_sequence: Some(input.history_sequence),
+                sequence: Some(input.sequence),
             },
         )
     }
@@ -195,14 +195,14 @@ mod tests {
         store.scoped.advance_epoch(&mut batch).unwrap();
         batch.commit().unwrap();
         let anchor = store
-            .append_history(
+            .append(
                 OperationId::new(),
-                HistoryInput {
+                EventInput {
                     sources: vec![],
                     session: "session".into(),
                     event_id: "source".into(),
                     scope: Scope::Personal,
-                    kind: HistoryKind::UserMessage,
+                    kind: EventKind::UserMessage,
                     media_type: "text/plain".into(),
                     occurred_at_ms: 1,
                     expected_sequence: None,
@@ -217,7 +217,7 @@ mod tests {
                     scope: CheckpointScope::Session,
                     session: "session".into(),
                     run: "run".into(),
-                    history_sequence: 1,
+                    sequence: 1,
                     expected_previous: None,
                     expected_availability_epoch: 1,
                     sources: vec![anchor.pin],

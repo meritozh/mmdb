@@ -135,7 +135,7 @@ impl RecordKind {
 
     pub fn module(self) -> StoreModule {
         match self {
-            Self::History | Self::Checkpoint => StoreModule::Session,
+            Self::Event | Self::Checkpoint => StoreModule::Session,
             _ => StoreModule::Memory,
         }
     }
@@ -191,7 +191,7 @@ mod tests {
         let mut pins = Vec::new();
         for kind in [
             RecordKind::Object,
-            RecordKind::History,
+            RecordKind::Event,
             RecordKind::Checkpoint,
         ] {
             let pin = scoped.fresh_pin(kind);
@@ -212,7 +212,7 @@ mod tests {
                         recorded_at_ms: 1,
                         payload,
                         endpoints: None,
-                        history: None,
+                        event: None,
                         checkpoint: None,
                     },
                 )

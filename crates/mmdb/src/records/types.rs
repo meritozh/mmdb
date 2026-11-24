@@ -9,7 +9,7 @@ pub enum RecordKind {
     Type,
     Object,
     Relation,
-    History,
+    Event,
     Checkpoint,
     Action,
     ActionExecution,
@@ -85,7 +85,7 @@ pub enum ToolOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum HistoryKind {
+pub enum EventKind {
     UserMessage,
     AssistantMessage,
     AssistantStarted {
@@ -122,11 +122,11 @@ pub enum MessageStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistoryEntry {
+pub struct LogEvent {
     pub session: String,
     pub event_id: String,
     pub sequence: u64,
-    pub kind: HistoryKind,
+    pub kind: EventKind,
     pub media_type: String,
 }
 
@@ -158,7 +158,7 @@ pub struct RecordHeader {
     pub recorded_at_ms: i64,
     pub payload: PayloadDescriptor,
     pub endpoints: Option<Endpoints>,
-    pub history: Option<HistoryEntry>,
+    pub event: Option<LogEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<CheckpointMetadata>,
 }
@@ -178,7 +178,7 @@ pub struct CheckpointMetadata {
     pub session: String,
     pub run: String,
     pub window: u64,
-    pub history_sequence: u64,
+    pub sequence: u64,
     pub previous: Option<RecordPin>,
     pub availability_epoch: u64,
 }
@@ -196,7 +196,7 @@ impl RecordHeader {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriteReceipt {
     pub pin: RecordPin,
-    pub history_sequence: Option<u64>,
+    pub sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

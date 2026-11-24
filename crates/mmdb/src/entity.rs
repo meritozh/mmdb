@@ -197,7 +197,7 @@ impl ContextStore<'_> {
             recorded_at_ms: now,
             payload: self.scoped.put_payload(&mut batch, &pin, &bytes),
             endpoints: None,
-            history: None,
+            event: None,
             checkpoint: None,
         };
         let stored = StoredEntityIdentity {
@@ -223,7 +223,7 @@ impl ContextStore<'_> {
             digest,
             crate::context::WriteReceipt {
                 pin,
-                history_sequence: None,
+                sequence: None,
             },
         )?;
         Ok(stored.into())
@@ -284,7 +284,7 @@ impl ContextStore<'_> {
             self.scoped.digest("entity-alias", &(primary, &alias))?,
             crate::context::WriteReceipt {
                 pin: self.scoped.fresh_pin(RecordKind::Object),
-                history_sequence: None,
+                sequence: None,
             },
         )?;
         Ok(stored.into())
@@ -356,7 +356,7 @@ impl ContextStore<'_> {
                 self.scoped.digest("entity-merge", &(source, target))?,
                 crate::context::WriteReceipt {
                     pin: self.scoped.fresh_pin(RecordKind::Object),
-                    history_sequence: None,
+                    sequence: None,
                 },
             )
             .map(|_| ())

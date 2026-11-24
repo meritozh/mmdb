@@ -30,7 +30,7 @@ pub(crate) fn kind_byte(kind: RecordKind) -> u8 {
         RecordKind::Type => 0,
         RecordKind::Object => 1,
         RecordKind::Relation => 2,
-        RecordKind::History => 3,
+        RecordKind::Event => 3,
         RecordKind::Checkpoint => 4,
         RecordKind::Action => 5,
         RecordKind::ActionExecution => 6,

@@ -1,7 +1,7 @@
 //! Native acceptance on a temporary copy of a closed real-task context store.
 //! Usage: verify_context_lifecycle STORE BUSINESS_PINS_JSON REPORT_JSON
 use mmdb::context::*;
-use mmdb::session::{CheckpointInput, HistoryInput};
+use mmdb::session::{CheckpointInput, EventInput};
 use mmdb::Store;
 use mmdb::{Actor, OperationId, Scope, TemporalFacts};
 use serde_json::json;
@@ -62,7 +62,7 @@ fn read_pin(
     pin: &RecordPin,
 ) -> ContextResult<()> {
     match pin.record.kind {
-        RecordKind::History => log.read_payload(pin, 0, MAX_PAYLOAD_PAGE_BYTES).map(|_| ()),
+        RecordKind::Event => log.read_payload(pin, 0, MAX_PAYLOAD_PAGE_BYTES).map(|_| ()),
         RecordKind::Checkpoint => log.read_checkpoint(pin).map(|_| ()),
         _ => context.read(pin).map(|_| ()),
     }
@@ -168,14 +168,14 @@ fn main() -> Result<()> {
             .ok_or("real task object lacks provenance")?
             .clone();
         let anchor = log
-            .append_history(
+            .append(
                 OperationId::new(),
-                HistoryInput {
+                EventInput {
                     sources: vec![source.clone()],
                     session: "independent-lifecycle".into(),
                     event_id: "lifecycle-anchor".into(),
                     scope: Scope::Personal,
-                    kind: HistoryKind::Notice,
+                    kind: EventKind::Notice,
                     media_type: "text/plain".into(),
                     occurred_at_ms: 1,
                     expected_sequence: Some(0),
@@ -184,7 +184,7 @@ fn main() -> Result<()> {
             )?
             .pin;
         let checkpoint=log.save_checkpoint(OperationId::new(),CheckpointInput {
-            scope:CheckpointScope::Session,session:"independent-lifecycle".into(),run:"native-verifier".into(),history_sequence:1,
+            scope:CheckpointScope::Session,session:"independent-lifecycle".into(),run:"native-verifier".into(),sequence:1,
             expected_previous:None,expected_availability_epoch:store.availability_epoch()?,sources:vec![target.clone(),anchor],
             payload:json!({"goal":"verify actual task records on a disposable copy","state":"pending"}),
         })?.pin;

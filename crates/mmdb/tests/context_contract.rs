@@ -11,13 +11,13 @@ fn access(owner: &str) -> ContextAccess {
     ContextAccess::new(owner, Actor::System)
 }
 
-fn history_input(session: &str, event: &str) -> HistoryInput {
-    HistoryInput {
+fn event_input(session: &str, event: &str) -> EventInput {
+    EventInput {
         sources: Vec::new(),
         session: session.into(),
         event_id: event.into(),
         scope: Scope::Personal,
-        kind: HistoryKind::UserMessage,
+        kind: EventKind::UserMessage,
         media_type: "text/plain; charset=utf-8".into(),
         occurred_at_ms: 10,
         expected_sequence: None,
@@ -25,9 +25,9 @@ fn history_input(session: &str, event: &str) -> HistoryInput {
 }
 
 fn source(log: &SessionLog<'_>, event: &str, text: &str) -> RecordPin {
-    log.append_history(
+    log.append(
         OperationId::new(),
-        history_input("session-a", event),
+        event_input("session-a", event),
         text.as_bytes(),
     )
     .unwrap()
@@ -182,8 +182,8 @@ fn independent_harnesses_share_types_history_and_relations_after_reopen() {
         String::from_utf8(bytes).unwrap(),
         "Research found a capacity constraint that affects the decision."
     );
-    assert_eq!(trading_log.history_position("session-a").unwrap(), 1);
-    assert_eq!(trading_log.history_position("session-b").unwrap(), 0);
+    assert_eq!(trading_log.position("session-a").unwrap(), 1);
+    assert_eq!(trading_log.position("session-b").unwrap(), 0);
 }
 
 #[test]
@@ -302,10 +302,10 @@ fn private_sources_do_not_become_public_through_objects_or_relations() {
     permitted.scopes.push(private.clone());
     let all_log = db.session_log(permitted.clone()).unwrap();
     let all = db.context(permitted).unwrap();
-    let mut raw_input = history_input("private", "raw");
+    let mut raw_input = event_input("private", "raw");
     raw_input.scope = private.clone();
     let raw = all_log
-        .append_history(OperationId::new(), raw_input, b"private fact".as_slice())
+        .append(OperationId::new(), raw_input, b"private fact".as_slice())
         .unwrap()
         .pin;
     let type_pin = all
@@ -345,9 +345,9 @@ fn complete_large_history_is_searchable_across_chunks_and_query_pages() {
         let db = Store::create(&root).unwrap();
         db.session_log(access("owner"))
             .unwrap()
-            .append_history(
+            .append(
                 OperationId::new(),
-                history_input("long", "large"),
+                event_input("long", "large"),
                 bytes.as_slice(),
             )
             .unwrap()
@@ -371,7 +371,7 @@ fn complete_large_history_is_searchable_across_chunks_and_query_pages() {
         let mut found = Vec::new();
         for _ in 0..100 {
             let result = log
-                .search_history(HistoryQuery {
+                .search(LogQuery {
                     text: text.into(),
                     session: None,
                     cursor,
@@ -400,37 +400,37 @@ fn append_retries_preserve_identity_and_order_even_after_later_events() {
     let db = Store::create(dir.path().join("context")).unwrap();
     let log = db.session_log(access("owner")).unwrap();
     let operation = OperationId::new();
-    let mut input = history_input("session", "first");
+    let mut input = event_input("session", "first");
     input.expected_sequence = Some(0);
     let first = log
-        .append_history(operation, input.clone(), b"first".as_slice())
+        .append(operation, input.clone(), b"first".as_slice())
         .unwrap();
-    log.append_history(
+    log.append(
         OperationId::new(),
-        history_input("session", "second"),
+        event_input("session", "second"),
         b"second".as_slice(),
     )
     .unwrap();
     assert_eq!(
-        log.append_history(operation, input.clone(), b"first".as_slice())
+        log.append(operation, input.clone(), b"first".as_slice())
             .unwrap(),
         first
     );
     input.expected_sequence = Some(2);
     assert_eq!(
-        log.append_history(OperationId::new(), input.clone(), b"first".as_slice())
+        log.append(OperationId::new(), input.clone(), b"first".as_slice())
             .unwrap(),
         first
     );
     assert!(matches!(
-        log.append_history(OperationId::new(), input, b"different".as_slice()),
+        log.append(OperationId::new(), input, b"different".as_slice()),
         Err(ContextError::IdempotencyConflict)
     ));
-    let page = log.history("session", 0, 1).unwrap();
+    let page = log.events("session", 0, 1).unwrap();
     assert_eq!(page.entries[0].pin, first.pin);
     assert_eq!(page.next_sequence, Some(1));
-    let second = log.history("session", 1, 1).unwrap();
-    assert_eq!(second.entries[0].history.as_ref().unwrap().sequence, 2);
+    let second = log.events("session", 1, 1).unwrap();
+    assert_eq!(second.entries[0].event.as_ref().unwrap().sequence, 2);
     assert!(second.next_sequence.is_none());
     assert_eq!(log.operation_receipt(operation).unwrap(), Some(first));
 }
@@ -445,9 +445,9 @@ fn concurrent_appends_allocate_one_session_order() {
             std::thread::spawn(move || {
                 db.session_log(access("owner"))
                     .unwrap()
-                    .append_history(
+                    .append(
                         OperationId::new(),
-                        history_input("shared", &format!("event-{index}")),
+                        event_input("shared", &format!("event-{index}")),
                         format!("item-{index}").as_bytes(),
                     )
                     .unwrap()
@@ -457,17 +457,17 @@ fn concurrent_appends_allocate_one_session_order() {
     let receipts: Vec<_> = jobs.into_iter().map(|job| job.join().unwrap()).collect();
     let positions: BTreeSet<_> = receipts
         .iter()
-        .map(|receipt| receipt.history_sequence.unwrap())
+        .map(|receipt| receipt.sequence.unwrap())
         .collect();
     assert_eq!(positions, (1..=8).collect());
     let log = db.session_log(access("owner")).unwrap();
-    let history = log.history("shared", 0, 100).unwrap();
-    assert_eq!(history.entries.len(), 8);
-    let mut stale = history_input("shared", "stale");
+    let page = log.events("shared", 0, 100).unwrap();
+    assert_eq!(page.entries.len(), 8);
+    let mut stale = event_input("shared", "stale");
     stale.expected_sequence = Some(0);
     assert!(matches!(
-        log.append_history(OperationId::new(), stale, b"stale".as_slice()),
-        Err(ContextError::HistoryConflict {
+        log.append(OperationId::new(), stale, b"stale".as_slice()),
+        Err(ContextError::PositionConflict {
             expected: 0,
             actual: 8
         })
@@ -481,26 +481,26 @@ fn tool_results_require_their_call_and_follow_its_purge_state() {
     let log = db
         .session_log(ContextAccess::new("owner", Actor::Operator))
         .unwrap();
-    let mut result = history_input("session", "result");
-    result.kind = HistoryKind::ToolResult {
+    let mut result = event_input("session", "result");
+    result.kind = EventKind::ToolResult {
         call_id: "call-1".into(),
         outcome: ToolOutcome::Succeeded,
     };
     assert!(matches!(
-        log.append_history(OperationId::new(), result.clone(), b"response".as_slice()),
+        log.append(OperationId::new(), result.clone(), b"response".as_slice()),
         Err(ContextError::InvalidInput(_))
     ));
-    let mut call = history_input("session", "call");
-    call.kind = HistoryKind::ToolCall {
+    let mut call = event_input("session", "call");
+    call.kind = EventKind::ToolCall {
         message_id: None,
         call_id: "call-1".into(),
         tool_name: "research".into(),
     };
     let call = log
-        .append_history(OperationId::new(), call, b"arguments".as_slice())
+        .append(OperationId::new(), call, b"arguments".as_slice())
         .unwrap();
     let result = log
-        .append_history(OperationId::new(), result, b"response".as_slice())
+        .append(OperationId::new(), result, b"response".as_slice())
         .unwrap();
     assert_eq!(
         log.inspect_header(&result.pin).unwrap().sources,
@@ -851,7 +851,7 @@ fn reset_creates_a_new_context_era_without_importing_previous_history() {
     let receipt = commit_reset(&plan, plan.digest().as_str(), StoreEraId::new(), &[]).unwrap();
     let db = Store::open(&root).unwrap();
     let fresh_log = db.session_log(access("owner")).unwrap();
-    assert_eq!(fresh_log.history_position("session-a").unwrap(), 0);
+    assert_eq!(fresh_log.position("session-a").unwrap(), 0);
     assert!(matches!(
         fresh_log.read_payload(&old, 0, 100),
         Err(ContextError::AccessDenied)
@@ -919,34 +919,34 @@ fn incomplete_uploads_never_advance_history_and_can_be_cleaned() {
         let db = Store::create(&root).unwrap();
         let log = db.session_log(access("owner")).unwrap();
         assert!(matches!(
-            log.append_history(
+            log.append(
                 operation,
-                history_input("session", "interrupted"),
+                event_input("session", "interrupted"),
                 FailingReader {
                     remaining: PAYLOAD_CHUNK_BYTES + 5
                 }
             ),
             Err(ContextError::Io(_))
         ));
-        assert_eq!(log.history_position("session").unwrap(), 0);
+        assert_eq!(log.position("session").unwrap(), 0);
         assert!(log.operation_receipt(operation).unwrap().is_none());
     }
     let db = Store::open(&root).unwrap();
     let log = db.session_log(access("owner")).unwrap();
-    assert!(log.history("session", 0, 10).unwrap().entries.is_empty());
+    assert!(log.events("session", 0, 10).unwrap().entries.is_empty());
     let context = db.context(access("owner")).unwrap();
     assert_eq!(context.recover_payloads(10, 10).unwrap().chunks_removed, 0);
     let report = log.recover_payloads(10, 10).unwrap();
     assert_eq!(report.chunks_removed, 1);
     assert_eq!(report.uploads_removed, 1);
     assert_eq!(
-        log.append_history(
+        log.append(
             operation,
-            history_input("session", "interrupted"),
+            event_input("session", "interrupted"),
             b"complete retry".as_slice()
         )
         .unwrap()
-        .history_sequence,
+        .sequence,
         Some(1)
     );
 }
@@ -970,9 +970,9 @@ fn history_crash_child() {
     let db = Store::create(root).unwrap();
     db.session_log(access("owner"))
         .unwrap()
-        .append_history(
+        .append(
             OperationId::new(),
-            history_input("session", "crashed"),
+            event_input("session", "crashed"),
             CrashReader(false),
         )
         .unwrap();
@@ -991,16 +991,16 @@ fn actual_process_interruption_leaves_no_partial_visible_history() {
     assert_eq!(status.code(), Some(77));
     let db = Store::open(&root).unwrap();
     let log = db.session_log(access("owner")).unwrap();
-    assert_eq!(log.history_position("session").unwrap(), 0);
+    assert_eq!(log.position("session").unwrap(), 0);
     assert_eq!(log.recover_payloads(10, 10).unwrap().chunks_removed, 1);
     assert_eq!(
-        log.append_history(
+        log.append(
             OperationId::new(),
-            history_input("session", "after-crash"),
+            event_input("session", "after-crash"),
             b"resumed".as_slice()
         )
         .unwrap()
-        .history_sequence,
+        .sequence,
         Some(1)
     );
 }
@@ -1316,11 +1316,11 @@ fn copied_history_tracks_source_availability_and_session_catalog_pages() {
     let log = db.session_log(access("owner")).unwrap();
     let store = db.context(access("owner")).unwrap();
     let original = source(&log, "source", "withdrawable-secret");
-    let mut copied = history_input("model-session", "model-request");
-    copied.kind = HistoryKind::Notice;
+    let mut copied = event_input("model-session", "model-request");
+    copied.kind = EventKind::Notice;
     copied.sources = vec![original.clone()];
     let copy = log
-        .append_history(
+        .append(
             OperationId::new(),
             copied,
             b"withdrawable-secret copied".as_slice(),
@@ -1340,9 +1340,9 @@ fn copied_history_tracks_source_availability_and_session_catalog_pages() {
         Err(ContextError::Unavailable(_))
     ));
     for index in 0..7 {
-        log.append_history(
+        log.append(
             OperationId::new(),
-            history_input(&format!("session-{index}"), "input"),
+            event_input(&format!("session-{index}"), "input"),
             b"original".as_slice(),
         )
         .unwrap();
@@ -1350,7 +1350,7 @@ fn copied_history_tracks_source_availability_and_session_catalog_pages() {
     let mut sessions = BTreeSet::new();
     let mut after = None;
     loop {
-        let page = log.history_sessions(2, after.as_deref()).unwrap();
+        let page = log.sessions(2, after.as_deref()).unwrap();
         for session in page.sessions {
             assert!(sessions.insert(session));
         }
@@ -1363,14 +1363,14 @@ fn copied_history_tracks_source_availability_and_session_catalog_pages() {
     assert!(db
         .session_log(access("another-owner"))
         .unwrap()
-        .history_sessions(2, None)
+        .sessions(2, None)
         .unwrap()
         .sessions
         .is_empty());
     assert!(matches!(
         db.session_log(ContextAccess::new("owner", Actor::Assistant))
             .unwrap()
-            .history_sessions(2, None),
+            .sessions(2, None),
         Err(ContextError::AccessDenied)
     ));
 }
@@ -1426,7 +1426,7 @@ fn checkpoint_parent_and_epoch_are_compared_atomically_and_survive_reopen() {
         scope: CheckpointScope::Session,
         session: "session-a".into(),
         run: "run".into(),
-        history_sequence: 1,
+        sequence: 1,
         expected_previous: None,
         expected_availability_epoch: store.availability_epoch().unwrap(),
         sources: vec![anchor.clone()],
@@ -1437,10 +1437,7 @@ fn checkpoint_parent_and_epoch_are_compared_atomically_and_survive_reopen() {
         .unwrap();
     assert!(log.save_checkpoint(OperationId::new(), input).is_err());
     let tail = source(&log, "tail", "new message");
-    assert_eq!(
-        log.history("session-a", 1, 10).unwrap().entries[0].pin,
-        tail
-    );
+    assert_eq!(log.events("session-a", 1, 10).unwrap().entries[0].pin, tail);
     let old_epoch = store.availability_epoch().unwrap();
     db.session_log(ContextAccess::new("owner", Actor::User))
         .unwrap()
@@ -1457,7 +1454,7 @@ fn checkpoint_parent_and_epoch_are_compared_atomically_and_survive_reopen() {
                 scope: CheckpointScope::Session,
                 session: "session-a".into(),
                 run: "run".into(),
-                history_sequence: 2,
+                sequence: 2,
                 expected_previous: Some(first.pin.clone()),
                 expected_availability_epoch: old_epoch,
                 sources: vec![tail],
@@ -1477,7 +1474,7 @@ fn checkpoint_parent_and_epoch_are_compared_atomically_and_survive_reopen() {
         log.read_checkpoint(&first.pin),
         Err(ContextError::Unavailable(_))
     ));
-    assert_eq!(log.history_position("session-a").unwrap(), 2);
+    assert_eq!(log.position("session-a").unwrap(), 2);
 }
 
 #[test]
@@ -1506,7 +1503,7 @@ fn live_revision_keeps_checkpoint_derived_originals_and_pairs_the_completed_tool
                 scope: CheckpointScope::Session,
                 session: "session-a".into(),
                 run: "run".into(),
-                history_sequence: 1,
+                sequence: 1,
                 expected_previous: None,
                 expected_availability_epoch: store.availability_epoch().unwrap(),
                 sources: vec![raw.clone(), note.clone()],
@@ -1522,15 +1519,15 @@ fn live_revision_keeps_checkpoint_derived_originals_and_pairs_the_completed_tool
         )
         .unwrap()
         .pin;
-    let mut call_input = history_input("session-a", "revise-call");
-    call_input.kind = HistoryKind::ToolCall {
+    let mut call_input = event_input("session-a", "revise-call");
+    call_input.kind = EventKind::ToolCall {
         call_id: "revise-call".into(),
         tool_name: "context".into(),
         message_id: None,
     };
     call_input.sources = vec![derived.clone()];
     let call = log
-        .append_history(
+        .append(
             OperationId::new(),
             call_input,
             b"revise the original note".as_slice(),
@@ -1569,14 +1566,14 @@ fn live_revision_keeps_checkpoint_derived_originals_and_pairs_the_completed_tool
         log.read_payload(&call, 0, 100).is_ok(),
         "the already dispatched call must remain readable"
     );
-    let mut result_input = history_input("session-a", "revise-result");
-    result_input.kind = HistoryKind::ToolResult {
+    let mut result_input = event_input("session-a", "revise-result");
+    result_input.kind = EventKind::ToolResult {
         call_id: "revise-call".into(),
         outcome: ToolOutcome::Succeeded,
     };
     result_input.sources = vec![changed.clone()];
     let result = log
-        .append_history(
+        .append(
             OperationId::new(),
             result_input,
             b"revision 2 committed".as_slice(),
@@ -1584,7 +1581,7 @@ fn live_revision_keeps_checkpoint_derived_originals_and_pairs_the_completed_tool
         .unwrap()
         .pin;
     assert_eq!(
-        log.tool_history("session-a", "revise-call")
+        log.tool_pair("session-a", "revise-call")
             .unwrap()
             .1
             .unwrap()
@@ -1644,7 +1641,7 @@ fn checkpoint_history_redaction_remains_conservative_for_unlisted_summary_input(
                 scope: CheckpointScope::Session,
                 session: "session-a".into(),
                 run: "run".into(),
-                history_sequence: 2,
+                sequence: 2,
                 expected_previous: None,
                 expected_availability_epoch: store.availability_epoch().unwrap(),
                 sources: vec![anchor],
@@ -1697,7 +1694,7 @@ fn session_and_child_run_checkpoints_keep_independent_cas_chains_across_reopen()
             scope: CheckpointScope::Session,
             session: "session-a".into(),
             run: "parent-run".into(),
-            history_sequence: 1,
+            sequence: 1,
             expected_previous: None,
             expected_availability_epoch: store.availability_epoch().unwrap(),
             sources: vec![anchor],
@@ -1744,7 +1741,7 @@ fn session_and_child_run_checkpoints_keep_independent_cas_chains_across_reopen()
                     session: "session-a".into(),
                     run: run.into(),
                     window: 1,
-                    history_sequence: 1,
+                    sequence: 1,
                     previous: None,
                     availability_epoch: base.expected_availability_epoch,
                 })
@@ -1823,7 +1820,7 @@ fn session_and_child_run_checkpoints_keep_independent_cas_chains_across_reopen()
         assert_eq!(metadata.scope, *scope);
         assert_eq!(metadata.window, 2);
         assert_eq!(metadata.previous, Some(first[index].clone()));
-        assert_eq!(metadata.history_sequence, 1);
+        assert_eq!(metadata.sequence, 1);
         assert_eq!(header.provenance.parent_run, profile.parent_run);
         assert_eq!(
             log.read_checkpoint(&second[index]).unwrap().payload,
@@ -1838,7 +1835,7 @@ fn session_and_child_run_checkpoints_keep_independent_cas_chains_across_reopen()
                 .window,
             1
         );
-        assert_eq!(log.history_position("session-a").unwrap(), 1);
+        assert_eq!(log.position("session-a").unwrap(), 1);
     }
 }
 
@@ -1891,13 +1888,13 @@ fn log_copies_stay_readable_after_their_sources_change() {
             .unwrap()
             .bytes;
         assert!(!payload.is_empty());
-        let mut input = history_input("snapshot-session", &format!("copy-{index}"));
-        input.kind = HistoryKind::Notice;
+        let mut input = event_input("snapshot-session", &format!("copy-{index}"));
+        input.kind = EventKind::Notice;
         input.sources = vec![original.clone()];
         let copy = log
-            .append_history(OperationId::new(), input, payload.as_slice())
+            .append(OperationId::new(), input, payload.as_slice())
             .unwrap();
-        assert_eq!(copy.history_sequence, Some(index as u64 + 1));
+        assert_eq!(copy.sequence, Some(index as u64 + 1));
         assert_eq!(
             log.inspect_header(&copy.pin).unwrap().sources,
             vec![original.clone()]
@@ -1930,19 +1927,19 @@ fn log_copies_stay_readable_after_their_sources_change() {
         ));
     }
 
-    let mut blocked = history_input("snapshot-session", "copy-after-purge");
-    blocked.kind = HistoryKind::Notice;
+    let mut blocked = event_input("snapshot-session", "copy-after-purge");
+    blocked.kind = EventKind::Notice;
     blocked.sources = vec![old_object.clone(), old_type];
     blocked.expected_sequence = Some(2);
     let operation = OperationId::new();
     assert!(matches!(
-        log.append_history(operation, blocked, copies[0].1.as_slice()),
+        log.append(operation, blocked, copies[0].1.as_slice()),
         Err(ContextError::Unavailable(record)) if record == old_object.record
     ));
     assert!(log.operation_receipt(operation).unwrap().is_none());
-    assert_eq!(log.history_position("snapshot-session").unwrap(), 2);
+    assert_eq!(log.position("snapshot-session").unwrap(), 2);
     assert!(log
-        .history("snapshot-session", 2, 10)
+        .events("snapshot-session", 2, 10)
         .unwrap()
         .entries
         .is_empty());
@@ -1955,14 +1952,14 @@ fn history_copy_reserves_new_root_depth_before_committing_an_unreadable_record()
     let log = db.session_log(access("owner")).unwrap();
     let mut chain = vec![source(&log, "root", "original evidence")];
     for depth in 1..=32 {
-        let mut input = history_input("depth-session", &format!("depth-{depth}"));
-        input.kind = HistoryKind::Notice;
+        let mut input = event_input("depth-session", &format!("depth-{depth}"));
+        input.kind = EventKind::Notice;
         input.sources = vec![chain.last().unwrap().clone()];
         input.expected_sequence = Some(depth - 1);
         let copy = log
-            .append_history(OperationId::new(), input, b"copied evidence".as_slice())
+            .append(OperationId::new(), input, b"copied evidence".as_slice())
             .unwrap();
-        assert_eq!(copy.history_sequence, Some(depth));
+        assert_eq!(copy.sequence, Some(depth));
         chain.push(copy.pin);
     }
     assert_eq!(
@@ -1974,19 +1971,19 @@ fn history_copy_reserves_new_root_depth_before_committing_an_unreadable_record()
         b"copied evidence"
     );
 
-    let mut input = history_input("depth-session", "overflow");
-    input.kind = HistoryKind::Notice;
+    let mut input = event_input("depth-session", "overflow");
+    input.kind = EventKind::Notice;
     input.sources = vec![chain[32].clone()];
     input.expected_sequence = Some(32);
     let operation = OperationId::new();
     assert!(matches!(
-        log.append_history(operation, input.clone(), b"too deep".as_slice()),
+        log.append(operation, input.clone(), b"too deep".as_slice()),
         Err(ContextError::BudgetExceeded)
     ));
     assert!(log.operation_receipt(operation).unwrap().is_none());
-    assert_eq!(log.history_position("depth-session").unwrap(), 32);
+    assert_eq!(log.position("depth-session").unwrap(), 32);
     assert!(log
-        .history("depth-session", 32, 10)
+        .events("depth-session", 32, 10)
         .unwrap()
         .entries
         .is_empty());
@@ -1994,9 +1991,9 @@ fn history_copy_reserves_new_root_depth_before_committing_an_unreadable_record()
     // A rejected copy consumes neither its event identity nor its operation.
     input.sources = vec![chain[31].clone()];
     let accepted = log
-        .append_history(operation, input, b"within limit".as_slice())
+        .append(operation, input, b"within limit".as_slice())
         .unwrap();
-    assert_eq!(accepted.history_sequence, Some(33));
+    assert_eq!(accepted.sequence, Some(33));
     assert_eq!(
         log.operation_receipt(operation).unwrap(),
         Some(accepted.clone())
@@ -2022,15 +2019,15 @@ fn tool_results_stay_readable_after_their_call_source_is_purged() {
         .save_object(OperationId::new(), object(&kind, &raw, "old value"))
         .unwrap()
         .pin;
-    let mut call = history_input("session-a", "update-call");
-    call.kind = HistoryKind::ToolCall {
+    let mut call = event_input("session-a", "update-call");
+    call.kind = EventKind::ToolCall {
         message_id: None,
         call_id: "update-object".into(),
         tool_name: "context".into(),
     };
     call.sources = vec![old.clone()];
     let call = log
-        .append_history(
+        .append(
             OperationId::new(),
             call,
             b"update to a new revision".as_slice(),
@@ -2041,13 +2038,13 @@ fn tool_results_stay_readable_after_their_call_source_is_purged() {
         .unwrap()
         .pin;
     assert!(log.read_payload(&call.pin, 0, 100).is_ok());
-    let mut result = history_input("session-a", "update-result");
-    result.kind = HistoryKind::ToolResult {
+    let mut result = event_input("session-a", "update-result");
+    result.kind = EventKind::ToolResult {
         call_id: "update-object".into(),
         outcome: ToolOutcome::Succeeded,
     };
     let result = log
-        .append_history(OperationId::new(), result, b"revision committed".as_slice())
+        .append(OperationId::new(), result, b"revision committed".as_slice())
         .unwrap();
     assert_eq!(
         log.read_payload(&result.pin, 0, 100).unwrap().bytes,
@@ -2083,40 +2080,40 @@ fn history_copy_shares_the_aggregate_source_budget_including_its_new_root() {
     let db = Store::create(tmp.path().join("context")).unwrap();
     let log = db.session_log(access("owner")).unwrap();
     let raw = source(&log, "root", "original evidence");
-    let mut wide = history_input("budget-session", "wide");
-    wide.kind = HistoryKind::Notice;
+    let mut wide = event_input("budget-session", "wide");
+    wide.kind = EventKind::Notice;
     wide.sources = vec![raw.clone(); 64];
     let wide = log
-        .append_history(OperationId::new(), wide, b"wide snapshot".as_slice())
+        .append(OperationId::new(), wide, b"wide snapshot".as_slice())
         .unwrap()
         .pin;
 
     // Each branch visits 65 records; 1 + 63 * 65 is exactly 4096.
-    let mut boundary = history_input("budget-session", "boundary");
-    boundary.kind = HistoryKind::Notice;
+    let mut boundary = event_input("budget-session", "boundary");
+    boundary.kind = EventKind::Notice;
     boundary.sources = vec![wide.clone(); 63];
     let boundary = log
-        .append_history(OperationId::new(), boundary, b"at limit".as_slice())
+        .append(OperationId::new(), boundary, b"at limit".as_slice())
         .unwrap();
     assert_eq!(
         log.read_payload(&boundary.pin, 0, 100).unwrap().bytes,
         b"at limit"
     );
 
-    let mut overflow = history_input("budget-session", "overflow");
-    overflow.kind = HistoryKind::Notice;
+    let mut overflow = event_input("budget-session", "overflow");
+    overflow.kind = EventKind::Notice;
     overflow.sources = vec![wide; 63];
     overflow.sources.push(raw);
     overflow.expected_sequence = Some(2);
     let operation = OperationId::new();
     assert!(matches!(
-        log.append_history(operation, overflow, b"over limit".as_slice()),
+        log.append(operation, overflow, b"over limit".as_slice()),
         Err(ContextError::BudgetExceeded)
     ));
     assert!(log.operation_receipt(operation).unwrap().is_none());
-    assert_eq!(log.history_position("budget-session").unwrap(), 2);
+    assert_eq!(log.position("budget-session").unwrap(), 2);
     assert!(log
-        .history("budget-session", 2, 10)
+        .events("budget-session", 2, 10)
         .unwrap()
         .entries
         .is_empty());
@@ -2132,17 +2129,17 @@ fn a_log_copy_needs_the_scopes_of_its_sources() {
     let log = db.session_log(authorized.clone()).unwrap();
     let store = db.context(authorized).unwrap();
     let raw = source(&log, "raw", "personal detail");
-    let mut input = history_input("work", "copy");
+    let mut input = event_input("work", "copy");
     input.scope = workspace.clone();
     input.sources = vec![raw];
     let copy = log
-        .append_history(OperationId::new(), input.clone(), b"first".as_slice())
+        .append(OperationId::new(), input.clone(), b"first".as_slice())
         .unwrap()
         .pin;
     input.event_id = "second".into();
     input.sources = vec![copy];
     let nested = log
-        .append_history(OperationId::new(), input, b"second".as_slice())
+        .append(OperationId::new(), input, b"second".as_slice())
         .unwrap()
         .pin;
     let checkpoint = log
@@ -2152,7 +2149,7 @@ fn a_log_copy_needs_the_scopes_of_its_sources() {
                 session: "work".into(),
                 run: "run".into(),
                 scope: CheckpointScope::Session,
-                history_sequence: 2,
+                sequence: 2,
                 expected_previous: None,
                 expected_availability_epoch: store.availability_epoch().unwrap(),
                 sources: vec![],
@@ -2222,7 +2219,7 @@ fn purging_a_log_event_hides_what_was_derived_from_it() {
                 scope: CheckpointScope::Session,
                 session: "session-a".into(),
                 run: "run".into(),
-                history_sequence: 2,
+                sequence: 2,
                 expected_previous: None,
                 expected_availability_epoch: store.availability_epoch().unwrap(),
                 sources: vec![raw.clone()],
@@ -2254,37 +2251,37 @@ fn a_withdrawn_fragment_hides_its_whole_message() {
         .unwrap();
     let message_id = "message".to_string();
     let kinds = [
-        HistoryKind::AssistantStarted {
+        EventKind::AssistantStarted {
             message_id: message_id.clone(),
         },
-        HistoryKind::AssistantFragment {
+        EventKind::AssistantFragment {
             message_id: message_id.clone(),
             ordinal: 0,
         },
-        HistoryKind::AssistantFragment {
+        EventKind::AssistantFragment {
             message_id: message_id.clone(),
             ordinal: 1,
         },
-        HistoryKind::ToolCall {
+        EventKind::ToolCall {
             message_id: Some(message_id.clone()),
             call_id: "call".into(),
             tool_name: "read".into(),
         },
-        HistoryKind::ToolResult {
+        EventKind::ToolResult {
             call_id: "call".into(),
             outcome: ToolOutcome::Succeeded,
         },
-        HistoryKind::AssistantTerminal {
+        EventKind::AssistantTerminal {
             message_id,
             status: MessageStatus::Completed,
         },
     ];
     let mut pins = Vec::new();
     for (index, kind) in kinds.into_iter().enumerate() {
-        let mut input = history_input("session-a", &index.to_string());
+        let mut input = event_input("session-a", &index.to_string());
         input.kind = kind;
         pins.push(
-            log.append_history(OperationId::new(), input, b"event".as_slice())
+            log.append(OperationId::new(), input, b"event".as_slice())
                 .unwrap()
                 .pin,
         );
@@ -2325,7 +2322,7 @@ fn a_legacy_directory_resets_into_an_empty_store() {
     let store = Store::open(&root).unwrap();
     let log = store.session_log(access("owner")).unwrap();
     let context = store.context(access("owner")).unwrap();
-    assert!(log.history_sessions(10, None).unwrap().sessions.is_empty());
+    assert!(log.sessions(10, None).unwrap().sessions.is_empty());
     assert!(context
         .query_current_valid(None, None, 10)
         .unwrap()
@@ -2365,15 +2362,15 @@ fn access_bound_to_a_session_appends_only_to_it() {
     let log = store.session_log(profile).unwrap();
     let id = OperationId::new();
     assert!(matches!(
-        log.append_history(id, history_input("other", "event"), &b"text"[..]),
+        log.append(id, event_input("other", "event"), &b"text"[..]),
         Err(ContextError::AccessDenied)
     ));
-    assert_eq!(log.history_position("other").unwrap(), 0);
+    assert_eq!(log.position("other").unwrap(), 0);
     assert!(log.operation_receipt(id).unwrap().is_none());
     let receipt = log
-        .append_history(id, history_input("bound", "event"), &b"text"[..])
+        .append(id, event_input("bound", "event"), &b"text"[..])
         .unwrap();
-    assert_eq!(receipt.history_sequence, Some(1));
+    assert_eq!(receipt.sequence, Some(1));
 }
 
 #[test]
@@ -2390,14 +2387,13 @@ fn log_permissions_follow_the_actor() {
         let log = store
             .session_log(ContextAccess::new(&owner, actor))
             .unwrap();
-        let message =
-            log.append_history(OperationId::new(), history_input("s", "user"), &b"said"[..]);
+        let message = log.append(OperationId::new(), event_input("s", "user"), &b"said"[..]);
         if actor == Actor::Assistant {
             assert!(matches!(message, Err(ContextError::AccessDenied)));
         } else {
             message.unwrap();
         }
-        let sessions = log.history_sessions(5, None);
+        let sessions = log.sessions(5, None);
         if matches!(actor, Actor::System | Actor::Operator) {
             assert_eq!(sessions.unwrap().sessions, ["s"]);
         } else {
@@ -2419,8 +2415,8 @@ fn log_permissions_follow_the_actor() {
     }
 }
 
-fn log_query() -> HistoryQuery {
-    HistoryQuery {
+fn log_query() -> LogQuery {
+    LogQuery {
         text: "hit".into(),
         session: None,
         cursor: None,
@@ -2446,23 +2442,23 @@ fn log_reads_and_searches_refuse_budgets_over_their_limits() {
         log.read_payload(&pin, 0, MAX_PAYLOAD_PAGE_BYTES + 1),
         Err(ContextError::InvalidInput(_))
     ));
-    assert_eq!(log.search_history(log_query()).unwrap().matches.len(), 1);
+    assert_eq!(log.search(log_query()).unwrap().matches.len(), 1);
     for invalid in [
-        HistoryQuery {
+        LogQuery {
             max_events: 4097,
             ..log_query()
         },
-        HistoryQuery {
+        LogQuery {
             max_bytes: 16 * 1024 * 1024 + 1,
             ..log_query()
         },
-        HistoryQuery {
+        LogQuery {
             limit: 101,
             ..log_query()
         },
     ] {
         assert!(matches!(
-            log.search_history(invalid),
+            log.search(invalid),
             Err(ContextError::InvalidInput(_))
         ));
     }
@@ -2474,21 +2470,21 @@ fn search_walks_sessions_in_key_order_and_events_in_sequence() {
     let store = Store::create(dir.path().join("store")).unwrap();
     let log = store.session_log(access("owner")).unwrap();
     for session in ["bb", "z", "aa", "z", "bb", "aa"] {
-        let seq = log.history_position(session).unwrap() + 1;
-        log.append_history(
+        let seq = log.position(session).unwrap() + 1;
+        log.append(
             OperationId::new(),
-            history_input(session, &seq.to_string()),
+            event_input(session, &seq.to_string()),
             &b"hit"[..],
         )
         .unwrap();
     }
-    let mut query = HistoryQuery {
+    let mut query = LogQuery {
         limit: 1,
         ..log_query()
     };
     let mut positions = Vec::new();
     loop {
-        let page = log.search_history(query.clone()).unwrap();
+        let page = log.search(query.clone()).unwrap();
         assert_eq!(page.matches.len(), 1);
         let entry = page
             .matches
@@ -2496,7 +2492,7 @@ fn search_walks_sessions_in_key_order_and_events_in_sequence() {
             .next()
             .unwrap()
             .header
-            .history
+            .event
             .unwrap();
         positions.push((entry.session, entry.sequence));
         if page.cursor.is_none() {
@@ -2588,7 +2584,7 @@ fn one_operation_id_names_one_write_across_the_log_and_context() {
     let context = store.context(access("owner")).unwrap();
     let id = OperationId::new();
     let receipt = log
-        .append_history(id, history_input("s", "first"), &b"text"[..])
+        .append(id, event_input("s", "first"), &b"text"[..])
         .unwrap();
     assert!(matches!(
         context.define_type(id, definition("note")),
@@ -2598,11 +2594,11 @@ fn one_operation_id_names_one_write_across_the_log_and_context() {
     let id = OperationId::new();
     let receipt = context.define_type(id, definition("note")).unwrap();
     assert!(matches!(
-        log.append_history(id, history_input("s", "second"), &b"text"[..]),
+        log.append(id, event_input("s", "second"), &b"text"[..]),
         Err(ContextError::IdempotencyConflict)
     ));
     assert_eq!(log.operation_receipt(id).unwrap(), Some(receipt));
-    assert_eq!(log.history_position("s").unwrap(), 1);
+    assert_eq!(log.position("s").unwrap(), 1);
 }
 
 #[test]

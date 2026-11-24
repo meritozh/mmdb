@@ -15,8 +15,8 @@ pub use types::*;
 const CALLS: &str = "session_tool_calls_v1";
 const MESSAGES: &str = "session_messages_v1";
 module_partitions!(SessionParts, SESSION_PARTITIONS, {
-    history_order => "session_order_v1",
-    history_heads => "session_heads_v1",
+    order => "session_order_v1",
+    heads => "session_heads_v1",
     events => "session_events_v1",
     calls => CALLS,
     results => "session_tool_results_v1",
@@ -93,14 +93,14 @@ impl SessionLog<'_> {
         state: RecordState,
     ) -> ContextResult<WriteReceipt> {
         expected.record.kind.require_module(StoreModule::Session)?;
-        let redacts = state == RecordState::Purged || expected.record.kind == RecordKind::History;
+        let redacts = state == RecordState::Purged || expected.record.kind == RecordKind::Event;
         if redacts && !matches!(self.scoped.access().actor, Actor::User | Actor::Operator) {
             return Err(ContextError::AccessDenied);
         }
         self.scoped
             .commit_state_change(operation, expected, state, redacts, |batch, _, header| {
-                if let Some(history) = &header.history {
-                    self.withdraw_history(batch, history)?;
+                if let Some(event) = &header.event {
+                    self.withdraw_event(batch, event)?;
                 }
                 Ok(())
             })

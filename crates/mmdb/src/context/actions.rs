@@ -130,7 +130,7 @@ impl ContextStore<'_> {
                 digest,
                 WriteReceipt {
                     pin: previous.pin,
-                    history_sequence: None,
+                    sequence: None,
                 },
             );
         } else {
@@ -159,7 +159,7 @@ impl ContextStore<'_> {
             digest,
             WriteReceipt {
                 pin,
-                history_sequence: None,
+                sequence: None,
             },
         )
     }
@@ -331,7 +331,7 @@ impl ContextStore<'_> {
                 digest,
                 WriteReceipt {
                     pin,
-                    history_sequence: None,
+                    sequence: None,
                 },
             )?,
             already_present: false,
@@ -405,7 +405,7 @@ impl ContextStore<'_> {
             digest,
             WriteReceipt {
                 pin,
-                history_sequence: None,
+                sequence: None,
             },
         )
     }
@@ -476,7 +476,7 @@ impl ContextStore<'_> {
             recorded_at_ms: now,
             payload,
             endpoints: None,
-            history: None,
+            event: None,
             checkpoint: None,
         }
     }

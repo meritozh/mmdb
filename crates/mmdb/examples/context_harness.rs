@@ -1,6 +1,6 @@
 //! A deterministic pair of harnesses sharing a context store across reopen.
 use mmdb::context::*;
-use mmdb::session::HistoryInput;
+use mmdb::session::EventInput;
 use mmdb::Store;
 use mmdb::{Actor, OperationId, Scope, TemporalFacts};
 use serde_json::json;
@@ -15,14 +15,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         access.agent = Some("research".into());
         let log = db.session_log(access.clone())?;
         let context = db.context(access)?;
-        let evidence = log.append_history(
+        let evidence = log.append(
             OperationId::new(),
-            HistoryInput {
+            EventInput {
                 sources: Vec::new(),
                 session: "research-session".into(),
                 event_id: "user-message-1".into(),
                 scope: Scope::Personal,
-                kind: HistoryKind::UserMessage,
+                kind: EventKind::UserMessage,
                 media_type: "text/plain".into(),
                 occurred_at_ms: 1,
                 expected_sequence: Some(0),
@@ -134,8 +134,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         hit.path.len()
     );
     println!(
-        "Original session history position: {}",
-        log.history_position("research-session")?
+        "Session log position: {}",
+        log.position("research-session")?
     );
     Ok(())
 }

@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = database.context(access)?;
     let read_source = |pin: &RecordPin| -> ContextResult<()> {
         match pin.record.kind {
-            RecordKind::History => {
+            RecordKind::Event => {
                 log.read_payload(pin, 0, MAX_PAYLOAD_PAGE_BYTES)?;
             }
             RecordKind::Checkpoint => {
@@ -37,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sessions = Vec::new();
     let mut after = None;
     loop {
-        let page = log.history_sessions(100, after.as_deref())?;
+        let page = log.sessions(100, after.as_deref())?;
         sessions.extend(page.sessions);
         after = page.next;
         if after.is_none() {
@@ -59,25 +59,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut runs = BTreeSet::new();
         let mut records = Vec::new();
         loop {
-            let page = log.history(&session, sequence, 100)?;
+            let page = log.events(&session, sequence, 100)?;
             if page.entries.is_empty() {
                 break;
             }
             for header in page.entries {
-                let history = header.history.as_ref().ok_or("missing history metadata")?;
-                if history.sequence != sequence + 1 || !event_ids.insert(history.event_id.clone()) {
-                    return Err("non-contiguous or duplicate history".into());
+                let event = header.event.as_ref().ok_or("missing event metadata")?;
+                if event.sequence != sequence + 1 || !event_ids.insert(event.event_id.clone()) {
+                    return Err("non-contiguous or duplicate session events".into());
                 }
-                sequence = history.sequence;
+                sequence = event.sequence;
                 agents.insert(header.provenance.agent.clone());
                 runs.insert(header.provenance.run.clone());
-                match &history.kind {
-                    HistoryKind::ToolCall { call_id, .. } => {
+                match &event.kind {
+                    EventKind::ToolCall { call_id, .. } => {
                         if calls.insert(call_id.clone(), header.pin.clone()).is_some() {
                             return Err("duplicate tool call".into());
                         }
                     }
-                    HistoryKind::ToolResult { call_id, .. }
+                    EventKind::ToolResult { call_id, .. }
                         if !calls.contains_key(call_id) || !results.insert(call_id.clone()) =>
                     {
                         return Err("orphan or duplicate tool result".into());
