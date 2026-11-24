@@ -58,6 +58,6 @@ See the [recovery implementation](../../crates/mmdb/src/db/index_repair.rs) and 
 
 ## How the stores fit together
 
-The facade composes the node store with [vector search](vector-search.md), [graph traversal](graph-traversal.md), and [blob storage](blob-storage.md). Node, vector and graph indexes share a fjall keyspace. The blob store keeps bytes in hash-addressed files with its own metadata. The [catalog](memory-catalog.md) supplies row estimates and kind counts to [query execution](query-execution.md).
+The facade composes the node store with [vector search](vector-search.md), [graph traversal](graph-traversal.md), and [blob storage](blob-storage.md). Node, vector and graph indexes use separate keyspaces in one Fjall database. The blob store keeps bytes in hash-addressed files with its own metadata. The [catalog](memory-catalog.md) supplies row estimates and kind counts to [query execution](query-execution.md).
 
 At the facade boundary, [embedding projections](embedding-projections.md) run caller-provided clients. [Evidence recall](evidence-recall.md) combines lexical, vector and relation evidence. [Dream maintenance](dream-maintenance.md) stages derived memories, and the [audit journal](memory-audit.md) records operations.

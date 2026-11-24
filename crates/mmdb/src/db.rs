@@ -76,15 +76,16 @@ impl Database {
         legacy_embedder: Option<Box<dyn Embedder>>,
     ) -> Result<Self> {
         let path = path.as_ref();
+        BlobStore::check_format(path)?;
         let storage = Arc::new(Storage::open(path)?);
-        let vector_store = Arc::new(VectorStore::open(storage.keyspace.clone(), path)?);
-        let graph_store = Arc::new(GraphStore::open(storage.keyspace.clone())?);
+        let vector_store = Arc::new(VectorStore::open(storage.database.clone(), path)?);
+        let graph_store = Arc::new(GraphStore::open(storage.database.clone())?);
         let blob_store = Arc::new(BlobStore::open(path)?);
-        let audit_store = Arc::new(AuditStore::open(storage.keyspace.clone())?);
-        let lexical_index = Arc::new(LexicalIndex::open(storage.keyspace.clone())?);
-        let runtime_store = Arc::new(RuntimeStore::open(storage.keyspace.clone())?);
-        let state_store = Arc::new(StateStore::open(storage.keyspace.clone(), config.tenant)?);
-        let access_store = Arc::new(AccessStore::open(storage.keyspace.clone())?);
+        let audit_store = Arc::new(AuditStore::open(storage.database.clone())?);
+        let lexical_index = Arc::new(LexicalIndex::open(storage.database.clone())?);
+        let runtime_store = Arc::new(RuntimeStore::open(storage.database.clone())?);
+        let state_store = Arc::new(StateStore::open(storage.database.clone(), config.tenant)?);
+        let access_store = Arc::new(AccessStore::open(storage.database.clone())?);
         let catalog = rebuild_catalog(&storage, config.tenant)?;
         let persisted_profile = runtime_store.load_profile(config.tenant)?;
         let migrate_legacy = requested_profile.is_none() && persisted_profile.is_none();

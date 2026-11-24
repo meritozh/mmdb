@@ -1,13 +1,13 @@
 use super::keys::*;
 use super::snapshot::manifest_path;
 use super::{HitFilter, SnapshotManifest, VectorStore};
-use fjall::Config;
+use fjall::Database as FjallDatabase;
 use std::path::Path;
 use tempfile::tempdir;
 use ulid::Ulid;
 
 fn make_store_at(path: &Path) -> VectorStore {
-    let ks = Config::new(path).open().unwrap();
+    let ks = FjallDatabase::builder(path).open().unwrap();
     VectorStore::open(ks, path).unwrap()
 }
 
@@ -144,7 +144,7 @@ fn open_reloads_checkpointed_hnsw_snapshot() {
     let dir = tempdir().unwrap();
     let engine = dir.path().join("engine");
     assert_snapshot_reloads(
-        || VectorStore::open(Config::new(&engine).open().unwrap(), dir.path()).unwrap(),
+        || VectorStore::open(FjallDatabase::builder(&engine).open().unwrap(), dir.path()).unwrap(),
         &dir.path().join("vector_hnsw_snapshots"),
     );
 }
@@ -155,7 +155,7 @@ fn open_reloads_from_explicit_snapshot_directory() {
     let snapshots = tempdir().unwrap();
     assert_snapshot_reloads(
         || {
-            let ks = Config::new(engine.path()).open().unwrap();
+            let ks = FjallDatabase::builder(engine.path()).open().unwrap();
             VectorStore::open_with_snapshot_dir(ks, snapshots.path()).unwrap()
         },
         snapshots.path(),

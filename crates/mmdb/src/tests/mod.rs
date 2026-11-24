@@ -3838,7 +3838,7 @@ mod agent_memory {
             let storage = mmdb_storage::Storage::open(dir.path()).unwrap();
             storage.put_node(&node).unwrap();
             let vectors =
-                mmdb_vector::VectorStore::open(storage.keyspace.clone(), dir.path()).unwrap();
+                mmdb_vector::VectorStore::open(storage.database.clone(), dir.path()).unwrap();
             vectors.insert(0, "old-model", id, &[1.0, 0.0]).unwrap();
             let key = mmdb_storage::keys::node_key(0, id);
             let value = storage.nodes.get(&key).unwrap().unwrap();
@@ -3852,7 +3852,7 @@ mod agent_memory {
                 .nodes
                 .insert(key, serde_json::to_vec(&value).unwrap())
                 .unwrap();
-            storage.keyspace.persist(PersistMode::SyncAll).unwrap();
+            storage.database.persist(PersistMode::SyncAll).unwrap();
         }
         let db = Database::open(dir.path()).unwrap();
         let node = db.get(id).unwrap().unwrap();

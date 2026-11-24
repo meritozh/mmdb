@@ -62,7 +62,7 @@ impl VectorStore {
         idx.insert_batch(&assigned);
 
         // Persist meta + rev in one fjall batch.
-        let mut batch = self.keyspace.batch();
+        let mut batch = self.database.batch().durability(Some(PersistMode::SyncAll));
         for ((node_id, internal_id), (vec, _)) in node_to_id.iter().zip(assigned.iter()) {
             let meta_key = meta_key_bytes(tenant, model, *node_id);
             let mut meta_val = Vec::with_capacity(8 + 4 + vec.len() * 4);
@@ -76,9 +76,6 @@ impl VectorStore {
             batch.insert(&self.rev, rev_key, node_id.0.to_be_bytes());
         }
         batch.commit().map_err(|e| Error::Storage(e.to_string()))?;
-        self.keyspace
-            .persist(PersistMode::SyncAll)
-            .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -191,15 +188,12 @@ impl VectorStore {
 
         let rev_key = rev_key_bytes(tenant, model, internal_id);
         let tomb_key = tomb_key_bytes(tenant, model, internal_id);
-        let mut batch = self.keyspace.batch();
+        let mut batch = self.database.batch().durability(Some(PersistMode::SyncAll));
         batch.remove(&self.meta, meta_key);
         batch.remove(&self.rev, rev_key);
         batch.insert(&self.tomb, tomb_key, []);
         batch.commit().map_err(|e| Error::Storage(e.to_string()))?;
         self.record_tombstone_high_watermark((tenant, model_hash(model)), internal_id);
-        self.keyspace
-            .persist(PersistMode::SyncAll)
-            .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -253,7 +247,7 @@ impl VectorStore {
         let (lo, hi) = meta_range_bytes(tenant, model);
         let mut count = 0;
         for kv in self.meta.range(lo..hi) {
-            kv.map_err(|e| Error::Storage(e.to_string()))?;
+            kv.into_inner().map_err(|e| Error::Storage(e.to_string()))?;
             count += 1;
             if count >= stop_after {
                 break;
@@ -273,7 +267,7 @@ impl VectorStore {
         let (lo, hi) = meta_range_bytes(tenant, model);
         let mut scored = Vec::new();
         for kv in self.meta.range(lo..hi) {
-            let (key, value) = kv.map_err(|e| Error::Storage(e.to_string()))?;
+            let (key, value) = kv.into_inner().map_err(|e| Error::Storage(e.to_string()))?;
             let Some(node_id) = node_id_from_meta_key(&key) else {
                 continue;
             };

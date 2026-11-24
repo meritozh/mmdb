@@ -7,7 +7,7 @@
 //! Run with:
 //!   cargo run --release -p mmdb-vector --example recall_bench
 
-use fjall::Config;
+use fjall::Database as FjallDatabase;
 use mmdb_vector::VectorStore;
 use std::time::Instant;
 use tempfile::tempdir;
@@ -40,7 +40,7 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
 
 fn main() {
     let dir = tempdir().unwrap();
-    let ks = Config::new(dir.path()).open().unwrap();
+    let ks = FjallDatabase::builder(dir.path()).open().unwrap();
     let store = VectorStore::open(ks, dir.path()).unwrap();
 
     let mut seed: u64 = 0xdead_beef_cafe_babe;

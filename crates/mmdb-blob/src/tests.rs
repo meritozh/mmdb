@@ -110,8 +110,8 @@ fn reopen_survives_refcounts() {
 #[test]
 fn open_with_repair_removes_orphan_on_disk_blob() {
     let dir = tempdir().unwrap();
-    // Manually plant an orphan blob on disk (no metadata entry).
-    fs::ensure_layout(dir.path()).unwrap();
+    // Establish a known-format metadata database, then plant bytes with no row.
+    drop(BlobStore::open(dir.path()).unwrap());
     let orphan_hash = [0xc0; 32];
     fs::write_blob_bytes(dir.path(), &orphan_hash, b"orphan data").unwrap();
     assert!(fs::blob_exists_on_disk(dir.path(), &orphan_hash));

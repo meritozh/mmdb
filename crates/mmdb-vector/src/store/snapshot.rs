@@ -17,7 +17,7 @@ impl VectorStore {
         //                                  dim, items,                 max_id
 
         for kv in self.meta.iter() {
-            let (k, v) = kv.map_err(|e| Error::Storage(e.to_string()))?;
+            let (k, v) = kv.into_inner().map_err(|e| Error::Storage(e.to_string()))?;
             if k.len() != 4 + 4 + 16 || v.len() < 8 + 4 {
                 continue;
             }
@@ -99,7 +99,7 @@ impl VectorStore {
     fn load_tombstone_groups(&self) -> Result<HashMap<(u32, u32), RoaringBitmap>> {
         let mut tomb_groups: HashMap<(u32, u32), RoaringBitmap> = HashMap::new();
         for kv in self.tomb.iter() {
-            let (k, _) = kv.map_err(|e| Error::Storage(e.to_string()))?;
+            let (k, _) = kv.into_inner().map_err(|e| Error::Storage(e.to_string()))?;
             if k.len() != 4 + 4 + 8 {
                 continue;
             }
@@ -223,7 +223,7 @@ impl VectorStore {
         let mut max_internal_id = 0;
         let (lo, hi) = meta_range_bytes_for_hash(tenant, mh);
         for kv in self.meta.range(lo..hi) {
-            let (_, value) = kv.map_err(|e| Error::Storage(e.to_string()))?;
+            let (_, value) = kv.into_inner().map_err(|e| Error::Storage(e.to_string()))?;
             if value.len() < 8 {
                 continue;
             }
@@ -233,7 +233,7 @@ impl VectorStore {
 
         let (lo, hi) = tomb_range_bytes_for_hash(tenant, mh);
         for kv in self.tomb.range(lo..hi) {
-            let (key, _) = kv.map_err(|e| Error::Storage(e.to_string()))?;
+            let (key, _) = kv.into_inner().map_err(|e| Error::Storage(e.to_string()))?;
             if key.len() != 4 + 4 + 8 {
                 continue;
             }

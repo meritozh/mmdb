@@ -1744,7 +1744,7 @@ impl fmt::Display for StoreFormatError {
                 found,
             } => write!(
                 formatter,
-                "store root `{}` has format `{found}`, expected exact format `{expected}`",
+                "store root `{}` has format `{found}`, expected exact format `{expected}`; use a new directory or explicitly reset this managed store",
                 path.display()
             ),
             Self::EmptyResetTargetSet => formatter.write_str("reset plan has no explicit targets"),

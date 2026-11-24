@@ -12,7 +12,7 @@
 //! <root>/
 //!   blobs/            # blob bytes on the filesystem
 //!     <xx>/<64hex>    # one file per small blob, chunked directory per large
-//!   blob-meta/        # fjall keyspace with a single partition `m`
+//!   blob-meta/        # Fjall database with a single keyspace `m`
 //!     m/              # per-hash refcount + size + chunked flag
 //! ```
 //!
@@ -50,7 +50,7 @@ use crate::metadata::{BlobMeta, MetaStore};
 pub const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 /// Blobs ≤ this threshold are small enough to be stored inline inside
-/// the fjall `nodes` partition by the caller. They *can* also live on
+/// the Fjall `nodes` keyspace by the caller. They *can* also live on
 /// the filesystem; this is purely a performance hint.
 pub const INLINE_THRESHOLD: usize = 64 * 1024;
 
@@ -128,8 +128,31 @@ impl BlobStore {
         Self::open_with(path, true)
     }
 
+    /// Validate the byte store and its optional enclosing engine before either is opened.
+    pub fn check_format(root: &Path) -> Result<()> {
+        use mmdb_kernel::engine_format::{inspect, EngineRoot};
+        inspect(root, &["blobs", "blob-meta"])?;
+        if inspect(&fs::metadata_dir(root), &[])? == EngineRoot::New {
+            let bytes = root.join("blobs");
+            match std::fs::read_dir(&bytes) {
+                Ok(mut files) => {
+                    if files.next().transpose()?.is_some() {
+                        return Err(mmdb_core::Error::Storage(format!(
+                            "{} contains blob data without its metadata; open a new empty store",
+                            bytes.display()
+                        )));
+                    }
+                }
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     fn open_with(path: impl AsRef<Path>, repair: bool) -> Result<Self> {
         let root = path.as_ref().to_path_buf();
+        Self::check_format(&root)?;
         fs::ensure_layout(&root)?;
         let meta = Arc::new(MetaStore::open(&root)?);
         let store = Self {

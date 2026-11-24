@@ -19,7 +19,7 @@
 //! - Linear scan for GC (iterate all, filter refcount == 0)
 //! - Crash durability via fjall's WAL + MVCC
 
-use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
+use fjall::{Database as FjallDatabase, Keyspace, KeyspaceCreateOptions, PersistMode};
 use mmdb_core::{Error, Result};
 use std::path::Path;
 
@@ -66,8 +66,8 @@ impl BlobMeta {
 /// raw 32-byte BLAKE3 hash. (We hex-encode internally so fjall range scans
 /// produce human-readable debug output if needed.)
 pub(crate) struct MetaStore {
-    keyspace: Keyspace,
-    meta: PartitionHandle,
+    database: FjallDatabase,
+    meta: Keyspace,
 }
 
 impl MetaStore {
@@ -75,13 +75,13 @@ impl MetaStore {
         let meta_dir = fs::metadata_dir(root.as_ref());
         std::fs::create_dir_all(&meta_dir)
             .map_err(|e| Error::Storage(format!("create blob-meta dir: {e}")))?;
-        let ks = Config::new(&meta_dir)
+        let ks = FjallDatabase::builder(&meta_dir)
             .open()
-            .map_err(|e| Error::Storage(format!("open blob-meta keyspace: {e}")))?;
+            .map_err(|e| Error::Storage(format!("open blob-meta database: {e}")))?;
         let meta = ks
-            .open_partition(PARTITION_META, PartitionCreateOptions::default())
+            .keyspace(PARTITION_META, KeyspaceCreateOptions::default)
             .map_err(|e| Error::Storage(format!("open meta partition: {e}")))?;
-        Ok(Self { keyspace: ks, meta })
+        Ok(Self { database: ks, meta })
     }
 
     /// Insert a brand-new blob entry with refcount = 1.
@@ -93,10 +93,7 @@ impl MetaStore {
             chunked,
         }
         .encode();
-        self.meta
-            .insert(key, val.as_slice())
-            .map_err(|e| Error::Storage(format!("insert meta: {e}")))?;
-        self.persist()
+        self.write(key, val)
     }
 
     /// Look up a blob entry.
@@ -120,10 +117,7 @@ impl MetaStore {
         let mut m = BlobMeta::decode(&existing)
             .ok_or_else(|| Error::Storage(format!("corrupt metadata for {key}")))?;
         m.refcount = m.refcount.saturating_add(1);
-        self.meta
-            .insert(key, m.encode().as_slice())
-            .map_err(|e| Error::Storage(format!("inc_ref insert: {e}")))?;
-        self.persist()
+        self.write(key, m.encode())
     }
 
     /// Decrement refcount by 1 (saturating at 0). Returns NotFound if missing.
@@ -137,10 +131,7 @@ impl MetaStore {
         let mut m = BlobMeta::decode(&existing)
             .ok_or_else(|| Error::Storage(format!("corrupt metadata for {key}")))?;
         m.refcount = m.refcount.saturating_sub(1);
-        self.meta
-            .insert(key, m.encode().as_slice())
-            .map_err(|e| Error::Storage(format!("dec_ref insert: {e}")))?;
-        self.persist()
+        self.write(key, m.encode())
     }
 
     /// Iterate all metadata entries (hash, BlobMeta). Used by GC and orphan
@@ -148,7 +139,9 @@ impl MetaStore {
     pub(crate) fn iter_all(&self) -> Result<Vec<([u8; 32], BlobMeta)>> {
         let mut out = Vec::new();
         for kv in self.meta.iter() {
-            let (k, v) = kv.map_err(|e| Error::Storage(format!("iter meta: {e}")))?;
+            let (k, v) = kv
+                .into_inner()
+                .map_err(|e| Error::Storage(format!("iter meta: {e}")))?;
             let key_bytes: &[u8] = k.as_ref();
             let Some(key_str) = std::str::from_utf8(key_bytes).ok() else {
                 tracing::warn!(key = ?k, "non-utf8 metadata key, skipping");
@@ -171,17 +164,19 @@ impl MetaStore {
     /// unlinked from disk.
     pub(crate) fn remove(&self, hash: &[u8; 32]) -> Result<()> {
         let key = fs::hex_hash(hash);
-        self.meta
-            .remove(&key)
-            .map_err(|e| Error::Storage(format!("remove meta: {e}")))?;
-        self.persist()
+        let mut batch = self.database.batch().durability(Some(PersistMode::SyncAll));
+        batch.remove(&self.meta, key);
+        batch
+            .commit()
+            .map_err(|e| Error::Storage(format!("remove blob metadata: {e}")))
     }
 
-    fn persist(&self) -> Result<()> {
-        self.keyspace
-            .persist(PersistMode::SyncAll)
-            .map_err(|e| Error::Storage(format!("persist meta: {e}")))?;
-        Ok(())
+    fn write(&self, key: String, encoded: [u8; VALUE_SIZE]) -> Result<()> {
+        let mut batch = self.database.batch().durability(Some(PersistMode::SyncAll));
+        batch.insert(&self.meta, key, encoded.as_slice());
+        batch
+            .commit()
+            .map_err(|e| Error::Storage(format!("write blob metadata: {e}")))
     }
 }
 

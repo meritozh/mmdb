@@ -3,7 +3,7 @@
 Status: shipped
 
 `mmdb-graph` stores labeled edges and provides neighbor scans plus BFS traversal.
-It shares the facade's fjall keyspace but owns its own partitions.
+It shares the facade’s Fjall database and owns its edge keyspaces.
 
 ## Responsibilities
 
@@ -79,7 +79,7 @@ Graph facade methods:
 - `neighbours_in`
 - `edge_labels`
 
-These methods delegate to `mmdb-graph` while sharing the same fjall keyspace as
+These methods delegate to `mmdb-graph` while sharing the same Fjall database as
 node storage.
 
 The graph store accepts caller labels. Agent-produced relations in the evidence and dream APIs use the reserved labels `contains`, `derived_from`, `causes`, `enables`, `prevents`, `contradicts`, and `supersedes`.

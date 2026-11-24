@@ -18,7 +18,7 @@ use ulid::Ulid;
 macro_rules! native_partition_names {
     ($($constant:ident => $name:literal),+ $(,)?) => {
         $(const $constant: &str = $name;)+
-        pub(crate) const NATIVE_PARTITIONS: &[&str] = &[$($constant),+];
+        pub(crate) const NATIVE_PARTITIONS: &[mmdb_kernel::PartitionSpec] = &[$(mmdb_kernel::PartitionSpec::Inline($constant)),+];
     };
 }
 
@@ -8392,7 +8392,7 @@ mod tests {
 
     #[test]
     fn fresh_store_gets_a_stable_era_and_foreign_roots_are_refused() {
-        assert_eq!(STORE_FORMAT_ID, "mmdb-store-v1");
+        assert_eq!(STORE_FORMAT_ID, "mmdb-store-v2");
         let fresh = tempfile::tempdir().unwrap();
         let fresh_root = fresh.path().join("memory");
         let first_era = {

@@ -69,7 +69,7 @@ Numeric key components are big-endian so range scans sort correctly.
 4. Inserts current time and kind secondary keys.
 5. Inserts compact `nodes_meta`.
 6. Inserts metadata equality index entries.
-7. Commits one fjall batch and persists with `SyncAll`.
+7. Commits one Fjall batch with `SyncAll` durability.
 
 `delete_node` removes the node and all secondary entries in one batch.
 

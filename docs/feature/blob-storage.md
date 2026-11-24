@@ -6,6 +6,10 @@ Status: shipped
 large bytes outside the node LSM while preserving refcounted lifecycle
 semantics.
 
+When blob files exist, opening the store requires a compatible metadata database. A
+missing or incompatible database leaves the files intact. With valid metadata,
+explicit repair can remove individual files that have no metadata row.
+
 ## Responsibilities
 
 - Hash and persist binary payloads.

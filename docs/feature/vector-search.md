@@ -8,7 +8,7 @@ It wraps HNSW search while keeping a fjall-backed source of truth for rebuilds.
 ## Responsibilities
 
 - Maintain one `VectorIndex` per `(tenant, model)`.
-- Store vector rows, reverse lookup rows, and tombstones in fjall partitions.
+- Store vector rows, reverse lookup rows, and tombstones in Fjall keyspaces.
 - Rebuild HNSW indexes from persisted vector metadata.
 - Load native HNSW snapshots when manifests prove they are current.
 - Support filtered search by candidate `Ulid`.

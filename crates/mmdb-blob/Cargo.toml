@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+mmdb-kernel = { path = "../mmdb-kernel" }
 mmdb-core = { path = "../mmdb-core" }
 blake3.workspace = true
 serde.workspace = true

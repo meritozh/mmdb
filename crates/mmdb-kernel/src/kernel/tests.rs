@@ -5,11 +5,14 @@ const MEMORY: ModuleId = ModuleId("memory");
 const MODULES: &[ModuleSpec] = &[
     ModuleSpec {
         id: SESSION,
-        partitions: &["entries"],
+        partitions: &[PartitionSpec::Inline("entries")],
     },
     ModuleSpec {
         id: MEMORY,
-        partitions: &["entries", "index"],
+        partitions: &[
+            PartitionSpec::LargeValues("entries"),
+            PartitionSpec::Inline("index"),
+        ],
     },
 ];
 
@@ -101,14 +104,14 @@ fn store_metadata_is_created_once_and_checked_against_the_manifest() {
     assert_eq!(reopened.keyed_hasher("operation").finalize(), digest);
     drop(reopened);
 
-    let keyspace = Config::new(&root).open().unwrap();
-    let partition = keyspace
-        .open_partition(KERNEL_PARTITION, Default::default())
+    let database = FjallDatabase::builder(&root).open().unwrap();
+    let partition = database
+        .keyspace(KERNEL_PARTITION, Default::default)
         .unwrap();
     let mut metadata: StoreMetadata =
         serde_json::from_slice(&partition.get(STORE_KEY).unwrap().unwrap()).unwrap();
     metadata.store_era = StoreEraId::new().to_string();
-    let mut batch = durable_batch(&keyspace);
+    let mut batch = durable_batch(&database);
     batch.insert(
         &partition,
         STORE_KEY,
@@ -116,18 +119,18 @@ fn store_metadata_is_created_once_and_checked_against_the_manifest() {
     );
     batch.commit().unwrap();
     drop(partition);
-    drop(keyspace);
+    drop(database);
     assert!(matches!(open(&root), Err(KernelError::Corrupt(_))));
 
-    let keyspace = Config::new(&root).open().unwrap();
-    let partition = keyspace
-        .open_partition(KERNEL_PARTITION, Default::default())
+    let database = FjallDatabase::builder(&root).open().unwrap();
+    let partition = database
+        .keyspace(KERNEL_PARTITION, Default::default)
         .unwrap();
-    let mut batch = durable_batch(&keyspace);
+    let mut batch = durable_batch(&database);
     batch.remove(&partition, STORE_KEY);
     batch.commit().unwrap();
     drop(partition);
-    drop(keyspace);
+    drop(database);
     assert!(matches!(open(&root), Err(KernelError::Corrupt(_))));
 }
 
@@ -138,11 +141,11 @@ fn a_first_open_stopped_before_its_metadata_commit_initializes_on_reopen() {
     fs::create_dir(&root).unwrap();
     format().new_manifest().unwrap().write_new(&root).unwrap();
     // The interrupted open left engine files and an empty metadata partition.
-    let keyspace = Config::new(&root).open().unwrap();
-    keyspace
-        .open_partition(KERNEL_PARTITION, Default::default())
+    let database = FjallDatabase::builder(&root).open().unwrap();
+    database
+        .keyspace(KERNEL_PARTITION, Default::default)
         .unwrap();
-    drop(keyspace);
+    drop(database);
     let kernel = open(&root).unwrap();
     let era = kernel.era(SESSION);
     drop(kernel);
@@ -174,34 +177,34 @@ fn module_specs_are_checked_before_opening() {
     }];
     const BAD_NAME: &[ModuleSpec] = &[ModuleSpec {
         id: MEMORY,
-        partitions: &["Not_lower"],
+        partitions: &[PartitionSpec::Inline("Not_lower")],
     }];
     const EMPTY_NAME: &[ModuleSpec] = &[ModuleSpec {
         id: MEMORY,
-        partitions: &[""],
+        partitions: &[PartitionSpec::Inline("")],
     }];
     const DUPLICATE_NAME: &[ModuleSpec] = &[ModuleSpec {
         id: MEMORY,
-        partitions: &["x", "x"],
+        partitions: &[PartitionSpec::Inline("x"), PartitionSpec::Inline("x")],
     }];
     const DUPLICATE_MODULE: &[ModuleSpec] = &[
         ModuleSpec {
             id: MEMORY,
-            partitions: &["x"],
+            partitions: &[PartitionSpec::Inline("x")],
         },
         ModuleSpec {
             id: MEMORY,
-            partitions: &["y"],
+            partitions: &[PartitionSpec::Inline("y")],
         },
     ];
     const TOO_LONG: &[ModuleSpec] = &[ModuleSpec {
         id: MEMORY,
-        partitions: &[concat!(
+        partitions: &[PartitionSpec::Inline(concat!(
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        )],
+        ))],
     }];
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("store");
@@ -272,27 +275,19 @@ fn open_cleans_noncurrent_partitions_and_rejects_unrecognized_names() {
     let kernel = create(&root);
     let current = partition_name(SESSION.0, kernel.era(SESSION), "entries");
     drop(kernel);
-    let keyspace = Config::new(&root).open().unwrap();
+    let database = FjallDatabase::builder(&root).open().unwrap();
     let leftover = partition_name(SESSION.0, EraId::new(), "entries");
-    keyspace
-        .open_partition(&leftover, Default::default())
+    database.keyspace(&leftover, Default::default).unwrap();
+    database
+        .delete_keyspace(database.keyspace(&current, Default::default).unwrap())
         .unwrap();
-    keyspace
-        .delete_partition(
-            keyspace
-                .open_partition(&current, Default::default())
-                .unwrap(),
-        )
-        .unwrap();
-    drop(keyspace);
+    drop(database);
     drop(open(&root).unwrap());
-    let keyspace = Config::new(&root).open().unwrap();
-    assert!(keyspace.partition_exists(&current));
-    assert!(!keyspace.partition_exists(&leftover));
-    keyspace
-        .open_partition("stray", Default::default())
-        .unwrap();
-    drop(keyspace);
+    let database = FjallDatabase::builder(&root).open().unwrap();
+    assert!(database.keyspace_exists(&current));
+    assert!(!database.keyspace_exists(&leftover));
+    database.keyspace("stray", Default::default).unwrap();
+    drop(database);
     assert!(matches!(open(&root), Err(KernelError::Corrupt(_))));
 }
 
@@ -328,15 +323,15 @@ fn module_reset_deletes_the_old_era_partitions() {
     assert_eq!(kernel.era(SESSION), session.era());
     assert_eq!(kernel.era(MEMORY), replacement);
     assert!(receipts.contains_key("reset").unwrap());
-    for name in &kernel.0.schema.0[MEMORY.0] {
+    for name in kernel.0.schema.0[MEMORY.0].keys() {
         assert!(!kernel
             .0
-            .keyspace
-            .partition_exists(&partition_name(MEMORY.0, memory.era(), name)));
+            .database
+            .keyspace_exists(&partition_name(MEMORY.0, memory.era(), name)));
         assert!(kernel
             .0
-            .keyspace
-            .partition_exists(&partition_name(MEMORY.0, replacement, name)));
+            .database
+            .keyspace_exists(&partition_name(MEMORY.0, replacement, name)));
     }
     assert!(matches!(
         memory.partition("entries"),
@@ -376,29 +371,29 @@ fn module_reset_cleanup_resumes_after_interruption() {
     assert!(report.cleanup_pending);
     assert!(!kernel
         .0
-        .keyspace
-        .partition_exists(&partition_name(MEMORY.0, old, "entries")));
+        .database
+        .keyspace_exists(&partition_name(MEMORY.0, old, "entries")));
     assert!(kernel
         .0
-        .keyspace
-        .partition_exists(&partition_name(MEMORY.0, old, "index")));
+        .database
+        .keyspace_exists(&partition_name(MEMORY.0, old, "index")));
     assert_eq!(kernel.era_state(MEMORY, old), EraState::Retired);
     drop(kernel);
 
     let kernel = open(&root).unwrap();
-    for name in &kernel.0.schema.0[MEMORY.0] {
+    for name in kernel.0.schema.0[MEMORY.0].keys() {
         assert!(!kernel
             .0
-            .keyspace
-            .partition_exists(&partition_name(MEMORY.0, old, name)));
+            .database
+            .keyspace_exists(&partition_name(MEMORY.0, old, name)));
         assert!(!kernel
             .0
-            .keyspace
-            .partition_exists(&partition_name(MEMORY.0, abandoned, name)));
+            .database
+            .keyspace_exists(&partition_name(MEMORY.0, abandoned, name)));
         assert!(kernel
             .0
-            .keyspace
-            .partition_exists(&partition_name(MEMORY.0, replacement, name)));
+            .database
+            .keyspace_exists(&partition_name(MEMORY.0, replacement, name)));
     }
     assert_eq!(kernel.era_state(MEMORY, old), EraState::Retired);
     assert_eq!(kernel.era_state(MEMORY, abandoned), EraState::Unknown);
@@ -564,8 +559,8 @@ fn an_unknown_reset_outcome_poisons_the_kernel() {
         assert_eq!(kernel.era_state(MEMORY, leftover), leftover_state);
         assert!(!kernel
             .0
-            .keyspace
-            .partition_exists(&partition_name(MEMORY.0, leftover, "entries")));
+            .database
+            .keyspace_exists(&partition_name(MEMORY.0, leftover, "entries")));
         assert_eq!(
             kernel
                 .module(SESSION)
@@ -576,4 +571,23 @@ fn an_unknown_reset_outcome_poisons_the_kernel() {
             applied
         );
     }
+}
+
+#[test]
+fn declared_value_layout_survives_new_eras_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("store");
+    let kernel = create(&root);
+    let check = |parts: EraPartitions| {
+        assert!(parts.partition("entries").unwrap().raw.is_kv_separated());
+        assert!(!parts.partition("index").unwrap().raw.is_kv_separated());
+    };
+    check(kernel.module(MEMORY));
+    let prepared = kernel.prepare_module_reset(MEMORY, EraId::new()).unwrap();
+    check(prepared.clone());
+    kernel
+        .commit_module_reset(prepared, kernel.batch())
+        .unwrap();
+    drop(kernel);
+    check(open(&root).unwrap().module(MEMORY));
 }

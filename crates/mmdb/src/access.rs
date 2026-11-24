@@ -1,6 +1,6 @@
 use crate::audit::{AuditAction, AuditContext};
 use crate::Database;
-use fjall::{Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
+use fjall::{Database as FjallDatabase, Keyspace, KeyspaceCreateOptions, PersistMode};
 use mmdb_core::{Error, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -18,18 +18,18 @@ pub struct AccessStats {
 }
 
 pub(crate) struct AccessStore {
-    keyspace: Keyspace,
-    records: PartitionHandle,
+    database: FjallDatabase,
+    records: Keyspace,
     write_lock: Mutex<()>,
 }
 
 impl AccessStore {
-    pub(crate) fn open(keyspace: Keyspace) -> Result<Self> {
-        let records = keyspace
-            .open_partition(PART_ACCESS, PartitionCreateOptions::default())
+    pub(crate) fn open(database: FjallDatabase) -> Result<Self> {
+        let records = database
+            .keyspace(PART_ACCESS, KeyspaceCreateOptions::default)
             .map_err(|error| Error::Storage(error.to_string()))?;
         Ok(Self {
-            keyspace,
+            database,
             records,
             write_lock: Mutex::new(()),
         })
@@ -55,7 +55,7 @@ impl AccessStore {
 
         let _guard = self.write_lock.lock();
         let mut updated = Vec::with_capacity(node_ids.len());
-        let mut batch = self.keyspace.batch().durability(Some(PersistMode::SyncAll));
+        let mut batch = self.database.batch().durability(Some(PersistMode::SyncAll));
         for node_id in node_ids {
             let current = self.get(tenant, *node_id)?;
             let stats = AccessStats {
@@ -82,7 +82,7 @@ impl AccessStore {
 
     pub(crate) fn delete(&self, tenant: u32, node_id: Ulid) -> Result<()> {
         let _guard = self.write_lock.lock();
-        let mut batch = self.keyspace.batch().durability(Some(PersistMode::SyncAll));
+        let mut batch = self.database.batch().durability(Some(PersistMode::SyncAll));
         batch.remove(&self.records, access_key(tenant, node_id));
         batch
             .commit()
@@ -128,7 +128,7 @@ impl AccessStore {
             access_count,
             last_accessed_at_ms: last_accessed_at_ms.unwrap_or_else(crate::now_ms),
         };
-        let mut batch = self.keyspace.batch().durability(Some(PersistMode::SyncAll));
+        let mut batch = self.database.batch().durability(Some(PersistMode::SyncAll));
         batch.insert(
             &self.records,
             access_key(tenant, target),

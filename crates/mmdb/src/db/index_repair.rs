@@ -2,7 +2,7 @@
 //! the node identity and all model indexes either revision could have touched.
 //! The base node (including absence) decides the outcome on replay.
 use super::Database;
-use fjall::{Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
+use fjall::{Database as FjallDatabase, Keyspace, KeyspaceCreateOptions, PersistMode};
 use mmdb_core::{Error, MemoryNode, Result};
 use mmdb_storage::Storage;
 use std::collections::BTreeSet;
@@ -14,8 +14,8 @@ struct Pending {
     models: BTreeSet<String>,
 }
 pub(super) struct IndexRepairs {
-    ks: Keyspace,
-    part: PartitionHandle,
+    ks: FjallDatabase,
+    part: Keyspace,
     key: [u8; 4],
 }
 fn storage_error(e: impl std::fmt::Display) -> Error {
@@ -24,9 +24,9 @@ fn storage_error(e: impl std::fmt::Display) -> Error {
 
 impl IndexRepairs {
     pub(super) fn open(storage: &Storage, tenant: u32) -> Result<Self> {
-        let ks = storage.keyspace.clone();
+        let ks = storage.database.clone();
         let part = ks
-            .open_partition("node_index_repair_v1", PartitionCreateOptions::default())
+            .keyspace("node_index_repair_v1", KeyspaceCreateOptions::default)
             .map_err(storage_error)?;
         Ok(Self {
             ks,

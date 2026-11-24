@@ -4,7 +4,7 @@ Status: shipped
 
 工作流、游标和待处理队列可以按 tenant、namespace 和二进制 key 读写 JSON 值。每项包含修订和更新时间。状态记录存入 `app_state_v1`，不会作为记忆节点参与语义召回。
 
-`Database::state()` 复用多模型库的 keyspace。对于必须在记忆库重置后继续使用的运行状态，使用 `StateStore::open_path` 打开独立目录，传入 tenant 和存储格式描述。这个入口持有自己的租约。两个目录各自提交，跨库恢复由调用方协调。
+`Database::state()` 在多模型库的同一 Fjall 数据库中使用独立 keyspace。对于必须在记忆库重置后继续使用的运行状态，使用 `StateStore::open_path` 打开独立目录，传入 tenant 和存储格式描述。这个入口持有自己的租约。两个目录各自提交，跨库恢复由调用方协调。
 
 `apply` 和 `apply_namespaced` 在一次批次中检查所有预期修订并执行写入或删除。这样一个轮次的终止状态和待投递的记忆事件可以一起落盘。任一条件冲突，整批都不会生效。I/O 错误后的可见值仍需要通过 `confirm_durable` 确认持久化。
 

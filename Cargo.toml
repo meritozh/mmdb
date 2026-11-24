@@ -10,7 +10,7 @@ authors = ["mmdb contributors"]
 repository = "https://github.com/meritozh/mmdb"
 
 [workspace.dependencies]
-fjall = "2.4"
+fjall = "3.1.13"
 rkyv = { version = "0.7", features = ["validation", "smallvec", "uuid"] }
 ulid = { version = "1.1", features = ["serde"] }
 bytes = "1.7"

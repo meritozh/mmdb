@@ -1,4 +1,4 @@
-use fjall::{Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
+use fjall::{Database as FjallDatabase, Keyspace, KeyspaceCreateOptions, PersistMode};
 use mmdb_core::{Content, Error, MemoryNode, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,21 +21,21 @@ struct LexicalDocument {
 }
 
 pub(crate) struct LexicalIndex {
-    keyspace: Keyspace,
-    docs: PartitionHandle,
-    postings: PartitionHandle,
+    database: FjallDatabase,
+    docs: Keyspace,
+    postings: Keyspace,
 }
 
 impl LexicalIndex {
-    pub(crate) fn open(keyspace: Keyspace) -> Result<Self> {
-        let docs = keyspace
-            .open_partition(PART_DOCS, PartitionCreateOptions::default())
+    pub(crate) fn open(database: FjallDatabase) -> Result<Self> {
+        let docs = database
+            .keyspace(PART_DOCS, KeyspaceCreateOptions::default)
             .map_err(|e| Error::Storage(e.to_string()))?;
-        let postings = keyspace
-            .open_partition(PART_POSTINGS, PartitionCreateOptions::default())
+        let postings = database
+            .keyspace(PART_POSTINGS, KeyspaceCreateOptions::default)
             .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(Self {
-            keyspace,
+            database,
             docs,
             postings,
         })
@@ -58,7 +58,7 @@ impl LexicalIndex {
             length: tokens.len(),
             terms,
         };
-        let mut batch = self.keyspace.batch();
+        let mut batch = self.database.batch().durability(Some(PersistMode::SyncAll));
         if let Some(old) = old {
             for term in old.terms.keys() {
                 batch.remove(&self.postings, posting_key(tenant, term, node));
@@ -76,8 +76,7 @@ impl LexicalIndex {
                 );
             }
         }
-        batch.commit().map_err(|e| Error::Storage(e.to_string()))?;
-        self.persist()
+        batch.commit().map_err(|e| Error::Storage(e.to_string()))
     }
 
     pub(crate) fn delete(&self, tenant: u32, node: Ulid) -> Result<()> {
@@ -88,15 +87,14 @@ impl LexicalIndex {
             .map_err(|e| Error::Storage(e.to_string()))?
             .map(|value| serde_json::from_slice::<LexicalDocument>(&value))
             .transpose()?;
-        let mut batch = self.keyspace.batch();
+        let mut batch = self.database.batch().durability(Some(PersistMode::SyncAll));
         batch.remove(&self.docs, key);
         if let Some(old) = old {
             for term in old.terms.keys() {
                 batch.remove(&self.postings, posting_key(tenant, term, node));
             }
         }
-        batch.commit().map_err(|e| Error::Storage(e.to_string()))?;
-        self.persist()
+        batch.commit().map_err(|e| Error::Storage(e.to_string()))
     }
 
     pub(crate) fn search_with_filter(
@@ -161,7 +159,9 @@ impl LexicalIndex {
         let mut count = 0;
         let mut length = 0;
         for item in self.docs.range(lo..hi) {
-            let (_, value) = item.map_err(|e| Error::Storage(e.to_string()))?;
+            let (_, value) = item
+                .into_inner()
+                .map_err(|e| Error::Storage(e.to_string()))?;
             let document: LexicalDocument = serde_json::from_slice(&value)?;
             count += 1;
             length += document.length;
@@ -183,7 +183,9 @@ impl LexicalIndex {
         hi.extend_from_slice(&[0xff; 16]);
         let mut postings = Vec::new();
         for item in self.postings.range(prefix.clone()..hi) {
-            let (key, value) = item.map_err(|e| Error::Storage(e.to_string()))?;
+            let (key, value) = item
+                .into_inner()
+                .map_err(|e| Error::Storage(e.to_string()))?;
             if key.len() != prefix.len() + 16 || value.len() != 4 {
                 continue;
             }
@@ -194,12 +196,6 @@ impl LexicalIndex {
             postings.push((Ulid(u128::from_be_bytes(id)), u32::from_be_bytes(frequency)));
         }
         Ok(postings)
-    }
-
-    fn persist(&self) -> Result<()> {
-        self.keyspace
-            .persist(PersistMode::SyncAll)
-            .map_err(|e| Error::Storage(e.to_string()))
     }
 }
 
