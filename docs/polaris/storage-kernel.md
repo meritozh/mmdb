@@ -40,6 +40,15 @@ Status: active
 - Builds on: [Embedded multi-model memory](../feature/multi-model-memory.md), [Memory nodes and indexed reads](../feature/memory-nodes.md), [Model-specific vector and hybrid search](../feature/vector-search.md), [Directed edges and graph traversal](../feature/graph-traversal.md), [Content-addressed blob storage](../feature/blob-storage.md), [Embedding projections](../feature/embedding-projections.md), [Evidence recall and revision-checked proposals](../feature/evidence-recall.md), [Reversible dream maintenance](../feature/dream-maintenance.md), [Memory operation audit](../feature/memory-audit.md), [Model registry, statistics and named snapshots](../feature/memory-catalog.md), [Query planning and execution](../feature/query-execution.md), [MMQL recall queries](../feature/mmql.md), [有来源的领域对象、关系与召回](../feature/context-ontology.md), [业务动作定义与执行记录](../feature/business-actions.md)
 - Done when: 只剩一套记忆模型，且它不直接使用 fjall。agent-context 的契约测试在其上通过，依赖白名单的例外清单为空。
 
+## Features
+
+1. 会话日志和检查点从记忆存储迁到存储内核上的会话模块，从随记忆一起重置变为重置记忆后仍完整可读。Iterate [连续会话日志与原文搜索](../feature/session-log.md). Part: 1. After: none
+2. 会话日志从只记录消息和工具事件，变为也记录轮次的开始与结束，并在重开时把未结束的轮次关闭并标为中断。Iterate [连续会话日志与原文搜索](../feature/session-log.md). Part: 1. After: 1
+3. harness 可以创建带头记录的会话、按修订号列出会话，并从一段日志前缀 fork 出子会话。New. Part: 1. After: 1, 2
+4. harness 可以把派生出的对话存成绑定到日志位置的对话缓存，之后只读缓存之后的日志尾部就能还原对话，并在日志事件被撤回或清除后认出缓存已过期。New. Part: 1. After: 1
+5. WebAssembly UDF 从随 MMDB 提供变为移出 MMDB。Iterate [WebAssembly user-defined functions](../feature/wasm-udfs.md). Part: 1. After: none
+6. 运行状态从独立目录或共用多模型库 keyspace，变为同一存储中的模块，状态变更与会话日志追加同批提交。Iterate [运行状态与独立存储目录](../feature/operational-state.md). Part: 2. After: 1, 2
+
 ## Not this
 
 - 不引入更高层的组件（如 SQLite、tantivy、LanceDB）来组装存储。
