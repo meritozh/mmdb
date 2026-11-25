@@ -3,6 +3,35 @@ use crate::OperationId;
 use mmdb_kernel::KernelError;
 use std::fmt;
 
+/// The first turn or step rule that refused an append.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnError {
+    /// The harness supplied Interrupted or Forked.
+    ReservedReason,
+    /// Starting a turn requires a run in the writer's access.
+    RunRequired,
+    /// This session already has an open turn.
+    TurnOpen,
+    /// This call already has a result.
+    Answered,
+    /// The event requires an open turn.
+    OutsideTurn,
+    /// Only the opening run can write this event.
+    OtherRun,
+    /// The end event names another turn.
+    OtherTurn,
+    /// This turn already has an open step.
+    StepOpen,
+    /// The required step is closed or belongs to another message.
+    OutsideStep,
+    /// The step end names another step.
+    OtherStep,
+    /// This step still owes a terminal or a result.
+    StepUnfinished,
+    /// This turn still has an open step or an unanswered call.
+    TurnUnfinished,
+}
+
 #[derive(Debug)]
 pub enum ContextError {
     Storage(KernelError),
@@ -19,6 +48,7 @@ pub enum ContextError {
     AvailabilityConflict { expected: u64, actual: u64 },
     PositionConflict { expected: u64, actual: u64 },
     TypeConflict(String),
+    Turn(TurnError),
     IdempotencyConflict,
     CommitUnknown(OperationId),
     BudgetExceeded,
@@ -40,6 +70,7 @@ impl fmt::Display for ContextError {
             Self::RevisionConflict { expected, actual } => write!(f, "context revision conflict: expected {expected}, actual {actual}"),
             Self::AvailabilityConflict { expected, actual } => write!(f, "context availability conflict: expected {expected}, actual {actual}"),
             Self::PositionConflict { expected, actual } => write!(f, "session log position conflict: expected {expected}, actual {actual}"),
+            Self::Turn(rule) => write!(f, "session turn refused the event: {rule:?}"),
             Self::TypeConflict(name) => write!(f, "context type already has a different definition: {name}"),
             Self::IdempotencyConflict => write!(f, "operation or event identity was reused with different content"),
             Self::CommitUnknown(id) => write!(f, "context commit outcome unknown for operation {id}; inspect its receipt or retry the same operation"),

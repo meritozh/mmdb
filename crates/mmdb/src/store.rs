@@ -11,7 +11,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const STORE_FORMAT_ID: &str = "mmdb-store-v2";
+pub const STORE_FORMAT_ID: &str = "mmdb-store-v3";
 const SESSION: ModuleId = StoreModule::Session.id();
 const MEMORY: ModuleId = StoreModule::Memory.id();
 
@@ -65,7 +65,9 @@ impl Store {
     /// Open an existing directory with the exact store format.
     pub fn open(root: impl AsRef<Path>) -> StoreResult<Self> {
         let format = StoreFormatDescriptor::new(STORE_FORMAT_ID).map_err(KernelError::Format)?;
-        Self::from_kernel(Kernel::open(root.as_ref(), &format, MODULES)?)
+        let store = Self::from_kernel(Kernel::open(root.as_ref(), &format, MODULES)?)?;
+        session::end_interrupted_turns(&store.records, &store.session)?;
+        Ok(store)
     }
 
     fn from_kernel(kernel: Kernel) -> StoreResult<Self> {
@@ -347,7 +349,292 @@ impl From<ContextError> for StoreError {
 mod tests {
     use super::*;
     use crate::context::TypeDefinition;
-    use crate::{Actor, OperationId, Scope};
+    use crate::session::EventInput;
+    use crate::{
+        Actor, EventKind, MessageStatus, OperationId, Scope, ToolOutcome, TurnEndReason, TurnError,
+    };
+
+    fn session_writer<'a>(store: &'a Store, owner: &str, session: &str) -> SessionLog<'a> {
+        store
+            .session_log(ContextAccess {
+                session: Some(session.into()),
+                run: Some(format!("run-{owner}-{session}")),
+                ..ContextAccess::new(owner, Actor::System)
+            })
+            .unwrap()
+    }
+
+    fn event_input(session: &str, id: &str, kind: EventKind) -> EventInput {
+        EventInput {
+            session: session.into(),
+            event_id: id.into(),
+            kind,
+            sources: vec![],
+            scope: Scope::Personal,
+            media_type: "text/plain".into(),
+            occurred_at_ms: 1,
+            expected_sequence: None,
+        }
+    }
+
+    fn append_event(log: &SessionLog<'_>, session: &str, id: &str, kind: EventKind) {
+        log.append(OperationId::new(), event_input(session, id, kind), &[][..])
+            .unwrap();
+    }
+
+    fn start_step(store: &Store, owner: &str, session: &str) {
+        let log = session_writer(store, owner, session);
+        append_event(&log, session, "turn", EventKind::TurnStarted);
+        append_event(&log, session, "step", EventKind::StepStarted);
+    }
+
+    fn assert_step_interrupted(store: &Store, owner: &str, session: &str) {
+        let log = session_writer(store, owner, session);
+        let entries = log.events(session, 2, 10).unwrap().entries;
+        assert_eq!(log.position(session).unwrap(), 4);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].event.as_ref().unwrap().kind,
+            EventKind::StepEnded {
+                start_event_id: "step".into(),
+            }
+        );
+        assert_eq!(
+            entries[1].event.as_ref().unwrap().kind,
+            EventKind::TurnEnded {
+                reason: TurnEndReason::Interrupted,
+                start_event_id: "turn".into(),
+            }
+        );
+        for header in entries {
+            assert_eq!(header.provenance.session.as_deref(), Some(session));
+            assert_eq!(
+                header.provenance.run,
+                Some(format!("run-{owner}-{session}"))
+            );
+        }
+    }
+
+    #[test]
+    fn opening_reads_only_sessions_with_open_turns() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let store = Store::create(&root).unwrap();
+        for owner in ["alice", "bob"] {
+            start_step(&store, owner, "chat");
+        }
+        let idle = session_writer(&store, "alice", "idle");
+        append_event(&idle, "idle", "notice", EventKind::Notice);
+        let mut batch = store.kernel.batch();
+        batch.insert(
+            &store.session.heads,
+            session::session_key("alice", "idle"),
+            b"invalid",
+        );
+        batch.commit().unwrap();
+        drop(store);
+
+        let store = Store::open(&root).unwrap();
+        for owner in ["alice", "bob"] {
+            assert_step_interrupted(&store, owner, "chat");
+        }
+    }
+
+    #[test]
+    fn an_append_reads_only_the_owed_row_it_settles() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::create(temp.path().join("store")).unwrap();
+        start_step(&store, "alice", "chat");
+        let log = session_writer(&store, "alice", "chat");
+        let append =
+            |id: &str, kind| log.append(OperationId::new(), event_input("chat", id, kind), &[][..]);
+        append(
+            "message",
+            EventKind::AssistantStarted {
+                message_id: "m".into(),
+            },
+        )
+        .unwrap();
+        append(
+            "terminal",
+            EventKind::AssistantTerminal {
+                message_id: "m".into(),
+                status: MessageStatus::Completed,
+            },
+        )
+        .unwrap();
+        for id in ["A", "B"] {
+            append(
+                id,
+                EventKind::ToolCall {
+                    call_id: id.into(),
+                    tool_name: "read".into(),
+                    message_id: Some("m".into()),
+                },
+            )
+            .unwrap();
+        }
+        let mut key = session::session_key("alice", "chat");
+        key.extend_from_slice(&[1, b'B']);
+        assert!(store.session.owed.get(&key).unwrap().is_some());
+        let mut batch = store.kernel.batch();
+        batch.insert(&store.session.owed, key, b"invalid");
+        batch.commit().unwrap();
+
+        append("notice", EventKind::Notice).unwrap();
+        append(
+            "result-A",
+            EventKind::ToolResult {
+                call_id: "A".into(),
+                outcome: ToolOutcome::Succeeded,
+            },
+        )
+        .unwrap();
+        let before = log.position("chat").unwrap();
+        assert!(matches!(
+            append(
+                "result-B",
+                EventKind::ToolResult {
+                    call_id: "B".into(),
+                    outcome: ToolOutcome::Succeeded,
+                }
+            ),
+            Err(ContextError::Corrupt(_))
+        ));
+        assert!(matches!(
+            append(
+                "step-end",
+                EventKind::StepEnded {
+                    start_event_id: "step".into()
+                }
+            ),
+            Err(ContextError::Turn(TurnError::StepUnfinished))
+        ));
+        assert!(matches!(
+            append(
+                "cancel",
+                EventKind::TurnEnded {
+                    reason: TurnEndReason::Cancelled,
+                    start_event_id: "turn".into(),
+                }
+            ),
+            Err(ContextError::Corrupt(_))
+        ));
+        assert_eq!(log.position("chat").unwrap(), before);
+    }
+
+    #[test]
+    fn turn_end_and_reopen_reject_inconsistent_owed_counts() {
+        for (turn_owes, step_owes) in [(0, 0), (1, 0), (2, 1)] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("store");
+            let store = Store::create(&root).unwrap();
+            let log = unanswered_call_with_counts(&store, turn_owes, step_owes);
+            let before = log.position("chat").unwrap();
+            let end = event_input(
+                "chat",
+                "end",
+                EventKind::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                    start_event_id: "turn".into(),
+                },
+            );
+            assert!(matches!(
+                log.append(OperationId::new(), end, &b"end"[..]),
+                Err(ContextError::Corrupt(_))
+            ));
+            assert_eq!(log.position("chat").unwrap(), before);
+            let cleanup = log.recover_payloads(1, 1).unwrap();
+            assert_eq!((cleanup.uploads_removed, cleanup.chunks_removed), (0, 0));
+            drop(store);
+            assert!(matches!(
+                Store::open(&root),
+                Err(StoreError::Context(ContextError::Corrupt(_)))
+            ));
+        }
+    }
+
+    fn unanswered_call_with_counts(
+        store: &Store,
+        turn_owes: u64,
+        step_owes: u64,
+    ) -> SessionLog<'_> {
+        start_step(store, "alice", "chat");
+        let log = session_writer(store, "alice", "chat");
+        append_event(
+            &log,
+            "chat",
+            "call",
+            EventKind::ToolCall {
+                call_id: "A".into(),
+                tool_name: "read".into(),
+                message_id: None,
+            },
+        );
+        let key = session::session_key("alice", "chat");
+        let row = store.session.open_turns.get(&key).unwrap().unwrap();
+        let mut turn: serde_json::Value = serde_json::from_slice(&row).unwrap();
+        assert_eq!(turn["owes"], 1);
+        assert_eq!(turn["step"]["owes"], 1);
+        turn["owes"] = turn_owes.into();
+        turn["step"]["owes"] = step_owes.into();
+        let mut batch = store.kernel.batch();
+        batch.insert(
+            &store.session.open_turns,
+            key,
+            serde_json::to_vec(&turn).unwrap(),
+        );
+        batch.commit().unwrap();
+        log
+    }
+
+    #[test]
+    fn settling_with_an_empty_step_count_stages_no_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::create(temp.path().join("store")).unwrap();
+        let log = unanswered_call_with_counts(&store, 1, 0);
+        let before = log.position("chat").unwrap();
+        let result = event_input(
+            "chat",
+            "result",
+            EventKind::ToolResult {
+                call_id: "A".into(),
+                outcome: ToolOutcome::Succeeded,
+            },
+        );
+        assert!(matches!(
+            log.append(OperationId::new(), result, &b"result"[..]),
+            Err(ContextError::Corrupt(_))
+        ));
+        assert_eq!(log.position("chat").unwrap(), before);
+        let cleanup = log.recover_payloads(1, 1).unwrap();
+        assert_eq!((cleanup.uploads_removed, cleanup.chunks_removed), (0, 0));
+    }
+
+    #[test]
+    fn an_unknown_recovery_commit_closes_each_turn_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let store = Store::create(&root).unwrap();
+        for session in ["first", "second"] {
+            start_step(&store, "owner", session);
+        }
+        store.kernel.lose_next_commit_ack(&store.session.open_turns);
+        assert!(matches!(
+            session::end_interrupted_turns(&store.records, &store.session),
+            Err(ContextError::Storage(KernelError::CommitUnknown))
+        ));
+        for session in ["first", "second"] {
+            assert_step_interrupted(&store, "owner", session);
+        }
+        assert!(store.session.open_turns.iter().next().is_none());
+        drop(store);
+
+        let store = Store::open(&root).unwrap();
+        for session in ["first", "second"] {
+            assert_step_interrupted(&store, "owner", session);
+        }
+    }
 
     #[test]
     fn changing_the_replacement_era_invalidates_a_confirmed_digest() {

@@ -23,8 +23,10 @@ directory so workflows and queues survive a memory-store reset.
 
 The `mmdb::context` contract provides versioned object and relation types,
 source-backed records, and bounded lexical and graph recall. The
-`mmdb::session` module provides ordered session events and checkpoints. Both modules
-share the store lease, write lock and durable batches. An assistant can save validated
+`mmdb::session` module provides ordered session events and checkpoints.
+Reopening the store ends each unfinished turn as `Interrupted` after closing its
+pending messages, tool calls and step. Both modules share the store lease, write
+lock and durable batches. An assistant can save validated
 context directly, with provenance and an explicit inference label.
 
 Create a fresh root with `mmdb::Store::create(path)` and reopen it with
@@ -39,7 +41,7 @@ scope and tool permissions.
 the same catalog as custom types. Complete raw events stream into checksummed
 chunks. `SessionLog::search` uses bounded, resumable substring scans. Objects use
 lexical postings and explicit relation paths. One process holds the store lease
-at a time. The format is `mmdb-store-v2` on Fjall 3. Opening a Fjall 2 directory reports an
+at a time. The format is `mmdb-store-v3` on Fjall 3. Opening a Fjall 2 directory reports an
 incompatible format. Choose a new directory, or use a confirmed whole-store
 reset on a managed root to quarantine the original directory and start empty.
 The original MMDB version can open that quarantine.

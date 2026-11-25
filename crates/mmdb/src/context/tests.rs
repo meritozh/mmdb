@@ -99,6 +99,10 @@ fn committed_history_survives_a_lost_acknowledgement_without_duplication() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("context");
     let operation = OperationId::new();
+    let profile = |actor| ContextAccess {
+        run: Some("run".into()),
+        ..ContextAccess::new("owner", actor)
+    };
     let input = EventInput {
         sources: Vec::new(),
         session: "continuous-session".into(),
@@ -107,41 +111,59 @@ fn committed_history_survives_a_lost_acknowledgement_without_duplication() {
         kind: EventKind::AssistantMessage,
         media_type: "text/plain".into(),
         occurred_at_ms: 1,
-        expected_sequence: Some(0),
+        expected_sequence: Some(2),
     };
     let expected = {
         let db = Store::create(&root).unwrap();
-        let store = db
-            .session_log(ContextAccess::new("owner", Actor::Assistant))
-            .unwrap();
+        let store = db.session_log(profile(Actor::Assistant)).unwrap();
+        let system = db.session_log(profile(Actor::System)).unwrap();
+        for (id, kind) in [
+            ("turn", EventKind::TurnStarted),
+            ("step", EventKind::StepStarted),
+        ] {
+            let boundary = EventInput {
+                event_id: id.into(),
+                kind,
+                expected_sequence: None,
+                ..input.clone()
+            };
+            system
+                .append(OperationId::new(), boundary, &[][..])
+                .unwrap();
+        }
         store.scoped.lose_next_commit_ack();
         let error = store
             .append(operation, input.clone(), b"durable answer".as_slice())
             .unwrap_err();
         assert!(matches!(error, ContextError::CommitUnknown(id) if id == operation));
+        assert_eq!(store.position("continuous-session").unwrap(), 3);
         store.operation_receipt(operation).unwrap().unwrap()
     };
     let db = Store::open(&root).unwrap();
-    let store = db
-        .session_log(ContextAccess::new("owner", Actor::Assistant))
-        .unwrap();
+    let store = db.session_log(profile(Actor::Assistant)).unwrap();
     assert_eq!(
         store.operation_receipt(operation).unwrap(),
         Some(expected.clone())
     );
+    let reopened_position = store.position("continuous-session").unwrap();
     assert_eq!(
         store
             .append(operation, input, b"durable answer".as_slice())
             .unwrap(),
         expected
     );
-    assert_eq!(store.position("continuous-session").unwrap(), 1);
+    assert_eq!(
+        store.position("continuous-session").unwrap(),
+        reopened_position
+    );
     assert_eq!(
         store
             .events("continuous-session", 0, 10)
             .unwrap()
             .entries
-            .len(),
+            .iter()
+            .filter(|header| header.event.as_ref().unwrap().kind == EventKind::AssistantMessage)
+            .count(),
         1
     );
     assert_eq!(
@@ -153,6 +175,95 @@ fn committed_history_survives_a_lost_acknowledgement_without_duplication() {
         RecordState::Active
     );
     assert_eq!(store.recover_payloads(1, 1).unwrap().uploads_removed, 0);
+}
+
+#[test]
+fn a_cancel_with_a_lost_acknowledgement_published_all_its_closing_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Store::create(dir.path().join("context")).unwrap();
+    let log = db
+        .session_log(ContextAccess {
+            run: Some("run".into()),
+            ..ContextAccess::new("owner", Actor::System)
+        })
+        .unwrap();
+    let event = |id: &str, kind| EventInput {
+        session: "session".into(),
+        event_id: id.into(),
+        scope: Scope::Personal,
+        kind,
+        media_type: "text/plain".into(),
+        occurred_at_ms: 1,
+        sources: vec![],
+        expected_sequence: None,
+    };
+    for input in [
+        event("turn", EventKind::TurnStarted),
+        event("step", EventKind::StepStarted),
+        event(
+            "message",
+            EventKind::AssistantStarted {
+                message_id: "m".into(),
+            },
+        ),
+        event(
+            "call",
+            EventKind::ToolCall {
+                call_id: "c".into(),
+                tool_name: "read".into(),
+                message_id: Some("m".into()),
+            },
+        ),
+    ] {
+        log.append(OperationId::new(), input, &[][..]).unwrap();
+    }
+    let cancel = EventKind::TurnEnded {
+        start_event_id: "turn".into(),
+        reason: crate::TurnEndReason::Cancelled,
+    };
+    let before = log.position("session").unwrap();
+    let operation = OperationId::new();
+    log.scoped.lose_next_commit_ack();
+    let error = log
+        .append(
+            operation,
+            event("cancel", cancel.clone()),
+            &b"cancelled"[..],
+        )
+        .unwrap_err();
+    assert!(matches!(error, ContextError::CommitUnknown(id) if id == operation));
+    assert_eq!(log.position("session").unwrap(), before + 4);
+    let events = log.events("session", before, 10).unwrap().entries;
+    let kinds: Vec<_> = events
+        .iter()
+        .map(|header| header.event.as_ref().unwrap().kind.clone())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            EventKind::AssistantTerminal {
+                message_id: "m".into(),
+                status: MessageStatus::Interrupted
+            },
+            EventKind::ToolResult {
+                call_id: "c".into(),
+                outcome: ToolOutcome::EffectUnknown
+            },
+            EventKind::StepEnded {
+                start_event_id: "step".into(),
+            },
+            cancel,
+        ]
+    );
+    let receipt = log.operation_receipt(operation).unwrap().unwrap();
+    assert_eq!(receipt.pin, events[3].pin);
+    assert_eq!(receipt.sequence, Some(before + 4));
+    log.append(
+        OperationId::new(),
+        event("next", EventKind::TurnStarted),
+        &[][..],
+    )
+    .unwrap();
 }
 
 #[test]

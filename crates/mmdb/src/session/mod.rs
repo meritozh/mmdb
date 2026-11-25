@@ -3,13 +3,14 @@
 mod checkpoints;
 mod history;
 mod search;
+mod turns;
 mod types;
 
 use crate::records::codec::{owner_key, segment};
 pub use crate::records::RecoveryReport;
 use crate::records::*;
 use crate::OperationId;
-pub(crate) use history::LogGate;
+pub(crate) use history::{end_interrupted_turns, LogGate};
 pub use types::*;
 
 const CALLS: &str = "session_tool_calls_v1";
@@ -17,6 +18,8 @@ const MESSAGES: &str = "session_messages_v1";
 module_partitions!(SessionParts, SESSION_PARTITIONS, {
     order => "session_order_v1",
     heads => "session_heads_v1",
+    open_turns => "session_open_turns_v1",
+    owed => "session_owed_v1",
     events => "session_events_v1",
     calls => CALLS,
     results => "session_tool_results_v1",
@@ -30,7 +33,7 @@ pub struct SessionLog<'a> {
     pub(crate) parts: &'a SessionParts,
 }
 
-fn session_key(owner: &str, session: &str) -> Vec<u8> {
+pub(crate) fn session_key(owner: &str, session: &str) -> Vec<u8> {
     let mut key = owner_key(owner);
     segment(&mut key, session.as_bytes());
     key

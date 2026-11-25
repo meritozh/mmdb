@@ -371,6 +371,8 @@ struct Inner {
     store_era: StoreEraId,
     digest_key: [u8; 32],
     write_lock: Mutex<()>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    lose_ack_partition: Mutex<Option<String>>,
     #[cfg(test)]
     reset_fault: Mutex<Option<tests::ResetFault>>,
     // Keep the path leased until all engine handles have been dropped.
@@ -430,6 +432,8 @@ impl Kernel {
             eras: RwLock::new(eras),
             digest_key: metadata.digest_key,
             write_lock: Mutex::new(()),
+            #[cfg(any(test, feature = "test-hooks"))]
+            lose_ack_partition: Mutex::new(None),
             #[cfg(test)]
             reset_fault: Mutex::new(None),
         })))
@@ -473,8 +477,21 @@ impl Kernel {
         Batch {
             raw: durable_batch(&self.0.database),
             touched: BTreeSet::new(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            written_partitions: BTreeSet::new(),
             kernel: self.clone(),
         }
+    }
+
+    /// The next successful batch commit that writes this partition reports
+    /// `CommitUnknown` after its writes land. Arming again replaces the target.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn lose_next_commit_ack(&self, partition: &Partition) {
+        assert!(
+            Arc::ptr_eq(&self.0, &partition.owner.kernel.0),
+            "partition belongs to another kernel"
+        );
+        *self.0.lose_ack_partition.lock() = Some(partition.raw.name().to_string());
     }
 
     pub fn write_lock(&self) -> WriteGuard<'_> {
@@ -788,6 +805,8 @@ impl<T> DoubleEndedIterator for PartitionScan<'_, T> {
 pub struct Batch {
     raw: fjall::OwnedWriteBatch,
     touched: BTreeSet<(ModuleId, EraId)>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    written_partitions: BTreeSet<String>,
     kernel: Kernel,
 }
 
@@ -799,6 +818,9 @@ impl Batch {
             "partition belongs to another kernel"
         );
         self.touched.insert((owner.module, owner.era));
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.written_partitions
+            .insert(partition.raw.name().to_string());
     }
 
     pub fn insert(
@@ -833,7 +855,18 @@ impl Batch {
         let eras = self.kernel.0.eras.read();
         eras.ensure_usable()?;
         self.check_eras(&eras)?;
-        self.raw.commit().map_err(|_| KernelError::CommitUnknown)
+        #[cfg(any(test, feature = "test-hooks"))]
+        let mut armed = self.kernel.0.lose_ack_partition.lock();
+        self.raw.commit().map_err(|_| KernelError::CommitUnknown)?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        if armed
+            .as_ref()
+            .is_some_and(|name| self.written_partitions.contains(name))
+        {
+            *armed = None;
+            return Err(KernelError::CommitUnknown);
+        }
+        Ok(())
     }
 }
 

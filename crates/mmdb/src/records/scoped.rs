@@ -69,8 +69,6 @@ pub(crate) struct Records {
     pub(super) lifecycle: Partition,
     operations: Partition,
     gate: Box<dyn Gate>,
-    #[cfg(test)]
-    fail_commit_ack: std::sync::atomic::AtomicBool,
 }
 
 impl Records {
@@ -87,8 +85,6 @@ impl Records {
             lifecycle: session.partition(LIFECYCLE)?,
             operations: session.partition(OPERATIONS)?,
             gate,
-            #[cfg(test)]
-            fail_commit_ack: Default::default(),
         })
     }
     pub(crate) fn replace_memory_table(&mut self, table: RecordTable) {
@@ -209,8 +205,8 @@ impl Scoped<'_> {
     #[cfg(test)]
     pub(crate) fn lose_next_commit_ack(&self) {
         self.records
-            .fail_commit_ack
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+            .kernel
+            .lose_next_commit_ack(&self.records.operations);
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -233,9 +229,9 @@ struct SourceWalk {
 }
 
 impl SourceWalk {
-    fn for_new_record() -> Self {
+    fn for_new_record(reserve: usize) -> Self {
         Self {
-            count: 1,
+            count: 1 + reserve,
             ..Self::default()
         }
     }
@@ -457,7 +453,7 @@ impl Scoped<'_> {
         {
             return Err(ContextError::AccessDenied);
         }
-        let mut walk = SourceWalk::for_new_record();
+        let mut walk = SourceWalk::for_new_record(0);
         let mut memo = BTreeMap::new();
         for source in sources {
             let header = self.header_locked(source)?;
@@ -487,25 +483,51 @@ impl Scoped<'_> {
     }
 
     /// Original snapshots may copy a historical version or a type descriptor.
+    /// Charge the answered call against the budget even when it is unreadable,
+    /// and carry its recorded scopes. Explicit copies still require readability.
+    /// Reserve levels and visits above the new event for records that will cite it.
     pub(crate) fn validate_copy_sources(
         &self,
         scope: &Scope,
         sources: &[RecordPin],
+        answers: Option<&RecordHeader>,
+        reserve: usize,
     ) -> ContextResult<Vec<Scope>> {
         self.check_scope(scope)?;
-        if sources.len() > MAX_CONTEXT_SOURCES {
+        if sources.len() + usize::from(answers.is_some()) > MAX_CONTEXT_SOURCES {
             return Err(ContextError::InvalidInput(
                 "copy has too many source references".into(),
             ));
         }
-        let mut walk = SourceWalk::for_new_record();
+        let mut walk = SourceWalk::for_new_record(reserve);
         let mut memo = BTreeMap::new();
+        if let Some(call) = answers {
+            if !self.available_walk(
+                &call.pin,
+                SourceCheck::BudgetOnly,
+                None,
+                1 + reserve,
+                &mut walk,
+                &mut memo,
+            )? {
+                return Err(ContextError::Unavailable(call.pin.record.clone()));
+            }
+            walk.scopes.insert(call.scope.clone());
+            walk.scopes.extend(call.source_scopes.iter().cloned());
+        }
         for source in sources {
             let header = self.header_locked(source)?;
             if header.scope != *scope && header.scope != Scope::Personal {
                 return Err(ContextError::AccessDenied);
             }
-            if !self.available_walk(source, SourceCheck::Copy, None, 1, &mut walk, &mut memo)? {
+            if !self.available_walk(
+                source,
+                SourceCheck::Copy,
+                None,
+                1 + reserve,
+                &mut walk,
+                &mut memo,
+            )? {
                 return Err(ContextError::Unavailable(source.record.clone()));
             }
         }
@@ -587,14 +609,6 @@ impl Scoped<'_> {
         batch
             .commit()
             .map_err(|_| ContextError::CommitUnknown(operation))?;
-        #[cfg(test)]
-        if self
-            .records
-            .fail_commit_ack
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(ContextError::CommitUnknown(operation));
-        }
         Ok(receipt)
     }
 

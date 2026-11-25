@@ -546,6 +546,33 @@ fn flushed_chunk_keys_remain_readable_when_separated_values_fail() {
 }
 
 #[test]
+fn a_lost_ack_hits_only_the_commit_that_writes_the_armed_partition() {
+    let parent = tempfile::tempdir().unwrap();
+    let kernel = create(&parent.path().join("store"));
+    let session = kernel.module(SESSION).partition("entries").unwrap();
+    let memory = kernel.module(MEMORY).partition("entries").unwrap();
+    kernel.lose_next_commit_ack(&session);
+
+    let mut first = kernel.batch();
+    first.insert(&memory, "key", "first");
+    first.commit().unwrap();
+
+    let mut both = kernel.batch();
+    both.insert(&session, "key", "receipt");
+    both.insert(&memory, "key", "payload");
+    assert!(matches!(both.commit(), Err(KernelError::CommitUnknown)));
+    assert_eq!(
+        session.get("key").unwrap().as_deref(),
+        Some(&b"receipt"[..])
+    );
+    assert_eq!(memory.get("key").unwrap().as_deref(), Some(&b"payload"[..]));
+
+    let mut next = kernel.batch();
+    next.insert(&session, "key", "next");
+    next.commit().unwrap();
+}
+
+#[test]
 fn a_batch_refuses_partitions_of_a_stale_era() {
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("store");
