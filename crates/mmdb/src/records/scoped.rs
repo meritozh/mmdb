@@ -69,8 +69,6 @@ pub(crate) struct Records {
     pub(super) lifecycle: Partition,
     operations: Partition,
     gate: Box<dyn Gate>,
-    #[cfg(test)]
-    fail_commit_ack: std::sync::atomic::AtomicBool,
 }
 
 impl Records {
@@ -87,8 +85,6 @@ impl Records {
             lifecycle: session.partition(LIFECYCLE)?,
             operations: session.partition(OPERATIONS)?,
             gate,
-            #[cfg(test)]
-            fail_commit_ack: Default::default(),
         })
     }
     pub(crate) fn replace_memory_table(&mut self, table: RecordTable) {
@@ -209,8 +205,8 @@ impl Scoped<'_> {
     #[cfg(test)]
     pub(crate) fn lose_next_commit_ack(&self) {
         self.records
-            .fail_commit_ack
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+            .kernel
+            .lose_next_commit_ack(&self.records.operations);
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -587,14 +583,6 @@ impl Scoped<'_> {
         batch
             .commit()
             .map_err(|_| ContextError::CommitUnknown(operation))?;
-        #[cfg(test)]
-        if self
-            .records
-            .fail_commit_ack
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(ContextError::CommitUnknown(operation));
-        }
         Ok(receipt)
     }
 

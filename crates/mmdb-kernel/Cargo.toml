@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+test-hooks = []
+
 [dependencies]
 blake3.workspace = true
 fjall.workspace = true

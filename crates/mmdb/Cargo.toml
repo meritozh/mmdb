@@ -24,5 +24,6 @@ parking_lot.workspace = true
 base64 = "0.21"
 
 [dev-dependencies]
+mmdb-kernel = { path = "../mmdb-kernel", features = ["test-hooks"] }
 tempfile = "3"
 anyhow.workspace = true
