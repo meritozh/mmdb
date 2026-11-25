@@ -589,6 +589,29 @@ mod tests {
     }
 
     #[test]
+    fn settling_with_an_empty_step_count_stages_no_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::create(temp.path().join("store")).unwrap();
+        let log = unanswered_call_with_counts(&store, 1, 0);
+        let before = log.position("chat").unwrap();
+        let result = event_input(
+            "chat",
+            "result",
+            EventKind::ToolResult {
+                call_id: "A".into(),
+                outcome: ToolOutcome::Succeeded,
+            },
+        );
+        assert!(matches!(
+            log.append(OperationId::new(), result, &b"result"[..]),
+            Err(ContextError::Corrupt(_))
+        ));
+        assert_eq!(log.position("chat").unwrap(), before);
+        let cleanup = log.recover_payloads(1, 1).unwrap();
+        assert_eq!((cleanup.uploads_removed, cleanup.chunks_removed), (0, 0));
+    }
+
+    #[test]
     fn an_unknown_recovery_commit_closes_each_turn_once() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("store");

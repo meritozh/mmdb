@@ -360,6 +360,15 @@ impl SessionLog<'_> {
             },
         )
         .map_err(ContextError::Turn)?;
+        let mut batch = self.scoped.batch();
+        self.put_turn_change(
+            &mut batch,
+            &mut head,
+            &session_key,
+            &input,
+            state,
+            admitted.change,
+        )?;
         let reserve = usize::from(matches!(input.kind, EventKind::ToolCall { .. }));
         let source_scopes = self.scoped.validate_copy_sources(
             &input.scope,
@@ -369,27 +378,9 @@ impl SessionLog<'_> {
         )?;
         let message = self.message_transition(&input.session, &input.kind, admitted.stamp)?;
         let pin = self.scoped.fresh_pin(RecordKind::Event);
-        let mut batch = self.scoped.batch();
-        let ending_turn = matches!(admitted.change, Change::EndTurn(_));
-        let put_change = || {
-            self.put_turn_change(
-                &mut batch,
-                &mut head,
-                &session_key,
-                &input,
-                state,
-                admitted.change,
-            )
-        };
-        let stream = || self.scoped.stream_payload(payload, Some((&pin, operation)));
-        let streamed = if ending_turn {
-            put_change()?;
-            stream()?
-        } else {
-            let streamed = stream()?;
-            put_change()?;
-            streamed
-        };
+        let streamed = self
+            .scoped
+            .stream_payload(payload, Some((&pin, operation)))?;
         let digest = self.append_digest(&input, &streamed.descriptor)?;
         let sources = answers
             .into_iter()
