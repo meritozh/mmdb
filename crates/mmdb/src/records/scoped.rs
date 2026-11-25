@@ -229,9 +229,9 @@ struct SourceWalk {
 }
 
 impl SourceWalk {
-    fn for_new_record() -> Self {
+    fn for_new_record(reserve: usize) -> Self {
         Self {
-            count: 1,
+            count: 1 + reserve,
             ..Self::default()
         }
     }
@@ -453,7 +453,7 @@ impl Scoped<'_> {
         {
             return Err(ContextError::AccessDenied);
         }
-        let mut walk = SourceWalk::for_new_record();
+        let mut walk = SourceWalk::for_new_record(0);
         let mut memo = BTreeMap::new();
         for source in sources {
             let header = self.header_locked(source)?;
@@ -483,10 +483,12 @@ impl Scoped<'_> {
     }
 
     /// Original snapshots may copy a historical version or a type descriptor.
+    /// Reserve levels and visits above the new event for records that will cite it.
     pub(crate) fn validate_copy_sources(
         &self,
         scope: &Scope,
         sources: &[RecordPin],
+        reserve: usize,
     ) -> ContextResult<Vec<Scope>> {
         self.check_scope(scope)?;
         if sources.len() > MAX_CONTEXT_SOURCES {
@@ -494,14 +496,21 @@ impl Scoped<'_> {
                 "copy has too many source references".into(),
             ));
         }
-        let mut walk = SourceWalk::for_new_record();
+        let mut walk = SourceWalk::for_new_record(reserve);
         let mut memo = BTreeMap::new();
         for source in sources {
             let header = self.header_locked(source)?;
             if header.scope != *scope && header.scope != Scope::Personal {
                 return Err(ContextError::AccessDenied);
             }
-            if !self.available_walk(source, SourceCheck::Copy, None, 1, &mut walk, &mut memo)? {
+            if !self.available_walk(
+                source,
+                SourceCheck::Copy,
+                None,
+                1 + reserve,
+                &mut walk,
+                &mut memo,
+            )? {
                 return Err(ContextError::Unavailable(source.record.clone()));
             }
         }

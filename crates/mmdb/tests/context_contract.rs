@@ -1985,13 +1985,9 @@ fn log_copies_stay_readable_after_their_sources_change() {
         .is_empty());
 }
 
-#[test]
-fn history_copy_reserves_new_root_depth_before_committing_an_unreadable_record() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db = Store::create(tmp.path().join("context")).unwrap();
-    let log = db.session_log(access("owner")).unwrap();
-    let mut chain = vec![source(&log, "root", "original evidence")];
-    for depth in 1..=32 {
+fn history_copy_chain(log: &SessionLog<'_>, max_depth: u64) -> Vec<RecordPin> {
+    let mut chain = vec![source(log, "root", "original evidence")];
+    for depth in 1..=max_depth {
         let mut input = event_input("depth-session", &format!("depth-{depth}"));
         input.kind = EventKind::Notice;
         input.sources = vec![chain.last().unwrap().clone()];
@@ -2002,6 +1998,15 @@ fn history_copy_reserves_new_root_depth_before_committing_an_unreadable_record()
         assert_eq!(copy.sequence, Some(depth));
         chain.push(copy.pin);
     }
+    chain
+}
+
+#[test]
+fn history_copy_reserves_new_root_depth_before_committing_an_unreadable_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Store::create(tmp.path().join("context")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
+    let chain = history_copy_chain(&log, 32);
     assert_eq!(
         log.inspect_header(&chain[32]).unwrap().sources,
         vec![chain[31].clone()]
@@ -2042,6 +2047,46 @@ fn history_copy_reserves_new_root_depth_before_committing_an_unreadable_record()
         log.read_payload(&accepted.pin, 0, 100).unwrap().bytes,
         b"within limit"
     );
+}
+
+#[test]
+fn a_tool_call_reserves_room_for_its_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Store::create(tmp.path().join("context")).unwrap();
+    let log = db.session_log(access("owner")).unwrap();
+    let chain = history_copy_chain(&log, 31);
+
+    let mut call = event_input("tool-session", "call");
+    call.kind = EventKind::ToolCall {
+        call_id: "read".into(),
+        tool_name: "read".into(),
+        message_id: None,
+    };
+    call.sources = vec![chain[31].clone()];
+    let operation = OperationId::new();
+    assert!(matches!(
+        log.append(operation, call.clone(), &[][..]),
+        Err(ContextError::BudgetExceeded)
+    ));
+    assert!(log.operation_receipt(operation).unwrap().is_none());
+    assert_eq!(log.position("tool-session").unwrap(), 0);
+
+    call.sources = vec![chain[30].clone()];
+    let call = log.append(operation, call, &[][..]).unwrap();
+    let mut result = event_input("tool-session", "result");
+    result.kind = EventKind::ToolResult {
+        call_id: "read".into(),
+        outcome: ToolOutcome::Succeeded,
+    };
+    let result = log.append(OperationId::new(), result, &[][..]).unwrap();
+    assert_eq!(
+        log.inspect_header(&result.pin).unwrap().sources,
+        vec![call.pin]
+    );
+    db.context(access("owner"))
+        .unwrap()
+        .validate_current(&[result.pin], None)
+        .unwrap();
 }
 
 #[test]

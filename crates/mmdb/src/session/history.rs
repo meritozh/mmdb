@@ -256,7 +256,10 @@ impl SessionLog<'_> {
             }
             let mut sources = self.validate_call_link(&input)?;
             sources.extend(input.sources.clone());
-            let source_scopes = self.scoped.validate_copy_sources(&input.scope, &sources)?;
+            let reserve = usize::from(matches!(input.kind, EventKind::ToolCall { .. }));
+            let source_scopes =
+                self.scoped
+                    .validate_copy_sources(&input.scope, &sources, reserve)?;
             (sources, source_scopes)
         } else {
             (Vec::new(), Vec::new())
