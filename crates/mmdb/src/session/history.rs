@@ -369,19 +369,28 @@ impl SessionLog<'_> {
         )?;
         let message = self.message_transition(&input.session, &input.kind, admitted.stamp)?;
         let pin = self.scoped.fresh_pin(RecordKind::Event);
-        let streamed = self
-            .scoped
-            .stream_payload(payload, Some((&pin, operation)))?;
-        let digest = self.append_digest(&input, &streamed.descriptor)?;
         let mut batch = self.scoped.batch();
-        self.put_turn_change(
-            &mut batch,
-            &mut head,
-            &session_key,
-            &input,
-            state,
-            admitted.change,
-        )?;
+        let ending_turn = matches!(admitted.change, Change::EndTurn(_));
+        let put_change = || {
+            self.put_turn_change(
+                &mut batch,
+                &mut head,
+                &session_key,
+                &input,
+                state,
+                admitted.change,
+            )
+        };
+        let stream = || self.scoped.stream_payload(payload, Some((&pin, operation)));
+        let streamed = if ending_turn {
+            put_change()?;
+            stream()?
+        } else {
+            let streamed = stream()?;
+            put_change()?;
+            streamed
+        };
+        let digest = self.append_digest(&input, &streamed.descriptor)?;
         let sources = answers
             .into_iter()
             .map(|call| call.pin)
@@ -564,12 +573,8 @@ impl SessionLog<'_> {
         reason: TurnEndReason,
         occurred_at_ms: i64,
     ) -> ContextResult<()> {
-        let owed = if turn.owes > 0 {
-            self.owed_items(key)?
-        } else {
-            Vec::new()
-        };
-        let closing = turns::close(turn, &owed, reason);
+        let owed = self.owed_items(key)?;
+        let closing = turns::close(turn, &owed, reason)?;
         batch.remove(&self.parts.open_turns, key);
         for item in owed {
             batch.remove(&self.parts.owed, item.key(key));

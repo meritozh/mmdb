@@ -1,7 +1,10 @@
 //! Turn and step rules for one session. The log loads the state and persists
 //! the admitted change in the same batch as the event.
 
-use crate::{EventKind, MessageStatus, ToolOutcome, TurnEndReason, TurnError, TurnStamp};
+use crate::{
+    ContextError, ContextResult, EventKind, MessageStatus, ToolOutcome, TurnEndReason, TurnError,
+    TurnStamp,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,7 +117,30 @@ pub(super) struct Closing {
 }
 
 /// Owed items arrive in identity order, terminals first and then results.
-pub(super) fn close(turn: &OpenTurn, owed: &[Owed], reason: TurnEndReason) -> Vec<Closing> {
+pub(super) fn close(
+    turn: &OpenTurn,
+    owed: &[Owed],
+    reason: TurnEndReason,
+) -> ContextResult<Vec<Closing>> {
+    if turn.owes != owed.len() as u64 {
+        return Err(ContextError::Corrupt(
+            "turn owed count disagrees with rows".into(),
+        ));
+    }
+    if let Some(step) = &turn.step {
+        let count = owed
+            .iter()
+            .filter(|item| item.step() == Some(step.number))
+            .count();
+        if step.owes != count as u64 {
+            return Err(ContextError::Corrupt(
+                "step owed count disagrees with rows".into(),
+            ));
+        }
+    }
+    if reason == TurnEndReason::Completed && (turn.step.is_some() || !owed.is_empty()) {
+        return Err(ContextError::Turn(TurnError::TurnUnfinished));
+    }
     let prefix = format!("mmdb:turn-{}", turn.number);
     let stamp = turn.stamp();
     let mut closing = Vec::new();
@@ -166,7 +192,7 @@ pub(super) fn close(turn: &OpenTurn, owed: &[Owed], reason: TurnEndReason) -> Ve
             },
         });
     }
-    closing
+    Ok(closing)
 }
 
 /// Link lookups have already established that a result's call exists and
@@ -210,9 +236,6 @@ pub(super) fn admit(state: &TurnState, write: Write<'_>) -> Result<Admitted, Tur
             let turn = writing_turn()?;
             if start_event_id != &turn.start_event_id {
                 return Err(TurnError::OtherTurn);
-            }
-            if *reason == TurnEndReason::Completed && (turn.step.is_some() || turn.owes > 0) {
-                return Err(TurnError::TurnUnfinished);
             }
             stamp = Some(TurnStamp {
                 number: turn.number,

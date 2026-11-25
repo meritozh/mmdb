@@ -524,6 +524,71 @@ mod tests {
     }
 
     #[test]
+    fn turn_end_and_reopen_reject_inconsistent_owed_counts() {
+        for (turn_owes, step_owes) in [(0, 0), (1, 0), (2, 1)] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("store");
+            let store = Store::create(&root).unwrap();
+            let log = unanswered_call_with_counts(&store, turn_owes, step_owes);
+            let before = log.position("chat").unwrap();
+            let end = event_input(
+                "chat",
+                "end",
+                EventKind::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                    start_event_id: "turn".into(),
+                },
+            );
+            assert!(matches!(
+                log.append(OperationId::new(), end, &b"end"[..]),
+                Err(ContextError::Corrupt(_))
+            ));
+            assert_eq!(log.position("chat").unwrap(), before);
+            let cleanup = log.recover_payloads(1, 1).unwrap();
+            assert_eq!((cleanup.uploads_removed, cleanup.chunks_removed), (0, 0));
+            drop(store);
+            assert!(matches!(
+                Store::open(&root),
+                Err(StoreError::Context(ContextError::Corrupt(_)))
+            ));
+        }
+    }
+
+    fn unanswered_call_with_counts(
+        store: &Store,
+        turn_owes: u64,
+        step_owes: u64,
+    ) -> SessionLog<'_> {
+        start_step(store, "alice", "chat");
+        let log = session_writer(store, "alice", "chat");
+        append_event(
+            &log,
+            "chat",
+            "call",
+            EventKind::ToolCall {
+                call_id: "A".into(),
+                tool_name: "read".into(),
+                message_id: None,
+            },
+        );
+        let key = session::session_key("alice", "chat");
+        let row = store.session.open_turns.get(&key).unwrap().unwrap();
+        let mut turn: serde_json::Value = serde_json::from_slice(&row).unwrap();
+        assert_eq!(turn["owes"], 1);
+        assert_eq!(turn["step"]["owes"], 1);
+        turn["owes"] = turn_owes.into();
+        turn["step"]["owes"] = step_owes.into();
+        let mut batch = store.kernel.batch();
+        batch.insert(
+            &store.session.open_turns,
+            key,
+            serde_json::to_vec(&turn).unwrap(),
+        );
+        batch.commit().unwrap();
+        log
+    }
+
+    #[test]
     fn an_unknown_recovery_commit_closes_each_turn_once() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("store");
