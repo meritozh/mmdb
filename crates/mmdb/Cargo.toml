@@ -21,7 +21,7 @@ serde_json.workspace = true
 fjall.workspace = true
 blake3.workspace = true
 parking_lot.workspace = true
-base64 = "0.21"
+base64 = "0.23"
 
 [dev-dependencies]
 mmdb-kernel = { path = "../mmdb-kernel", features = ["test-hooks"] }
