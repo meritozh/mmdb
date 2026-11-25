@@ -476,13 +476,14 @@ mod tests {
         }
         let mut key = session::session_key("alice", "chat");
         key.extend_from_slice(&[1, b'B']);
+        assert!(store.session.owed.get(&key).unwrap().is_some());
         let mut batch = store.kernel.batch();
         batch.insert(&store.session.owed, key, b"invalid");
         batch.commit().unwrap();
 
         append("notice", EventKind::Notice).unwrap();
         append(
-            "result",
+            "result-A",
             EventKind::ToolResult {
                 call_id: "A".into(),
                 outcome: ToolOutcome::Succeeded,
@@ -490,6 +491,16 @@ mod tests {
         )
         .unwrap();
         let before = log.position("chat").unwrap();
+        assert!(matches!(
+            append(
+                "result-B",
+                EventKind::ToolResult {
+                    call_id: "B".into(),
+                    outcome: ToolOutcome::Succeeded,
+                }
+            ),
+            Err(ContextError::Corrupt(_))
+        ));
         assert!(matches!(
             append(
                 "step-end",
