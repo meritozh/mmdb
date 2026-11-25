@@ -427,14 +427,29 @@ pub fn open(root: impl AsRef<Path>) -> StoreResult<Self> {
 
 ```rust
 impl Kernel {
-    /// The next `Batch::commit`, through any caller, lands and then reports `CommitUnknown`.
-    #[cfg(feature = "test-hooks")]
-    pub fn lose_next_commit_ack(&self);
+    /// The next `Batch::commit` whose batch writes `partition`, through any caller,
+    /// lands and then reports `CommitUnknown`. Commits that do not write it are untouched.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn lose_next_commit_ack(&self, partition: &Partition);
 }
 ```
 
-- Configuration: `mmdb-kernel` gains the feature `test-hooks`, off by default. `crates/mmdb/Cargo.toml` enables it in `[dev-dependencies]` only.
-- Behind the seam: one flag on the kernel, swapped in `Batch::commit` after the engine commit succeeds. `Records::fail_commit_ack` and the check in `commit_operation` go away; `Scoped::lose_next_commit_ack` (`cfg(test)`) calls the kernel's, so its existing callers keep working.
+- Invariants: one shot. The hook fires on the first matching commit, then disarms. A commit refused before the engine commit, for an unusable store or a stale era, neither lands nor disarms it. Arming again replaces the armed partition.
+- Why a partition: one `append` with a payload commits several batches. It commits the pending-upload marker and each payload chunk before the batch that publishes the event and its receipt. A hook on the next commit of any kind would hit the marker. A test therefore names the partition that only its target commit writes.
+- Configuration: `mmdb-kernel` gains the feature `test-hooks`, off by default. `crates/mmdb/Cargo.toml` enables it in `[dev-dependencies]` only. The kernel's own unit tests see the hook through `cfg(test)`.
+- Behind the seam: the kernel holds the qualified name of the armed partition, `<module>.<era>.<name>`. Only with the hook compiled in, a `Batch` also records the qualified names of the partitions it writes. After the engine commit succeeds, `Batch::commit` checks whether the batch wrote the armed partition. If it did, it disarms the hook and returns `KernelError::CommitUnknown`. `Records::fail_commit_ack` and the check in `commit_operation` go away. `commit_operation` already maps any commit error to `ContextError::CommitUnknown(operation)`.
+- `Scoped::lose_next_commit_ack()` (`cfg(test)`, no argument, `crates/mmdb/src/records/scoped.rs`) arms the kernel hook on the operation-receipt partition, `records_operations_v1`. It therefore hits the commit that publishes an operation's receipt, and never an earlier marker or chunk commit. Its two existing callers keep working unchanged.
+
+Call sites:
+
+```rust
+// The commit that publishes an append's event and receipt, as today.
+store.scoped.lose_next_commit_ack();
+
+// In `store.rs`'s tests. Recovery writes no receipt; its one batch removes
+// the open-turn rows it closes, so the test arms the open-turn partition of `SessionParts`.
+store.kernel.lose_next_commit_ack(&store.session.open_turns);
+```
 
 ## Data
 
@@ -449,16 +464,16 @@ impl Kernel {
 
 | Dependency | Category | Production adapter | Test adapter |
 | --- | --- | --- | --- |
-| Storage engine, through `mmdb-kernel` | local-substitutable | the store directory | a store in a `tempfile` directory; `Kernel::lose_next_commit_ack` for unknown commit outcomes |
+| Storage engine, through `mmdb-kernel` | local-substitutable | the store directory | a store in a `tempfile` directory; `Kernel::lose_next_commit_ack(partition)` for the unknown outcome of the commit that writes that partition |
 | Process exit, for the crash test | local-substitutable | the real process | the test binary re-run as a child that exits mid-turn, as `history_crash_child` does |
 | Clock (`now_ms`) and BLAKE3 | in-process | — | — |
 
-No new seam. The commit hook moves down a layer, so every commit path reaches it.
+No new seam. The commit hook moves down a layer so that recovery's commit, which writes no receipt, reaches it too. It picks its commit by a partition that commit writes, because one append commits a marker and chunks before its receipt.
 
 ## Steps
 
 1. Extract writing one event into a batch from `SessionLog::append` into `put_event`, so one batch can hold several events. `NewEvent` has no `turn` field yet. No behavior change. After: none. Check: `cargo test --workspace --locked`
-2. Move the lost-acknowledgement test hook from `commit_operation` into `Batch::commit` as `Kernel::lose_next_commit_ack`, behind the new `test-hooks` feature that `mmdb` enables for its tests. No behavior change; `committed_history_survives_a_lost_acknowledgement_without_duplication` and the other existing caller keep passing. After: none. Check: `cargo test --workspace --locked`
+2. Move the lost-acknowledgement test hook from `commit_operation` into `Batch::commit` as `Kernel::lose_next_commit_ack(partition)`, behind the new `test-hooks` feature that `mmdb` enables for its tests. `Scoped::lose_next_commit_ack()` arms it on `records_operations_v1`. No behavior change. Two existing tests keep passing unchanged: `committed_history_survives_a_lost_acknowledgement_without_duplication`, whose append commits a pending-upload marker before its receipt, and the purge test in `crates/mmdb/src/context/tests.rs` that also arms the hook. New kernel unit test `a_lost_ack_hits_only_the_commit_that_writes_the_armed_partition`, in `crates/mmdb-kernel/src/kernel/tests.rs`. The hook is armed on partition A. A commit that writes only B returns `Ok`. The next commit writes A and B, returns `CommitUnknown`, and both writes are readable. The commit after that writes A and returns `Ok`. After: none. Check: `cargo test --workspace --locked`
 3. Reserve room for a tool call's result. Add `reserve` to `validate_copy_sources`; a `ToolCall` passes 1. Test `a_tool_call_reserves_room_for_its_result` in `crates/mmdb/tests/context_contract.rs`, next to `history_copy_reserves_new_root_depth_before_committing_an_unreadable_record` and built on its chain: a call citing `chain[31]` is refused with `BudgetExceeded`; a call citing `chain[30]` is accepted, its result is accepted, and `validate_current` on the result succeeds. After: 1, 2. Check: `cargo test --workspace --locked`
 4. Record turns and steps and place events in them. Add `TurnStarted`, `TurnEnded`, `StepStarted`, `StepEnded`, `TurnEndReason`, `TurnStamp`, `TurnError` and `ContextError::Turn`, `MessageState::step`, and `NewEvent::turn`. Add `session::turns` with every rule except closing. Add the System-or-Operator check, the `mmdb:` prefix and `start_event_id` validation to input validation. Add `Numbers` in the session head, `session_open_turns_v1`, `session_owed_v1`, stamps on every event, the new link lookups, and `answers` in `validate_copy_sources`. Until step 5, `Cancelled` and `Failed` with an open step or anything owed are refused as `TurnUnfinished`, so no ended turn owes anything. Raise `STORE_FORMAT_ID` from `mmdb-store-v2` to `mmdb-store-v3`, and update the format line in `README.md` and the assertion in `native_memory.rs`. The Fjall 2 fixtures in `crates/mmdb/tests/fjall_format.rs` stay `mmdb-store-v1` and keep being refused. Update the existing tests listed under Replaces: they open a turn with an access that has a run, and a step where they write assistant events. New tests in `crates/mmdb/tests/session_turns.rs`:
    - `turn_and_step_numbers_increase_across_the_session`
@@ -490,12 +505,12 @@ No new seam. The commit hook moves down a layer, so every commit path reaches it
    - `a_closing_result_fits_the_reserved_budget`: a call citing `chain[30]` is cancelled, and `validate_current` on its closing result succeeds.
    - A retry case in `retrying_a_turn_event_after_the_turn_moved_on_returns_its_receipt`: a retried cancel writes no second set of closing events.
 
-   In-crate, in `crates/mmdb/src/context/tests.rs`: `a_cancel_with_a_lost_acknowledgement_published_all_its_closing_events`. Arm `lose_next_commit_ack`, then cancel a turn that owes one terminal and one call; the append returns `CommitUnknown`. The position advanced by exactly the closing events plus one, every closing event and the end event are present, and the same run can open a new turn. After: 4. Check: `cargo test --workspace --locked`
+   In-crate, in `crates/mmdb/src/context/tests.rs`: `a_cancel_with_a_lost_acknowledgement_published_all_its_closing_events`. Arm `Scoped::lose_next_commit_ack()`, which hits the commit that publishes the cancel's receipt, then cancel a turn that owes one terminal and one call; the append returns `CommitUnknown`. The position advanced by exactly the closing events plus one, every closing event and the end event are present, and the same run can open a new turn. After: 4. Check: `cargo test --workspace --locked`
 6. End turns left open at `Store::open` as Interrupted. Add `end_interrupted_turns` and call it from `Store::open`. Make `session::session_key` `pub(crate)` for the in-crate tests. Add a sentence on turns to `README.md`'s session log paragraph. Set the feature doc to `shipped` and archive this spec. Tests:
    - `a_turn_left_open_by_an_exited_process_ends_interrupted_on_open`, in `crates/mmdb/tests/session_turns.rs`: a child run of the test binary exits mid-step, with an unterminated message and an unanswered call.
    - `reopening_in_the_same_process_ends_its_own_open_turn`, in the same file.
    - `opening_reads_only_sessions_with_open_turns`, in-crate in `crates/mmdb/src/store.rs`'s tests. Set up two owners with open turns, plus a session with no open turn whose head value under `session_key` is overwritten with undecodable bytes. `Store::open` succeeds and ends both open turns.
-   - `an_unknown_recovery_commit_closes_each_turn_once`, in the same in-crate tests. Two sessions have open turns. Arm the kernel hook and call `end_interrupted_turns` directly; it returns `CommitUnknown`. Before reopening, both sessions already show their closing events and end events, and no open-turn row is left. Reopening changes no position.
+   - `an_unknown_recovery_commit_closes_each_turn_once`, in the same in-crate tests. Two sessions have open turns. Arm the kernel hook on the open-turn partition of `SessionParts` and call `end_interrupted_turns` directly; it returns `CommitUnknown`. Before reopening, both sessions already show their closing events and end events, and no open-turn row is left. Reopening changes no position.
    - `recovery_reads_no_source_of_an_owed_call`, in `crates/mmdb/tests/session_turns.rs`: a workspace session's unanswered call cites a Personal event of another session with no open turn; the handle is dropped and the store reopened. The store opens, and the closing result carries the call's `source_scopes`.
 
    After: 5. Check: `cargo test --workspace --locked`
