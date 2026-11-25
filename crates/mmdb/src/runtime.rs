@@ -882,8 +882,8 @@ impl RuntimeStore {
         hi.extend_from_slice(&[0xff; 512]);
         let mut values = Vec::new();
         for item in partition.range(prefix.to_vec()..hi) {
-            let (_, value) = item
-                .into_inner()
+            let value = item
+                .value()
                 .map_err(|e| Error::Storage(e.to_string()))?;
             values.push(serde_json::from_slice(&value)?);
         }

@@ -100,7 +100,7 @@ impl GraphStore {
         };
         let mut out = Vec::new();
         for kv in self.out.range(lo..hi) {
-            let (_, v) = kv.into_inner().map_err(|e| Error::Storage(e.to_string()))?;
+            let v = kv.value().map_err(|e| Error::Storage(e.to_string()))?;
             let e: Edge = serde_json::from_slice(&v).map_err(Error::from)?;
             if let Some(l) = label {
                 if e.label != l {
@@ -216,7 +216,7 @@ impl GraphStore {
         let (lo, hi) = label_dict_tenant_range(tenant);
         let mut labels = BTreeSet::new();
         for kv in self.labels.range(lo..hi) {
-            let (k, _) = kv.into_inner().map_err(|e| Error::Storage(e.to_string()))?;
+            let k = kv.key().map_err(|e| Error::Storage(e.to_string()))?;
             if let Some(label) = label_from_dict_key(&k) {
                 labels.insert(label);
             }

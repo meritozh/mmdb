@@ -159,8 +159,8 @@ impl LexicalIndex {
         let mut count = 0;
         let mut length = 0;
         for item in self.docs.range(lo..hi) {
-            let (_, value) = item
-                .into_inner()
+            let value = item
+                .value()
                 .map_err(|e| Error::Storage(e.to_string()))?;
             let document: LexicalDocument = serde_json::from_slice(&value)?;
             count += 1;

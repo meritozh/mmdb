@@ -675,6 +675,10 @@ fn read_pair(pair: fjall::Guard) -> KernelResult<(Bytes, Bytes)> {
     Ok((Bytes(key), Bytes(value)))
 }
 
+fn read_key(row: fjall::Guard) -> KernelResult<Bytes> {
+    Ok(Bytes(row.key()?))
+}
+
 impl Partition {
     pub fn get(&self, key: impl AsRef<[u8]>) -> KernelResult<Option<Bytes>> {
         let _eras = self.owner.readable()?;
@@ -687,49 +691,78 @@ impl Partition {
     }
 
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = KernelResult<(Bytes, Bytes)>> + '_ {
-        self.scan(|| self.raw.iter())
+        self.scan(|| self.raw.iter(), read_pair)
     }
 
     pub fn range<K: AsRef<[u8]>, R: RangeBounds<K>>(
         &self,
         range: R,
     ) -> impl DoubleEndedIterator<Item = KernelResult<(Bytes, Bytes)>> + '_ {
-        self.scan(|| self.raw.range(range))
+        self.scan(|| self.raw.range(range), read_pair)
     }
 
     pub fn prefix(
         &self,
         prefix: impl AsRef<[u8]>,
     ) -> impl DoubleEndedIterator<Item = KernelResult<(Bytes, Bytes)>> + '_ {
-        self.scan(|| self.raw.prefix(prefix))
+        self.scan(|| self.raw.prefix(prefix), read_pair)
     }
 
-    fn scan<I>(&self, open: impl FnOnce() -> I) -> PartitionScan<'_, I> {
+    /// Scan matching keys without fetching separated values. As with row scans,
+    /// the first era or storage error terminates iteration in both directions.
+    pub fn prefix_keys(
+        &self,
+        prefix: impl AsRef<[u8]>,
+    ) -> impl DoubleEndedIterator<Item = KernelResult<Bytes>> + '_ {
+        self.scan(|| self.raw.prefix(prefix), read_key)
+    }
+
+    pub fn range_keys<K: AsRef<[u8]>, R: RangeBounds<K>>(
+        &self,
+        range: R,
+    ) -> impl DoubleEndedIterator<Item = KernelResult<Bytes>> + '_ {
+        self.scan(|| self.raw.range(range), read_key)
+    }
+
+    pub fn prefix_values(
+        &self,
+        prefix: impl AsRef<[u8]>,
+    ) -> impl DoubleEndedIterator<Item = KernelResult<Bytes>> + '_ {
+        self.scan(|| self.raw.prefix(prefix), |row| Ok(Bytes(row.value()?)))
+    }
+
+    fn scan<T>(
+        &self,
+        open: impl FnOnce() -> fjall::Iter,
+        project: fn(fjall::Guard) -> KernelResult<T>,
+    ) -> PartitionScan<'_, T> {
         PartitionScan {
             owner: &self.owner,
             rows: Some(self.owner.readable().map(|_eras| open())),
+            project,
         }
     }
 }
 
 // A caller may retain a scan across a reset. Check each read without holding
 // the era lock while the caller processes a row.
-struct PartitionScan<'a, I> {
+struct PartitionScan<'a, T> {
     owner: &'a EraPartitions,
-    rows: Option<KernelResult<I>>,
+    rows: Option<KernelResult<fjall::Iter>>,
+    project: fn(fjall::Guard) -> KernelResult<T>,
 }
 
-impl<I: DoubleEndedIterator<Item = fjall::Guard>> PartitionScan<'_, I> {
+impl<T> PartitionScan<'_, T> {
     fn advance(
         &mut self,
-        next: impl FnOnce(&mut I) -> Option<I::Item>,
-    ) -> Option<KernelResult<(Bytes, Bytes)>> {
+        next: impl FnOnce(&mut fjall::Iter) -> Option<fjall::Guard>,
+    ) -> Option<KernelResult<T>> {
         let row = match self.rows.as_mut()? {
             Err(_) => return self.rows.take()?.err().map(Err),
             Ok(rows) => self
                 .owner
                 .readable()
-                .and_then(|_eras| next(rows).map(read_pair).transpose()),
+                .and_then(|_eras| next(rows).map(self.project).transpose()),
         };
         if !matches!(row, Ok(Some(_))) {
             self.rows = None;
@@ -738,15 +771,15 @@ impl<I: DoubleEndedIterator<Item = fjall::Guard>> PartitionScan<'_, I> {
     }
 }
 
-impl<I: DoubleEndedIterator<Item = fjall::Guard>> Iterator for PartitionScan<'_, I> {
-    type Item = KernelResult<(Bytes, Bytes)>;
+impl<T> Iterator for PartitionScan<'_, T> {
+    type Item = KernelResult<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.advance(Iterator::next)
     }
 }
 
-impl<I: DoubleEndedIterator<Item = fjall::Guard>> DoubleEndedIterator for PartitionScan<'_, I> {
+impl<T> DoubleEndedIterator for PartitionScan<'_, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.advance(DoubleEndedIterator::next_back)
     }
