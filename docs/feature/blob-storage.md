@@ -6,6 +6,13 @@ Status: shipped
 large bytes outside the node LSM while preserving refcounted lifecycle
 semantics.
 
+When blob files exist, opening the store requires a compatible metadata database
+with its `m` keyspace. If either is missing, ordinary open and repair return an
+error and preserve the files. With a valid index, explicit repair can remove
+individual files that have no metadata row. An established standalone blob store
+can share its parent directory with application files. Fjall files in that parent
+require a compatible engine version marker.
+
 ## Responsibilities
 
 - Hash and persist binary payloads.

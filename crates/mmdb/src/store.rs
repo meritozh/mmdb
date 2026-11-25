@@ -6,18 +6,18 @@ use crate::{
     ContextAccess, ContextError, ContextResult, EraId, StoreFormatDescriptor, StoreModule,
 };
 use mmdb_kernel::store_format::{StoreEraId, MAX_RESET_PLAN_TTL};
-use mmdb_kernel::{Kernel, KernelError, ModuleId, ModuleSpec};
+use mmdb_kernel::{Kernel, KernelError, ModuleId, ModuleSpec, PartitionSpec};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const STORE_FORMAT_ID: &str = "mmdb-store-v1";
+pub const STORE_FORMAT_ID: &str = "mmdb-store-v2";
 const SESSION: ModuleId = StoreModule::Session.id();
 const MEMORY: ModuleId = StoreModule::Memory.id();
 
 macro_rules! partitions {
     ($($group:path),+) => {{
-        let mut names = [""; 0 $(+ $group.len())+];
+        let mut names = [PartitionSpec::Inline(""); 0 $(+ $group.len())+];
         let mut remaining = names.as_mut_slice();
         $(
             let (group, rest) = remaining.split_at_mut($group.len());

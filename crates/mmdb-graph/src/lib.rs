@@ -8,7 +8,7 @@
 //! O(neighbours) time, optionally filtered by label, and symmetrically all
 //! incoming edges. The edge payload itself lives only in `edges_out`; the
 //! reverse partition stores just keys so updates stay cheap.
-use fjall::{Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
+use fjall::{Database as FjallDatabase, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
 use mmdb_core::{Edge, Error, Result};
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use ulid::Ulid;
@@ -19,10 +19,10 @@ const PART_LABELS: &str = "edge_label_dict";
 
 /// Persistent property-graph store backed by two `fjall` partitions.
 pub struct GraphStore {
-    keyspace: Keyspace,
-    out: PartitionHandle,
-    inn: PartitionHandle,
-    labels: PartitionHandle,
+    database: FjallDatabase,
+    out: Keyspace,
+    inn: Keyspace,
+    labels: Keyspace,
 }
 
 /// Which side of an edge a traversal follows.
@@ -37,21 +37,21 @@ pub enum Direction {
 }
 
 impl GraphStore {
-    /// Open the graph store against an existing fjall keyspace.
-    /// Sharing the keyspace with [`mmdb_storage::Storage`] lets writes from
+    /// Open the graph store against an existing fjall database.
+    /// Sharing the database with [`mmdb_storage::Storage`] lets writes from
     /// both crates land in the same WAL.
-    pub fn open(keyspace: Keyspace) -> Result<Self> {
-        let out = keyspace
-            .open_partition(PART_OUT, PartitionCreateOptions::default())
+    pub fn open(database: FjallDatabase) -> Result<Self> {
+        let out = database
+            .keyspace(PART_OUT, KeyspaceCreateOptions::default)
             .map_err(|e| Error::Storage(e.to_string()))?;
-        let inn = keyspace
-            .open_partition(PART_IN, PartitionCreateOptions::default())
+        let inn = database
+            .keyspace(PART_IN, KeyspaceCreateOptions::default)
             .map_err(|e| Error::Storage(e.to_string()))?;
-        let labels = keyspace
-            .open_partition(PART_LABELS, PartitionCreateOptions::default())
+        let labels = database
+            .keyspace(PART_LABELS, KeyspaceCreateOptions::default)
             .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(Self {
-            keyspace,
+            database,
             out,
             inn,
             labels,
@@ -67,14 +67,11 @@ impl GraphStore {
         let label_key = label_dict_key(tenant, lh, &edge.label);
         let val = serde_json::to_vec(&edge).map_err(Error::from)?;
 
-        let mut batch = self.keyspace.batch();
+        let mut batch = self.database.batch().durability(Some(PersistMode::SyncAll));
         batch.insert(&self.out, kout, val);
         batch.insert(&self.inn, kin, []);
         batch.insert(&self.labels, label_key, []);
         batch.commit().map_err(|e| Error::Storage(e.to_string()))?;
-        self.keyspace
-            .persist(PersistMode::SyncAll)
-            .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -83,13 +80,10 @@ impl GraphStore {
         let lh = label_hash(label);
         let kout = out_key(tenant, src, lh, dst);
         let kin = in_key(tenant, dst, lh, src);
-        let mut batch = self.keyspace.batch();
+        let mut batch = self.database.batch().durability(Some(PersistMode::SyncAll));
         batch.remove(&self.out, kout);
         batch.remove(&self.inn, kin);
         batch.commit().map_err(|e| Error::Storage(e.to_string()))?;
-        self.keyspace
-            .persist(PersistMode::SyncAll)
-            .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -106,7 +100,7 @@ impl GraphStore {
         };
         let mut out = Vec::new();
         for kv in self.out.range(lo..hi) {
-            let (_, v) = kv.map_err(|e| Error::Storage(e.to_string()))?;
+            let (_, v) = kv.into_inner().map_err(|e| Error::Storage(e.to_string()))?;
             let e: Edge = serde_json::from_slice(&v).map_err(Error::from)?;
             if let Some(l) = label {
                 if e.label != l {
@@ -125,9 +119,21 @@ impl GraphStore {
             Some(l) => in_label_range(tenant, node, label_hash(l)),
             None => in_node_range(tenant, node),
         };
+        let view = self.database.snapshot();
+        self.read_incoming(&view, tenant, node, label, view.range(&self.inn, lo..hi))
+    }
+
+    fn read_incoming(
+        &self,
+        view: &fjall::Snapshot,
+        tenant: u32,
+        node: Ulid,
+        label: Option<&str>,
+        index_rows: impl Iterator<Item = fjall::Guard>,
+    ) -> Result<Vec<Edge>> {
         let mut out = Vec::new();
-        for kv in self.inn.range(lo..hi) {
-            let (k, _) = kv.map_err(|e| Error::Storage(e.to_string()))?;
+        for row in index_rows {
+            let k = row.key().map_err(|e| Error::Storage(e.to_string()))?;
             // k = [tenant(4) | dst(16) | lh(4) | src(16)]
             if k.len() != 4 + 16 + 4 + 16 {
                 continue;
@@ -139,9 +145,8 @@ impl GraphStore {
             src_buf.copy_from_slice(&k[24..40]);
             let src = Ulid(u128::from_be_bytes(src_buf));
             let kout = out_key(tenant, src, lh, node);
-            if let Some(v) = self
-                .out
-                .get(&kout)
+            if let Some(v) = view
+                .get(&self.out, &kout)
                 .map_err(|e| Error::Storage(e.to_string()))?
             {
                 let e: Edge = serde_json::from_slice(&v).map_err(Error::from)?;
@@ -211,7 +216,7 @@ impl GraphStore {
         let (lo, hi) = label_dict_tenant_range(tenant);
         let mut labels = BTreeSet::new();
         for kv in self.labels.range(lo..hi) {
-            let (k, _) = kv.map_err(|e| Error::Storage(e.to_string()))?;
+            let (k, _) = kv.into_inner().map_err(|e| Error::Storage(e.to_string()))?;
             if let Some(label) = label_from_dict_key(&k) {
                 labels.insert(label);
             }
@@ -313,7 +318,7 @@ fn label_from_dict_key(k: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fjall::Config;
+    use fjall::Database as FjallDatabase;
     use std::collections::BTreeMap;
     use tempfile::tempdir;
 
@@ -334,7 +339,7 @@ mod tests {
 
     fn open() -> (tempfile::TempDir, GraphStore) {
         let dir = tempdir().unwrap();
-        let ks = Config::new(dir.path()).open().unwrap();
+        let ks = FjallDatabase::builder(dir.path()).open().unwrap();
         (dir, GraphStore::open(ks).unwrap())
     }
 
@@ -373,6 +378,36 @@ mod tests {
         let ins = g.neighbours_in(0, b, None).unwrap();
         assert_eq!(ins.len(), 1);
         assert_eq!(ins[0].src, a);
+    }
+
+    #[test]
+    fn incoming_join_keeps_the_payload_deleted_after_index_selection() {
+        let (_dir, graph) = open();
+        let src = Ulid::new();
+        let dst = Ulid::new();
+        graph.add_edge(7, mk_edge(src, dst, "rel")).unwrap();
+
+        let view = graph.database.snapshot();
+        let (lo, hi) = in_label_range(7, dst, label_hash("rel"));
+        // The writer commits after the iterator has selected its reverse marker.
+        let rows = view.range(&graph.inn, lo..hi).rev().inspect(|_| {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| graph.remove_edge(7, src, dst, "rel"))
+                    .join()
+                    .unwrap()
+                    .unwrap();
+            });
+        });
+        let result = graph
+            .read_incoming(&view, 7, dst, Some("rel"), rows)
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            (result[0].src, result[0].dst, result[0].label.as_str()),
+            (src, dst, "rel")
+        );
+        assert!(graph.neighbours_in(7, dst, Some("rel")).unwrap().is_empty());
     }
 
     #[test]

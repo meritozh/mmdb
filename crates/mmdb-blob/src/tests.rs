@@ -110,8 +110,8 @@ fn reopen_survives_refcounts() {
 #[test]
 fn open_with_repair_removes_orphan_on_disk_blob() {
     let dir = tempdir().unwrap();
-    // Manually plant an orphan blob on disk (no metadata entry).
-    fs::ensure_layout(dir.path()).unwrap();
+    // Establish a known-format metadata database, then plant bytes with no row.
+    drop(BlobStore::open(dir.path()).unwrap());
     let orphan_hash = [0xc0; 32];
     fs::write_blob_bytes(dir.path(), &orphan_hash, b"orphan data").unwrap();
     assert!(fs::blob_exists_on_disk(dir.path(), &orphan_hash));
@@ -129,6 +129,34 @@ fn open_with_repair_removes_orphan_on_disk_blob() {
         drop(s);
     }
     assert!(!fs::blob_exists_on_disk(dir.path(), &orphan_hash));
+}
+
+#[test]
+fn standalone_reopen_accepts_unrelated_siblings_and_checks_parent_engine_residue() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let hash = BlobStore::open(root)
+        .unwrap()
+        .put_stream(&b"owned blob"[..])
+        .unwrap()
+        .into_ref()
+        .hash;
+    let sibling = root.join(".DS_Store");
+    std::fs::write(&sibling, b"desktop metadata").unwrap();
+    drop(BlobStore::open(root).unwrap());
+    let store = BlobStore::open_with_repair(root).unwrap();
+    assert_eq!(store.refcount(&hash).unwrap(), Some(1));
+    drop(store);
+    assert_eq!(std::fs::read(sibling).unwrap(), b"desktop metadata");
+    assert!(!root.join("version").exists());
+
+    for name in ["journals", "partitions", "keyspaces", "lock", "0.jnl"] {
+        let residue = root.join(name);
+        std::fs::write(&residue, b"engine residue").unwrap();
+        assert!(BlobStore::open_with_repair(root).is_err(), "{name}");
+        assert!(fs::blob_exists_on_disk(root, &hash));
+        std::fs::remove_file(residue).unwrap();
+    }
 }
 
 #[test]

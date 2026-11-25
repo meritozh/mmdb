@@ -49,7 +49,7 @@ pub use mmdb_vector as vector;
 /// Declare a module's partition schema together with its typed handles.
 macro_rules! module_partitions {
     ($parts:ident, $schema:ident, { $($field:ident => $name:expr),+ $(,)? }) => {
-        pub(crate) const $schema: &[&str] = &[$($name),+];
+        pub(crate) const $schema: &[mmdb_kernel::PartitionSpec] = &[$(mmdb_kernel::PartitionSpec::Inline($name)),+];
 
         pub(crate) struct $parts {
             $(pub(crate) $field: mmdb_kernel::Partition,)+

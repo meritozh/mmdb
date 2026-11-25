@@ -13,7 +13,7 @@ MMDB is an embedded Rust data layer for agents. It persists and manages operatio
 
 ### Gotchas
 
-- `Database::state()` shares the database's keyspace. Use `StateStore::open_path` with a separate root for workflows, queues, and other operational state that must survive a memory-store reset.
+- `Database::state()` uses a keyspace in the same Fjall database. Use `StateStore::open_path` with a separate root for workflows, queues, and other operational state that must survive a memory-store reset.
 - `Store::reset_memory` requires the plan's full confirmation digest and preserves the session log. Reopen after an unknown reset outcome or to finish pending cleanup. `Store::open` rejects an unexpected format. A whole-store reset quarantines the old directory.
 
 ## Principles

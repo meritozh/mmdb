@@ -1,4 +1,4 @@
-use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
+use fjall::{Database as FjallDatabase, Keyspace, KeyspaceCreateOptions, PersistMode};
 use mmdb_core::{Error, Result};
 use mmdb_kernel::store_format::{
     inspect_store_root, require_managed_store, StoreFormatDescriptor, StoreFormatError, StoreLease,
@@ -92,8 +92,8 @@ type Directories = HashMap<String, LiveDirectory>;
 
 pub struct StateStore {
     tenant: u32,
-    keyspace: Keyspace,
-    partition: PartitionHandle,
+    database: FjallDatabase,
+    partition: Keyspace,
     write_lock: Mutex<Directories>,
     _lease: Option<StoreLease>,
 }
@@ -101,7 +101,7 @@ pub struct StateStore {
 impl StateStore {
     /// Open an operational state store in its own physical root.
     ///
-    /// Keeping runtime records outside the semantic-memory keyspace lets
+    /// Keeping runtime records outside the semantic-memory database lets
     /// memory rebuilds and erasure operate without risking conversations,
     /// runs, workflows, or checkpoints.
     pub fn open_path(
@@ -134,23 +134,31 @@ impl StateStore {
         }
         let managed =
             require_managed_store(path, format.format_id()).map_err(state_store_format_error)?;
-        let keyspace = Config::new(managed.canonical_root())
+        mmdb_kernel::engine_format::inspect(
+            managed.canonical_root(),
+            &[mmdb_kernel::store_format::STORE_MANIFEST_FILE],
+        )?;
+        let database = FjallDatabase::builder(managed.canonical_root())
             .open()
             .map_err(|error| Error::Storage(error.to_string()))?;
-        Self::open_with_lease(keyspace, tenant, Some(lease))
+        Self::open_with_lease(database, tenant, Some(lease))
     }
 
-    pub(crate) fn open(keyspace: Keyspace, tenant: u32) -> Result<Self> {
-        Self::open_with_lease(keyspace, tenant, None)
+    pub(crate) fn open(database: FjallDatabase, tenant: u32) -> Result<Self> {
+        Self::open_with_lease(database, tenant, None)
     }
 
-    fn open_with_lease(keyspace: Keyspace, tenant: u32, lease: Option<StoreLease>) -> Result<Self> {
-        let partition = keyspace
-            .open_partition(PART_STATE, PartitionCreateOptions::default())
+    fn open_with_lease(
+        database: FjallDatabase,
+        tenant: u32,
+        lease: Option<StoreLease>,
+    ) -> Result<Self> {
+        let partition = database
+            .keyspace(PART_STATE, KeyspaceCreateOptions::default)
             .map_err(|error| Error::Storage(error.to_string()))?;
         Ok(Self {
             tenant,
-            keyspace,
+            database,
             partition,
             write_lock: Mutex::default(),
             _lease: lease,
@@ -177,7 +185,7 @@ impl StateStore {
         let revision = self
             .get_stored(&storage_key)?
             .map_or(1, |stored| stored.revision.saturating_add(1));
-        let mut batch = self.keyspace.batch().durability(Some(PersistMode::SyncAll));
+        let mut batch = self.database.batch().durability(Some(PersistMode::SyncAll));
         batch.insert(
             &self.partition,
             storage_key,
@@ -223,7 +231,7 @@ impl StateStore {
     /// acknowledgement following an I/O error.
     pub fn confirm_durable(&self) -> Result<()> {
         let _guard = self.write_lock.lock();
-        self.keyspace
+        self.database
             .persist(PersistMode::SyncAll)
             .map_err(|error| Error::Storage(error.to_string()))
     }
@@ -242,7 +250,9 @@ impl StateStore {
 
         let mut entries = Vec::new();
         for item in self.partition.prefix(storage_prefix) {
-            let (key, value) = item.map_err(|error| Error::Storage(error.to_string()))?;
+            let (key, value) = item
+                .into_inner()
+                .map_err(|error| Error::Storage(error.to_string()))?;
             let stored: StoredValue = serde_json::from_slice(&value)?;
             if stored.deleted {
                 continue;
@@ -318,7 +328,9 @@ impl StateStore {
             examined: 0,
         };
         for item in self.partition.range(start..) {
-            let (key, value) = item.map_err(|error| Error::Storage(error.to_string()))?;
+            let (key, value) = item
+                .into_inner()
+                .map_err(|error| Error::Storage(error.to_string()))?;
             if !key.starts_with(&storage_prefix) {
                 break;
             }
@@ -481,7 +493,7 @@ impl StateStore {
         }
 
         let now = crate::now_ms();
-        let mut batch = self.keyspace.batch().durability(Some(PersistMode::SyncAll));
+        let mut batch = self.database.batch().durability(Some(PersistMode::SyncAll));
         let mut delta = Vec::new();
         for (namespace, storage_key, current, mutation) in prepared {
             if directories.contains_key(&namespace) {

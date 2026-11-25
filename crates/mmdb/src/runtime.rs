@@ -1,7 +1,7 @@
 use crate::audit::{AuditAction, AuditContext};
 use crate::lexical::searchable_text;
 use crate::{Database, DatabaseConfig, Embedder};
-use fjall::{Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
+use fjall::{Database as FjallDatabase, Keyspace, KeyspaceCreateOptions, PersistMode};
 use mmdb_core::{Content, Embedding, MemoryNode, NodeKind};
 use mmdb_core::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -757,21 +757,21 @@ impl Database {
 }
 
 pub(crate) struct RuntimeStore {
-    keyspace: Keyspace,
-    profiles: PartitionHandle,
-    projections: PartitionHandle,
-    proposals: PartitionHandle,
-    dream_runs: PartitionHandle,
+    database: FjallDatabase,
+    profiles: Keyspace,
+    projections: Keyspace,
+    proposals: Keyspace,
+    dream_runs: Keyspace,
 }
 
 impl RuntimeStore {
-    pub(crate) fn open(keyspace: Keyspace) -> Result<Self> {
+    pub(crate) fn open(database: FjallDatabase) -> Result<Self> {
         Ok(Self {
-            profiles: open_partition(&keyspace, PART_PROFILES)?,
-            projections: open_partition(&keyspace, PART_PROJECTIONS)?,
-            proposals: open_partition(&keyspace, PART_PROPOSALS)?,
-            dream_runs: open_partition(&keyspace, PART_DREAM_RUNS)?,
-            keyspace,
+            profiles: open_partition(&database, PART_PROFILES)?,
+            projections: open_partition(&database, PART_PROJECTIONS)?,
+            proposals: open_partition(&database, PART_PROPOSALS)?,
+            dream_runs: open_partition(&database, PART_DREAM_RUNS)?,
+            database,
         })
     }
 
@@ -855,7 +855,7 @@ impl RuntimeStore {
 
     fn get_json<T: for<'de> Deserialize<'de>>(
         &self,
-        partition: &PartitionHandle,
+        partition: &Keyspace,
         key: &[u8],
     ) -> Result<Option<T>> {
         match partition
@@ -867,39 +867,33 @@ impl RuntimeStore {
         }
     }
 
-    fn put_json<T: Serialize>(
-        &self,
-        partition: &PartitionHandle,
-        key: &[u8],
-        value: &T,
-    ) -> Result<()> {
-        partition
-            .insert(key, serde_json::to_vec(value)?)
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        self.keyspace
-            .persist(PersistMode::SyncAll)
-            .map_err(|e| Error::Storage(e.to_string()))
+    fn put_json<T: Serialize>(&self, partition: &Keyspace, key: &[u8], value: &T) -> Result<()> {
+        let mut batch = self.database.batch().durability(Some(PersistMode::SyncAll));
+        batch.insert(partition, key, serde_json::to_vec(value)?);
+        batch.commit().map_err(|e| Error::Storage(e.to_string()))
     }
 
     fn scan_prefix<T: for<'de> Deserialize<'de>>(
         &self,
-        partition: &PartitionHandle,
+        partition: &Keyspace,
         prefix: &[u8],
     ) -> Result<Vec<T>> {
         let mut hi = prefix.to_vec();
         hi.extend_from_slice(&[0xff; 512]);
         let mut values = Vec::new();
         for item in partition.range(prefix.to_vec()..hi) {
-            let (_, value) = item.map_err(|e| Error::Storage(e.to_string()))?;
+            let (_, value) = item
+                .into_inner()
+                .map_err(|e| Error::Storage(e.to_string()))?;
             values.push(serde_json::from_slice(&value)?);
         }
         Ok(values)
     }
 }
 
-fn open_partition(keyspace: &Keyspace, name: &str) -> Result<PartitionHandle> {
-    keyspace
-        .open_partition(name, PartitionCreateOptions::default())
+fn open_partition(database: &FjallDatabase, name: &str) -> Result<Keyspace> {
+    database
+        .keyspace(name, KeyspaceCreateOptions::default)
         .map_err(|e| Error::Storage(e.to_string()))
 }
 

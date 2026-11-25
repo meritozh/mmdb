@@ -8,7 +8,7 @@ directory so workflows and queues survive a memory-store reset.
 
 - **Embedded** — zero-deployment, single-process, tenant-prefixed storage
 - **Multi-model** — text/structured nodes, vector embeddings, edges (graph), blobs
-- **fjall-based** — LSM storage with partitioned keyspaces, MVCC snapshots, KV separation
+- **fjall-based** — Fjall 3 keyspaces, cross-keyspace MVCC snapshots and separated record payloads
 - **Time-ordered** — tenant-prefixed, big-endian ULID keys for efficient time-range scans
 - **Node-centric data model** — `MemoryNode` with Episode / Fact / Entity / Artifact kinds
 - **Builder API** — ergonomic `NodeBuilder` for fluent node construction
@@ -39,8 +39,10 @@ scope and tool permissions.
 the same catalog as custom types. Complete raw events stream into checksummed
 chunks. `SessionLog::search` uses bounded, resumable substring scans. Objects use
 lexical postings and explicit relation paths. One process holds the store lease
-at a time. The format is `mmdb-store-v1`. An explicit whole-store reset moves
-a legacy directory into quarantine and creates a fresh store.
+at a time. The format is `mmdb-store-v2` on Fjall 3. Opening a Fjall 2 directory reports an
+incompatible format. Choose a new directory, or use a confirmed whole-store
+reset on a managed root to quarantine the original directory and start empty.
+The original MMDB version can open that quarantine.
 
 To reset native memory and domain context in place, call
 `store.plan_memory_reset(issued_at, ttl)`, then pass the plan, its full

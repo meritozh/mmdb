@@ -1,13 +1,14 @@
 use super::keys::*;
 use super::snapshot::manifest_path;
 use super::{HitFilter, SnapshotManifest, VectorStore};
-use fjall::Config;
+use fjall::Database as FjallDatabase;
+use std::path::Path;
 use tempfile::tempdir;
 use ulid::Ulid;
 
-fn make_store_at(path: &std::path::Path) -> VectorStore {
-    let ks = Config::new(path).open().unwrap();
-    VectorStore::open(ks).unwrap()
+fn make_store_at(path: &Path) -> VectorStore {
+    let ks = FjallDatabase::builder(path).open().unwrap();
+    VectorStore::open(ks, path).unwrap()
 }
 
 fn norm(v: Vec<f32>) -> Vec<f32> {
@@ -141,18 +142,39 @@ fn rebuild_after_reopen() {
 #[test]
 fn open_reloads_checkpointed_hnsw_snapshot() {
     let dir = tempdir().unwrap();
+    let engine = dir.path().join("engine");
+    assert_snapshot_reloads(
+        || VectorStore::open(FjallDatabase::builder(&engine).open().unwrap(), dir.path()).unwrap(),
+        &dir.path().join("vector_hnsw_snapshots"),
+    );
+}
+
+#[test]
+fn open_reloads_from_explicit_snapshot_directory() {
+    let engine = tempdir().unwrap();
+    let snapshots = tempdir().unwrap();
+    assert_snapshot_reloads(
+        || {
+            let ks = FjallDatabase::builder(engine.path()).open().unwrap();
+            VectorStore::open_with_snapshot_dir(ks, snapshots.path()).unwrap()
+        },
+        snapshots.path(),
+    );
+}
+
+fn assert_snapshot_reloads(open: impl Fn() -> VectorStore, snapshot_dir: &Path) {
     let id1 = Ulid::new();
     let id2 = Ulid::new();
     {
-        let s = make_store_at(dir.path());
+        let s = open();
         s.insert(0, "m", id1, &norm(vec![1.0, 0.0, 0.0, 0.0]))
             .unwrap();
         s.insert(0, "m", id2, &norm(vec![0.0, 1.0, 0.0, 0.0]))
             .unwrap();
-        s.flush_snapshots().unwrap();
+        assert_eq!(s.flush_snapshots().unwrap(), 1);
     }
-
-    let s = make_store_at(dir.path());
+    assert!(manifest_path(snapshot_dir, 0, model_hash("m")).is_file());
+    let s = open();
 
     assert_eq!(s.snapshot_reload_count(), 1);
     let hits = s
@@ -192,6 +214,33 @@ fn open_falls_back_to_rebuild_when_hnsw_snapshot_is_corrupt() {
         .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].node_id, id);
+}
+
+#[test]
+fn corrupt_manifest_rebuilds_its_model_and_flushes_a_reloadable_snapshot() {
+    let dir = tempdir().unwrap();
+    let id = Ulid::new();
+    let vector = [1.0, 0.0];
+    let store = make_store_at(dir.path());
+    for model in ["broken", "healthy"] {
+        store.insert(0, model, id, &vector).unwrap();
+    }
+    assert_eq!(store.flush_snapshots().unwrap(), 2);
+    let manifest = manifest_path(&store.snapshot_dir, 0, model_hash("broken"));
+    drop(store);
+
+    for invalid in [b"{".as_slice(), b"{}"] {
+        std::fs::write(&manifest, invalid).unwrap();
+        let store = make_store_at(dir.path());
+        assert_eq!(store.snapshot_reload_count(), 1);
+        assert_eq!(
+            store.search(0, "broken", &vector, 1).unwrap()[0].node_id,
+            id
+        );
+        assert_eq!(store.flush_snapshots().unwrap(), 1);
+        drop(store);
+        assert_eq!(make_store_at(dir.path()).snapshot_reload_count(), 2);
+    }
 }
 
 #[test]

@@ -8,7 +8,7 @@ It wraps HNSW search while keeping a fjall-backed source of truth for rebuilds.
 ## Responsibilities
 
 - Maintain one `VectorIndex` per `(tenant, model)`.
-- Store vector rows, reverse lookup rows, and tombstones in fjall partitions.
+- Store vector rows, reverse lookup rows, and tombstones in Fjall keyspaces.
 - Rebuild HNSW indexes from persisted vector metadata.
 - Load native HNSW snapshots when manifests prove they are current.
 - Support filtered search by candidate `Ulid`.
@@ -22,7 +22,10 @@ It wraps HNSW search while keeping a fjall-backed source of truth for rebuilds.
 | `vector_tomb` | `[tenant][model_hash][internal_id]` | empty tombstone marker |
 
 `vector_meta` is the durable source of truth. HNSW graph dumps are only a
-cold-start optimization.
+cold-start optimization. `VectorStore::open` takes the MMDB root and stores
+snapshots under `vector_hnsw_snapshots/` there. Use
+`VectorStore::open_with_snapshot_dir` to supply the snapshot directory directly.
+Both constructors resolve relative paths against the working directory at open.
 
 ## Model Identity
 
@@ -58,7 +61,8 @@ On open:
 
 `flush_snapshots` writes native HNSW graph/data files plus a JSON manifest. The
 manifest must cover live rows and tombstone high-water marks before it can be
-trusted for reload.
+trusted for reload. A missing or malformed manifest makes that model rebuild
+from its persisted vector rows. The next flush writes a fresh snapshot and manifest.
 
 ## Public Surface
 

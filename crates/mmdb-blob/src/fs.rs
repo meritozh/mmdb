@@ -152,6 +152,23 @@ pub(crate) fn ensure_layout(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Creating a metadata database or its index is safe only before any blob bytes exist.
+pub(crate) fn require_empty_blob_dir(root: &Path) -> Result<()> {
+    let bytes = root.join("blobs");
+    let mut entries = match fs::read_dir(&bytes) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if entries.next().transpose()?.is_some() {
+        return Err(mmdb_core::Error::Storage(format!(
+            "{} contains blob data without its metadata index in {}; keep the files and open a new empty store",
+            bytes.display(), metadata_dir(root).display()
+        )));
+    }
+    Ok(())
+}
+
 /// Atomic write: ensures directory for fjall metadata lives in <root>/ so it doesn't
 /// get mixed up with blob fs data by external callers.
 pub(crate) fn metadata_dir(root: &Path) -> PathBuf {

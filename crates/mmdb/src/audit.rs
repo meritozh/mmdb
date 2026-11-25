@@ -1,4 +1,4 @@
-use fjall::{Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
+use fjall::{Database as FjallDatabase, Keyspace, KeyspaceCreateOptions, PersistMode};
 use mmdb_core::{Content, Error, MemoryNode, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -52,16 +52,16 @@ pub struct AuditFilter {
 }
 
 pub(crate) struct AuditStore {
-    keyspace: Keyspace,
-    records: PartitionHandle,
+    database: FjallDatabase,
+    records: Keyspace,
 }
 
 impl AuditStore {
-    pub(crate) fn open(keyspace: Keyspace) -> Result<Self> {
-        let records = keyspace
-            .open_partition(PART_AUDIT, PartitionCreateOptions::default())
+    pub(crate) fn open(database: FjallDatabase) -> Result<Self> {
+        let records = database
+            .keyspace(PART_AUDIT, KeyspaceCreateOptions::default)
             .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(Self { keyspace, records })
+        Ok(Self { database, records })
     }
 
     pub(crate) fn append(&self, record: &AuditRecord) -> Result<()> {
@@ -78,19 +78,18 @@ impl AuditStore {
         persisted.details = sanitize_value(&persisted.details);
         persisted.error = persisted.error.as_deref().map(sanitize_error);
         let value = serde_json::to_vec(&persisted)?;
-        self.records
-            .insert(key, value)
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        self.keyspace
-            .persist(PersistMode::SyncAll)
-            .map_err(|e| Error::Storage(e.to_string()))
+        let mut batch = self.database.batch().durability(Some(PersistMode::SyncAll));
+        batch.insert(&self.records, key, value);
+        batch.commit().map_err(|e| Error::Storage(e.to_string()))
     }
 
     pub(crate) fn list(&self, tenant: u32, filter: &AuditFilter) -> Result<Vec<AuditRecord>> {
         let (lo, hi) = tenant_range(tenant);
         let mut records = Vec::new();
         for item in self.records.range(lo..hi) {
-            let (_, value) = item.map_err(|e| Error::Storage(e.to_string()))?;
+            let (_, value) = item
+                .into_inner()
+                .map_err(|e| Error::Storage(e.to_string()))?;
             let record: AuditRecord = serde_json::from_slice(&value)?;
             if filter
                 .operation_id

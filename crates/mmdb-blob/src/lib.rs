@@ -12,7 +12,7 @@
 //! <root>/
 //!   blobs/            # blob bytes on the filesystem
 //!     <xx>/<64hex>    # one file per small blob, chunked directory per large
-//!   blob-meta/        # fjall keyspace with a single partition `m`
+//!   blob-meta/        # Fjall database with a single keyspace `m`
 //!     m/              # per-hash refcount + size + chunked flag
 //! ```
 //!
@@ -43,6 +43,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mmdb_core::{Error, Result};
+use mmdb_kernel::engine_format::{self, EngineRoot};
 
 use crate::metadata::{BlobMeta, MetaStore};
 
@@ -50,7 +51,7 @@ use crate::metadata::{BlobMeta, MetaStore};
 pub const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 /// Blobs ≤ this threshold are small enough to be stored inline inside
-/// the fjall `nodes` partition by the caller. They *can* also live on
+/// the Fjall `nodes` keyspace by the caller. They *can* also live on
 /// the filesystem; this is purely a performance hint.
 pub const INLINE_THRESHOLD: usize = 64 * 1024;
 
@@ -128,12 +129,25 @@ impl BlobStore {
         Self::open_with(path, true)
     }
 
+    /// Validate the byte store and its optional enclosing engine before either is opened.
+    pub fn check_format(root: &Path) -> Result<()> {
+        match engine_format::inspect(&fs::metadata_dir(root), &[])? {
+            EngineRoot::New => {
+                engine_format::inspect(root, &["blobs", "blob-meta"])?;
+                fs::require_empty_blob_dir(root)?;
+            }
+            EngineRoot::Existing => engine_format::inspect_enclosing(root)?,
+        }
+        Ok(())
+    }
+
     fn open_with(path: impl AsRef<Path>, repair: bool) -> Result<Self> {
-        let root = path.as_ref().to_path_buf();
-        fs::ensure_layout(&root)?;
-        let meta = Arc::new(MetaStore::open(&root)?);
+        let root = path.as_ref();
+        Self::check_format(root)?;
+        let meta = Arc::new(MetaStore::open(root)?);
+        fs::ensure_layout(root)?;
         let store = Self {
-            root,
+            root: root.to_owned(),
             meta,
             mutation: Default::default(),
         };

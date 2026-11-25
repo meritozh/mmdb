@@ -11,10 +11,10 @@
 //! internal ids, then replays `vector_tomb` to restore soft-delete state.
 use crate::{IndexKey, VectorIndex};
 use dashmap::DashMap;
-use fjall::{Keyspace, PartitionCreateOptions, PartitionHandle};
+use fjall::{Database as FjallDatabase, Keyspace, KeyspaceCreateOptions};
 use mmdb_core::{Error, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{atomic::AtomicUsize, Arc};
 use ulid::Ulid;
 
@@ -45,10 +45,10 @@ mod tests;
 pub type HitFilter<'a> = dyn Fn(Ulid) -> bool + Send + Sync + 'a;
 
 pub struct VectorStore {
-    keyspace: Keyspace,
-    meta: PartitionHandle,
-    rev: PartitionHandle,
-    tomb: PartitionHandle,
+    database: FjallDatabase,
+    meta: Keyspace,
+    rev: Keyspace,
+    tomb: Keyspace,
     snapshot_dir: PathBuf,
     indices: DashMap<IndexKey, Arc<VectorIndex>>,
     snapshot_reloads: AtomicUsize,
@@ -72,29 +72,28 @@ pub(crate) struct SnapshotManifest {
 }
 
 impl VectorStore {
-    pub fn open(keyspace: Keyspace) -> Result<Self> {
-        Self::open_with_snapshot_dir(keyspace, None::<PathBuf>)
+    /// Keep HNSW snapshots in `vector_hnsw_snapshots/` under the MMDB root.
+    pub fn open(database: FjallDatabase, root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_snapshot_dir(database, root.as_ref().join(SNAPSHOT_DIR_NAME))
     }
 
+    /// Read and write this store's HNSW snapshots in the supplied directory.
     pub fn open_with_snapshot_dir(
-        keyspace: Keyspace,
-        snapshot_dir: impl Into<Option<PathBuf>>,
+        database: FjallDatabase,
+        snapshot_dir: impl Into<PathBuf>,
     ) -> Result<Self> {
-        let meta = keyspace
-            .open_partition(PART_META, PartitionCreateOptions::default())
+        let snapshot_dir = std::path::absolute(snapshot_dir.into())?;
+        let meta = database
+            .keyspace(PART_META, KeyspaceCreateOptions::default)
             .map_err(|e| Error::Storage(e.to_string()))?;
-        let rev = keyspace
-            .open_partition(PART_REV, PartitionCreateOptions::default())
+        let rev = database
+            .keyspace(PART_REV, KeyspaceCreateOptions::default)
             .map_err(|e| Error::Storage(e.to_string()))?;
-        let tomb = keyspace
-            .open_partition(PART_TOMB, PartitionCreateOptions::default())
+        let tomb = database
+            .keyspace(PART_TOMB, KeyspaceCreateOptions::default)
             .map_err(|e| Error::Storage(e.to_string()))?;
-        let snapshot_dir = snapshot_dir
-            .into()
-            .unwrap_or_else(|| snapshot::default_snapshot_dir(&meta));
-
         let s = Self {
-            keyspace,
+            database,
             meta,
             rev,
             tomb,

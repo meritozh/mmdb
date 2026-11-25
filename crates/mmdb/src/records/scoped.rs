@@ -1,7 +1,9 @@
 use super::codec::*;
 use super::*;
 use crate::{EraId, OperationId};
-use mmdb_kernel::{Batch, EraPartitions, EraState, Kernel, KernelResult, Partition, WriteGuard};
+use mmdb_kernel::{
+    Batch, EraPartitions, EraState, Kernel, KernelResult, Partition, PartitionSpec, WriteGuard,
+};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use ulid::Ulid;
@@ -27,9 +29,20 @@ const PAYLOADS: &str = "records_payloads_v1";
 const PENDING: &str = "records_pending_v1";
 const LIFECYCLE: &str = "records_lifecycle_v1";
 const OPERATIONS: &str = "records_operations_v1";
-pub(crate) const MEMORY_PARTITIONS: &[&str] = &[HEADERS, HEADS, PAYLOADS, PENDING];
-pub(crate) const SESSION_PARTITIONS: &[&str] =
-    &[HEADERS, HEADS, PAYLOADS, PENDING, LIFECYCLE, OPERATIONS];
+pub(crate) const MEMORY_PARTITIONS: &[PartitionSpec] = &[
+    PartitionSpec::Inline(HEADERS),
+    PartitionSpec::Inline(HEADS),
+    PartitionSpec::LargeValues(PAYLOADS),
+    PartitionSpec::Inline(PENDING),
+];
+pub(crate) const SESSION_PARTITIONS: &[PartitionSpec] = &[
+    PartitionSpec::Inline(HEADERS),
+    PartitionSpec::Inline(HEADS),
+    PartitionSpec::LargeValues(PAYLOADS),
+    PartitionSpec::Inline(PENDING),
+    PartitionSpec::Inline(LIFECYCLE),
+    PartitionSpec::Inline(OPERATIONS),
+];
 
 pub(crate) struct RecordTable {
     headers: Partition,
