@@ -88,10 +88,11 @@ pub use records::{
     Actor, CheckpointMetadata, CheckpointScope, ContextAccess, ContextError, ContextRef,
     ContextResult, Endpoints, EventKind, InformationKind, LogEvent, MessageStatus,
     PayloadDescriptor, PayloadPage, Provenance, RecordHeader, RecordKind, RecordPin, RecordState,
-    RecoveryReport, Scope, StoreModule, TemporalFacts, ToolOutcome, WriteReceipt,
-    MAX_ACCESS_SCOPES, MAX_CONTEXT_NAME_BYTES, MAX_CONTEXT_SOURCES, MAX_PAYLOAD_PAGE_BYTES,
-    MAX_RECORD_BYTES, PAYLOAD_CHUNK_BYTES,
+    RecoveryReport, Scope, StoreModule, TemporalFacts, ToolOutcome, TurnEndReason, TurnError,
+    TurnStamp, WriteReceipt, MAX_ACCESS_SCOPES, MAX_CONTEXT_NAME_BYTES, MAX_CONTEXT_SOURCES,
+    MAX_PAYLOAD_PAGE_BYTES, MAX_RECORD_BYTES, PAYLOAD_CHUNK_BYTES,
 };
+pub use session::MessageState;
 pub use store::{
     MemoryResetPlan, MemoryResetReceipt, Store, StoreError, StoreResult, STORE_FORMAT_ID,
 };

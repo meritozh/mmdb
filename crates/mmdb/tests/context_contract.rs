@@ -25,6 +25,22 @@ fn event_input(session: &str, event: &str) -> EventInput {
     }
 }
 
+fn turn_log(db: &Store, actor: Actor) -> SessionLog<'_> {
+    let profile = ContextAccess {
+        run: Some("run".into()),
+        ..ContextAccess::new("owner", actor)
+    };
+    db.session_log(profile).unwrap()
+}
+
+fn boundary(log: &SessionLog<'_>, session: &str, id: &str, kind: EventKind) {
+    let input = EventInput {
+        kind,
+        ..event_input(session, id)
+    };
+    log.append(OperationId::new(), input, &[][..]).unwrap();
+}
+
 fn source(log: &SessionLog<'_>, event: &str, text: &str) -> RecordPin {
     log.append(
         OperationId::new(),
@@ -479,9 +495,8 @@ fn concurrent_appends_allocate_one_session_order() {
 fn tool_results_require_their_call_and_follow_its_purge_state() {
     let dir = tempfile::tempdir().unwrap();
     let db = Store::create(dir.path().join("context")).unwrap();
-    let log = db
-        .session_log(ContextAccess::new("owner", Actor::Operator))
-        .unwrap();
+    let log = turn_log(&db, Actor::Operator);
+    boundary(&log, "session", "turn", EventKind::TurnStarted);
     let mut result = event_input("session", "result");
     result.kind = EventKind::ToolResult {
         call_id: "call-1".into(),
@@ -1055,6 +1070,8 @@ fn format_and_store_identity_prevent_accidental_adoption() {
         "mmdb-context-dev4",
         "mmdb-store-dev9",
         "mmdb-store-dev11",
+        "mmdb-store-v1",
+        "mmdb-store-v2",
     ] {
         let legacy = dir.path().join(legacy_format);
         std::fs::create_dir(&legacy).unwrap();
@@ -1522,7 +1539,7 @@ fn live_revision_keeps_checkpoint_derived_originals_and_pairs_the_completed_tool
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("context");
     let db = Store::create(&path).unwrap();
-    let log = db.session_log(access("owner")).unwrap();
+    let log = turn_log(&db, Actor::System);
     let store = db.context(access("owner")).unwrap();
     let raw = source(&log, "original", "SQLite source text");
     let kind = store
@@ -1559,6 +1576,7 @@ fn live_revision_keeps_checkpoint_derived_originals_and_pairs_the_completed_tool
         )
         .unwrap()
         .pin;
+    boundary(&log, "session-a", "turn", EventKind::TurnStarted);
     let mut call_input = event_input("session-a", "revise-call");
     call_input.kind = EventKind::ToolCall {
         call_id: "revise-call".into(),
@@ -2053,7 +2071,8 @@ fn history_copy_reserves_new_root_depth_before_committing_an_unreadable_record()
 fn a_tool_call_reserves_room_for_its_result() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Store::create(tmp.path().join("context")).unwrap();
-    let log = db.session_log(access("owner")).unwrap();
+    let log = turn_log(&db, Actor::System);
+    boundary(&log, "tool-session", "turn", EventKind::TurnStarted);
     let chain = history_copy_chain(&log, 31);
 
     let mut call = event_input("tool-session", "call");
@@ -2069,7 +2088,7 @@ fn a_tool_call_reserves_room_for_its_result() {
         Err(ContextError::BudgetExceeded)
     ));
     assert!(log.operation_receipt(operation).unwrap().is_none());
-    assert_eq!(log.position("tool-session").unwrap(), 0);
+    assert_eq!(log.position("tool-session").unwrap(), 1);
 
     call.sources = vec![chain[30].clone()];
     let call = log.append(operation, call, &[][..]).unwrap();
@@ -2093,7 +2112,8 @@ fn a_tool_call_reserves_room_for_its_result() {
 fn tool_results_stay_readable_after_their_call_source_is_purged() {
     let temp = tempfile::tempdir().unwrap();
     let db = Store::create(temp.path().join("context")).unwrap();
-    let log = db.session_log(access("owner")).unwrap();
+    let log = turn_log(&db, Actor::System);
+    boundary(&log, "session-a", "turn", EventKind::TurnStarted);
     let store = db.context(access("owner")).unwrap();
     let raw = source(&log, "source", "old observation");
     let kind = store
@@ -2331,9 +2351,9 @@ fn purging_a_log_event_hides_what_was_derived_from_it() {
 fn a_withdrawn_fragment_hides_its_whole_message() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Store::create(tmp.path().join("context")).unwrap();
-    let log = db
-        .session_log(ContextAccess::new("owner", Actor::Operator))
-        .unwrap();
+    let log = turn_log(&db, Actor::Operator);
+    boundary(&log, "session-a", "turn", EventKind::TurnStarted);
+    boundary(&log, "session-a", "step", EventKind::StepStarted);
     let message_id = "message".to_string();
     let kinds = [
         EventKind::AssistantStarted {

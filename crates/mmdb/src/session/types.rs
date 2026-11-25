@@ -9,6 +9,8 @@ pub struct MessageState {
     /// A withdrawn fragment also invalidates aggregate copies of the message.
     #[serde(default)]
     pub unavailable: bool,
+    /// Session-wide step number of the opening AssistantStarted event.
+    pub step: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

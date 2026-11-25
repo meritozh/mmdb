@@ -1,3 +1,4 @@
+use super::turns::{self, Change, Numbers, OpenTurn, Owed, TurnState};
 use super::*;
 use crate::records::codec::*;
 use crate::{Actor, OperationId, RecordState, Scope, TemporalFacts};
@@ -8,6 +9,7 @@ use std::io::Read;
 struct SessionHead {
     sequence: u64,
     scope: Scope,
+    numbers: Numbers,
 }
 
 /// One event ready to write into the session's batch.
@@ -24,6 +26,7 @@ struct NewEvent {
     pin: RecordPin,
     payload: PayloadDescriptor,
     message: Option<MessageState>,
+    turn: Option<TurnStamp>,
 }
 
 impl NewEvent {
@@ -58,6 +61,37 @@ fn identity_key(owner: &str, session: &str, identity: &str) -> Vec<u8> {
     let mut key = session_key(owner, session);
     segment(&mut key, identity.as_bytes());
     key
+}
+
+impl Owed {
+    // The identity is the last key component, so byte order is identity order.
+    fn key(&self, session_key: &[u8]) -> Vec<u8> {
+        let (kind, id) = match self {
+            Self::Terminal { message_id, .. } => (0, message_id),
+            Self::Result { call_id, .. } => (1, call_id),
+        };
+        let mut key = session_key.to_vec();
+        key.push(kind);
+        key.extend_from_slice(id.as_bytes());
+        key
+    }
+
+    fn from_row(suffix: &[u8], value: &[u8]) -> ContextResult<Self> {
+        let invalid = || ContextError::Corrupt("invalid owed item".into());
+        let (kind, id) = suffix.split_first().ok_or_else(invalid)?;
+        let id = std::str::from_utf8(id).map_err(|_| invalid())?.to_owned();
+        match kind {
+            0 => Ok(Self::Terminal {
+                message_id: id,
+                step: decode(value)?,
+            }),
+            1 => Ok(Self::Result {
+                call_id: id,
+                step: decode(value)?,
+            }),
+            _ => Err(invalid()),
+        }
+    }
 }
 
 fn assistant_message_id(kind: &EventKind) -> Option<&str> {
@@ -240,66 +274,60 @@ impl SessionLog<'_> {
                 ));
             }
         }
+        if previous_operation || previous_event.is_some() {
+            return self.retry_append(operation, input, payload, previous_event);
+        }
         let mut head = head.unwrap_or_else(|| SessionHead {
             sequence: 0,
             scope: input.scope.clone(),
+            numbers: Numbers::default(),
         });
-        let writing = !previous_operation && previous_event.is_none();
-        let (sources, source_scopes) = if writing {
-            if let Some(expected) = input.expected_sequence {
-                if expected != head.sequence {
-                    return Err(ContextError::PositionConflict {
-                        expected,
-                        actual: head.sequence,
-                    });
-                }
+        if let Some(expected) = input.expected_sequence {
+            if expected != head.sequence {
+                return Err(ContextError::PositionConflict {
+                    expected,
+                    actual: head.sequence,
+                });
             }
-            let mut sources = self.validate_call_link(&input)?;
-            sources.extend(input.sources.clone());
-            let reserve = usize::from(matches!(input.kind, EventKind::ToolCall { .. }));
-            let source_scopes =
-                self.scoped
-                    .validate_copy_sources(&input.scope, &sources, reserve)?;
-            (sources, source_scopes)
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        let message_transition = if writing {
-            self.message_transition(&input)?
-        } else {
-            None
-        };
+        }
+        let (message_step, answers) = self.validate_call_link(&input)?;
+        let state = self.turn_state(&session_key, head.numbers)?;
+        let admitted = turns::admit(
+            &state,
+            turns::Write {
+                kind: &input.kind,
+                run: self.scoped.access().run.as_deref(),
+                message_step,
+            },
+        )
+        .map_err(ContextError::Turn)?;
+        let reserve = usize::from(matches!(input.kind, EventKind::ToolCall { .. }));
+        let source_scopes = self.scoped.validate_copy_sources(
+            &input.scope,
+            &input.sources,
+            answers.as_ref(),
+            reserve,
+        )?;
+        let message = self.message_transition(&input, admitted.stamp)?;
         let pin = self.scoped.fresh_pin(RecordKind::Event);
         let streamed = self
             .scoped
-            .stream_payload(payload, writing.then_some((&pin, operation)))?;
-        let length = streamed.descriptor.bytes;
-        let payload_digest = streamed.descriptor.digest;
-        let digest = self
-            .scoped
-            .digest("append-history", &(&input, length, payload_digest))?;
-        if let Some(receipt) = self.scoped.replay(operation, digest)? {
-            return Ok(receipt);
-        }
-        if let Some(previous) = previous_event {
-            let event_input = EventInput {
-                expected_sequence: None,
-                ..input
-            };
-            if previous.digest != self.event_digest(&event_input, &streamed.descriptor)? {
-                return Err(ContextError::IdempotencyConflict);
-            }
-            self.scoped.header_locked(&previous.receipt.pin)?;
-            return self.scoped.commit_operation(
-                self.scoped.batch(),
-                operation,
-                digest,
-                previous.receipt,
-            );
-        }
-        if !writing {
-            return Err(ContextError::IdempotencyConflict);
-        }
+            .stream_payload(payload, Some((&pin, operation)))?;
+        let digest = self.append_digest(&input, &streamed.descriptor)?;
+        let mut batch = self.scoped.batch();
+        self.put_turn_change(
+            &mut batch,
+            &mut head,
+            &session_key,
+            &input,
+            state.open,
+            admitted.change,
+        )?;
+        let sources = answers
+            .into_iter()
+            .map(|call| call.pin)
+            .chain(input.sources)
+            .collect();
         let mut provenance = self.scoped.provenance();
         provenance.session = Some(input.session.clone());
         let event = NewEvent {
@@ -314,14 +342,112 @@ impl SessionLog<'_> {
             source_scopes,
             pin,
             payload: streamed.descriptor.clone(),
-            message: message_transition,
+            message,
+            turn: admitted.stamp,
         };
-        let mut batch = self.scoped.batch();
         let receipt = self.put_event(&mut batch, &mut head, event)?;
         batch.insert(&self.parts.heads, session_key, encode(&head)?);
         streamed.publish(&mut batch);
         self.scoped
             .commit_operation(batch, operation, digest, receipt)
+    }
+
+    fn retry_append<R: Read>(
+        &self,
+        operation: OperationId,
+        input: EventInput,
+        payload: R,
+        previous_event: Option<StoredEvent>,
+    ) -> ContextResult<WriteReceipt> {
+        let streamed = self.scoped.stream_payload(payload, None)?;
+        let digest = self.append_digest(&input, &streamed.descriptor)?;
+        if let Some(receipt) = self.scoped.replay(operation, digest)? {
+            return Ok(receipt);
+        }
+        let previous = previous_event.ok_or(ContextError::IdempotencyConflict)?;
+        let event_input = EventInput {
+            expected_sequence: None,
+            ..input
+        };
+        if previous.digest != self.event_digest(&event_input, &streamed.descriptor)? {
+            return Err(ContextError::IdempotencyConflict);
+        }
+        self.scoped.header_locked(&previous.receipt.pin)?;
+        self.scoped
+            .commit_operation(self.scoped.batch(), operation, digest, previous.receipt)
+    }
+
+    fn append_digest(
+        &self,
+        input: &EventInput,
+        payload: &PayloadDescriptor,
+    ) -> ContextResult<[u8; 32]> {
+        self.scoped
+            .digest("append-history", &(input, payload.bytes, payload.digest))
+    }
+
+    fn turn_state(&self, key: &[u8], numbers: Numbers) -> ContextResult<TurnState> {
+        let open = self
+            .parts
+            .open_turns
+            .get(key)?
+            .map(|bytes| decode(&bytes))
+            .transpose()?;
+        let mut owed = Vec::new();
+        if open.is_some() {
+            for row in self.parts.owed.prefix(key) {
+                let (entry, value) = row?;
+                owed.push(Owed::from_row(&entry[key.len()..], &value)?);
+            }
+        }
+        Ok(TurnState {
+            open,
+            owed,
+            numbers,
+        })
+    }
+
+    fn put_turn_change(
+        &self,
+        batch: &mut mmdb_kernel::Batch,
+        head: &mut SessionHead,
+        key: &[u8],
+        input: &EventInput,
+        open: Option<OpenTurn>,
+        change: Change,
+    ) -> ContextResult<()> {
+        match change {
+            Change::Nothing => {}
+            Change::Owe(item) => {
+                batch.insert(&self.parts.owed, item.key(key), encode(&item.step())?)
+            }
+            Change::Settle(item) => batch.remove(&self.parts.owed, item.key(key)),
+            Change::StartTurn { number, run } => {
+                head.numbers.turns = number;
+                let turn = OpenTurn {
+                    owner: self.scoped.access().owner.clone(),
+                    session: input.session.clone(),
+                    number,
+                    run,
+                    start_event_id: input.event_id.clone(),
+                    step: None,
+                };
+                batch.insert(&self.parts.open_turns, key, encode(&turn)?);
+            }
+            Change::StartStep(_) | Change::EndStep => {
+                let mut turn =
+                    open.ok_or_else(|| ContextError::Corrupt("step has no open turn".into()))?;
+                turn.step = if let Change::StartStep(step) = change {
+                    head.numbers.steps = step;
+                    Some(step)
+                } else {
+                    None
+                };
+                batch.insert(&self.parts.open_turns, key, encode(&turn)?);
+            }
+            Change::EndTurn => batch.remove(&self.parts.open_turns, key),
+        }
+        Ok(())
     }
 
     fn event_digest(
@@ -404,6 +530,7 @@ impl SessionLog<'_> {
                 sequence,
                 kind: event.kind,
                 media_type: event.media_type,
+                turn: event.turn,
             }),
             checkpoint: None,
         };
@@ -416,6 +543,11 @@ impl SessionLog<'_> {
         self.scoped.check_scope(&input.scope)?;
         validate_name(&input.session, "session")?;
         validate_name(&input.event_id, "event identity")?;
+        if input.event_id.starts_with("mmdb:") {
+            return Err(ContextError::InvalidInput(
+                "mmdb: event identities are reserved".into(),
+            ));
+        }
         validate_name(&input.media_type, "media type")?;
         if self
             .scoped
@@ -431,6 +563,16 @@ impl SessionLog<'_> {
                 self.scoped.access().actor,
                 Actor::User | Actor::System | Actor::Operator
             )
+        {
+            return Err(ContextError::AccessDenied);
+        }
+        if matches!(
+            input.kind,
+            EventKind::TurnStarted
+                | EventKind::TurnEnded { .. }
+                | EventKind::StepStarted
+                | EventKind::StepEnded
+        ) && !matches!(self.scoped.access().actor, Actor::System | Actor::Operator)
         {
             return Err(ContextError::AccessDenied);
         }
@@ -452,12 +594,19 @@ impl SessionLog<'_> {
                 }
             }
             EventKind::ToolResult { call_id, .. } => validate_name(call_id, "tool call identity")?,
+            EventKind::TurnEnded { start_event_id, .. } => {
+                validate_name(start_event_id, "turn start event identity")?
+            }
             _ => {}
         }
         Ok(())
     }
 
-    fn message_transition(&self, input: &EventInput) -> ContextResult<Option<MessageState>> {
+    fn message_transition(
+        &self,
+        input: &EventInput,
+        stamp: Option<TurnStamp>,
+    ) -> ContextResult<Option<MessageState>> {
         let Some(message_id) = assistant_message_id(&input.kind) else {
             return Ok(None);
         };
@@ -473,6 +622,9 @@ impl SessionLog<'_> {
                 next_fragment: 0,
                 terminal: None,
                 unavailable: false,
+                step: stamp
+                    .and_then(|stamp| stamp.step)
+                    .ok_or_else(|| ContextError::Corrupt("admitted message has no step".into()))?,
             },
             (EventKind::AssistantFragment { ordinal, .. }, Some(mut state))
                 if state.terminal.is_none() && *ordinal == state.next_fragment =>
@@ -591,14 +743,17 @@ impl SessionLog<'_> {
         Ok(())
     }
 
-    fn validate_call_link(&self, input: &EventInput) -> ContextResult<Vec<RecordPin>> {
+    fn validate_call_link(
+        &self,
+        input: &EventInput,
+    ) -> ContextResult<(Option<u64>, Option<RecordHeader>)> {
         match &input.kind {
             EventKind::ToolCall {
                 call_id,
                 message_id,
                 ..
             } => {
-                if let Some(message_id) = message_id {
+                let step = if let Some(message_id) = message_id {
                     let state: MessageState = self
                         .parts
                         .messages
@@ -619,7 +774,10 @@ impl SessionLog<'_> {
                             "tool references an unavailable assistant message".into(),
                         ));
                     }
-                }
+                    Some(state.step)
+                } else {
+                    None
+                };
                 if self.parts.calls.contains_key(identity_key(
                     &self.scoped.access().owner,
                     &input.session,
@@ -627,29 +785,18 @@ impl SessionLog<'_> {
                 ))? {
                     return Err(ContextError::IdempotencyConflict);
                 }
+                Ok((step, None))
             }
             EventKind::ToolResult { call_id, .. } => {
-                let key = identity_key(&self.scoped.access().owner, &input.session, call_id);
                 let call = self.call_index(&input.session, call_id)?.ok_or_else(|| {
                     ContextError::InvalidInput(
                         "tool result has no preceding call in this session".into(),
                     )
                 })?;
-                let header = self.scoped.head_locked(&call.record)?;
-                // A completed operation may have revised a source used by its
-                // call. Pair immutable originals using historical readability;
-                // purge and message unavailability still invalidate the link.
-                if !self.scoped.available_locked(&header.pin, false)? {
-                    return Err(ContextError::Unavailable(call.record));
-                }
-                if self.parts.results.contains_key(key)? {
-                    return Err(ContextError::IdempotencyConflict);
-                }
-                return Ok(vec![header.pin]);
+                Ok((None, Some(self.scoped.head_locked(&call.record)?)))
             }
-            _ => {}
+            _ => Ok((None, None)),
         }
-        Ok(Vec::new())
     }
 
     pub fn position(&self, session: &str) -> ContextResult<u64> {

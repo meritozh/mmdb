@@ -483,21 +483,38 @@ impl Scoped<'_> {
     }
 
     /// Original snapshots may copy a historical version or a type descriptor.
+    /// Charge the answered call against the budget even when it is unreadable,
+    /// and carry its recorded scopes. Explicit copies still require readability.
     /// Reserve levels and visits above the new event for records that will cite it.
     pub(crate) fn validate_copy_sources(
         &self,
         scope: &Scope,
         sources: &[RecordPin],
+        answers: Option<&RecordHeader>,
         reserve: usize,
     ) -> ContextResult<Vec<Scope>> {
         self.check_scope(scope)?;
-        if sources.len() > MAX_CONTEXT_SOURCES {
+        if sources.len() + usize::from(answers.is_some()) > MAX_CONTEXT_SOURCES {
             return Err(ContextError::InvalidInput(
                 "copy has too many source references".into(),
             ));
         }
         let mut walk = SourceWalk::for_new_record(reserve);
         let mut memo = BTreeMap::new();
+        if let Some(call) = answers {
+            if !self.available_walk(
+                &call.pin,
+                SourceCheck::BudgetOnly,
+                None,
+                1 + reserve,
+                &mut walk,
+                &mut memo,
+            )? {
+                return Err(ContextError::Unavailable(call.pin.record.clone()));
+            }
+            walk.scopes.insert(call.scope.clone());
+            walk.scopes.extend(call.source_scopes.iter().cloned());
+        }
         for source in sources {
             let header = self.header_locked(source)?;
             if header.scope != *scope && header.scope != Scope::Personal {

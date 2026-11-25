@@ -83,6 +83,18 @@ pub enum ToolOutcome {
     EffectUnknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnEndReason {
+    Completed,
+    Cancelled,
+    Failed,
+    /// Written only by store recovery.
+    Interrupted,
+    /// Written only by fork.
+    Forked,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventKind {
@@ -111,6 +123,15 @@ pub enum EventKind {
         outcome: ToolOutcome,
     },
     Notice,
+    /// The event ID of this opening names the turn.
+    TurnStarted,
+    TurnEnded {
+        reason: TurnEndReason,
+        start_event_id: String,
+    },
+    /// Opens one model request in the current turn.
+    StepStarted,
+    StepEnded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +142,13 @@ pub enum MessageStatus {
     Interrupted,
 }
 
+/// The session-wide turn and step numbers assigned by the log, starting at one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnStamp {
+    pub number: u64,
+    pub step: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEvent {
     pub session: String,
@@ -128,6 +156,8 @@ pub struct LogEvent {
     pub sequence: u64,
     pub kind: EventKind,
     pub media_type: String,
+    /// Open turn and step when this event was written, including boundary events.
+    pub turn: Option<TurnStamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

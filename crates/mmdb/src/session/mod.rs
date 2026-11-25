@@ -3,6 +3,7 @@
 mod checkpoints;
 mod history;
 mod search;
+mod turns;
 mod types;
 
 use crate::records::codec::{owner_key, segment};
@@ -17,6 +18,8 @@ const MESSAGES: &str = "session_messages_v1";
 module_partitions!(SessionParts, SESSION_PARTITIONS, {
     order => "session_order_v1",
     heads => "session_heads_v1",
+    open_turns => "session_open_turns_v1",
+    owed => "session_owed_v1",
     events => "session_events_v1",
     calls => CALLS,
     results => "session_tool_results_v1",
