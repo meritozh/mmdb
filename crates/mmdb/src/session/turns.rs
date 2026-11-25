@@ -11,14 +11,20 @@ pub(super) struct OpenTurn {
     pub number: u64,
     pub run: String,
     pub start_event_id: String,
-    pub step: Option<u64>,
+    pub step: Option<OpenStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct OpenStep {
+    pub number: u64,
+    pub start_event_id: String,
 }
 
 impl OpenTurn {
     fn stamp(&self) -> TurnStamp {
         TurnStamp {
             number: self.number,
-            step: self.step,
+            step: self.step.as_ref().map(|step| step.number),
         }
     }
 }
@@ -108,10 +114,12 @@ pub(super) fn close(turn: &OpenTurn, owed: &[Owed], reason: TurnEndReason) -> Ve
             stamp,
         });
     }
-    if stamp.step.is_some() {
+    if let Some(step) = &turn.step {
         closing.push(Closing {
             event_id: format!("{prefix}:step-end"),
-            kind: EventKind::StepEnded,
+            kind: EventKind::StepEnded {
+                start_event_id: step.start_event_id.clone(),
+            },
             stamp,
         });
     }
@@ -142,7 +150,7 @@ pub(super) fn admit(state: &TurnState, write: Write<'_>) -> Result<Admitted, Tur
         }
         Ok(turn)
     };
-    let writing_step = || writing_turn()?.step.ok_or(TurnError::OutsideStep);
+    let writing_step = || writing_turn()?.step.as_ref().ok_or(TurnError::OutsideStep);
 
     let mut stamp = open.map(OpenTurn::stamp);
     let change = match write.kind {
@@ -198,20 +206,27 @@ pub(super) fn admit(state: &TurnState, write: Write<'_>) -> Result<Admitted, Tur
             });
             Change::StartStep(step)
         }
-        EventKind::StepEnded => {
+        EventKind::StepEnded { start_event_id } => {
             let step = writing_step()?;
-            if state.owed.iter().any(|owed| owed.step() == Some(step)) {
+            if start_event_id != &step.start_event_id {
+                return Err(TurnError::OtherStep);
+            }
+            if state
+                .owed
+                .iter()
+                .any(|owed| owed.step() == Some(step.number))
+            {
                 return Err(TurnError::StepUnfinished);
             }
             Change::EndStep
         }
         EventKind::AssistantStarted { message_id } => Change::Owe(Owed::Terminal {
             message_id: message_id.clone(),
-            step: writing_step()?,
+            step: writing_step()?.number,
         }),
         EventKind::AssistantTerminal { message_id, .. } => Change::Settle(Owed::Terminal {
             message_id: message_id.clone(),
-            step: writing_step()?,
+            step: writing_step()?.number,
         }),
         EventKind::AssistantMessage | EventKind::AssistantFragment { .. } => {
             writing_step()?;
@@ -222,7 +237,7 @@ pub(super) fn admit(state: &TurnState, write: Write<'_>) -> Result<Admitted, Tur
             message_id,
             ..
         } => {
-            let step = writing_turn()?.step;
+            let step = writing_turn()?.step.as_ref().map(|step| step.number);
             if message_id.is_some() && (step.is_none() || step != write.message_step) {
                 return Err(TurnError::OutsideStep);
             }

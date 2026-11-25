@@ -44,9 +44,12 @@ fn write(log: &SessionLog<'_>, id: &str, kind: EventKind) -> WriteReceipt {
 }
 
 fn rejected(log: &SessionLog<'_>, event: EventInput) -> ContextError {
+    rejected_operation(log, OperationId::new(), event)
+}
+
+fn rejected_operation(log: &SessionLog<'_>, op: OperationId, event: EventInput) -> ContextError {
     let before = log.position(&event.session).unwrap();
     let session = event.session.clone();
-    let op = OperationId::new();
     let error = log.append(op, event, &[][..]).unwrap_err();
     assert_eq!(log.position(&session).unwrap(), before);
     assert!(log.operation_receipt(op).unwrap().is_none());
@@ -70,6 +73,12 @@ fn end(id: &str, reason: TurnEndReason) -> EventKind {
 
 fn completed(id: &str) -> EventKind {
     end(id, TurnEndReason::Completed)
+}
+
+fn end_step(start_event_id: &str) -> EventKind {
+    EventKind::StepEnded {
+        start_event_id: start_event_id.into(),
+    }
 }
 
 fn started(message: &str) -> EventKind {
@@ -151,7 +160,7 @@ fn a_turn_left_open_by_an_exited_process_ends_interrupted_on_open() {
             call_id: "c".into(),
             outcome: ToolOutcome::EffectUnknown,
         },
-        EventKind::StepEnded,
+        end_step("step"),
         end("turn", TurnEndReason::Interrupted),
     ];
     assert_eq!(entries.len(), expected.len());
@@ -254,9 +263,9 @@ fn turn_and_step_numbers_increase_across_the_session() {
         (&input_run, "notice", EventKind::Notice),
         (&log, "s1", EventKind::StepStarted),
         (&user, "interrupt", EventKind::UserMessage),
-        (&log, "s1-end", EventKind::StepEnded),
+        (&log, "s1-end", end_step("s1")),
         (&log, "s2", EventKind::StepStarted),
-        (&log, "s2-end", EventKind::StepEnded),
+        (&log, "s2-end", end_step("s2")),
         (&log, "t1-end", completed("t1")),
         (&log, "between", EventKind::Notice),
     ] {
@@ -301,7 +310,7 @@ fn only_system_or_operator_write_turn_and_step_events() {
         for kind in [
             EventKind::TurnStarted,
             EventKind::StepStarted,
-            EventKind::StepEnded,
+            end_step("step"),
             completed("turn"),
         ] {
             assert!(matches!(
@@ -313,8 +322,9 @@ fn only_system_or_operator_write_turn_and_step_events() {
     for (index, handle) in [&sys, &operator].into_iter().enumerate() {
         let t = format!("t{index}");
         write(handle, &t, EventKind::TurnStarted);
-        write(handle, &format!("s{index}"), EventKind::StepStarted);
-        write(handle, &format!("s{index}-end"), EventKind::StepEnded);
+        let s = format!("s{index}");
+        write(handle, &s, EventKind::StepStarted);
+        write(handle, &format!("{s}-end"), end_step(&s));
         write(handle, &format!("t{index}-end"), completed(&t));
     }
 }
@@ -451,9 +461,9 @@ fn withdrawn_turn_events_keep_numbers_and_turn_state() {
     let t = write(&log, "turn", EventKind::TurnStarted);
     let s = write(&log, "step", EventKind::StepStarted);
     log.retract(OperationId::new(), t.pin).unwrap();
-    log.purge(OperationId::new(), s.pin).unwrap();
+    log.retract(OperationId::new(), s.pin).unwrap();
     let m = write(&log, "message", EventKind::AssistantMessage);
-    let se = write(&log, "step-end", EventKind::StepEnded);
+    let se = write(&log, "step-end", end_step("step"));
     log.retract(OperationId::new(), se.pin).unwrap();
     refused(
         &log,
@@ -491,6 +501,20 @@ fn withdrawn_turn_events_keep_numbers_and_turn_state() {
             stamp(2, None)
         ]
     );
+
+    let append = |id, kind| {
+        let event = EventInput {
+            session: "purged-starts".into(),
+            ..input(id, kind)
+        };
+        log.append(OperationId::new(), event, &[][..]).unwrap()
+    };
+    let turn = append("purged-turn", EventKind::TurnStarted);
+    let step = append("purged-step", EventKind::StepStarted);
+    log.purge(OperationId::new(), turn.pin).unwrap();
+    log.purge(OperationId::new(), step.pin).unwrap();
+    append("step-end", end_step("purged-step"));
+    append("turn-end", completed("purged-turn"));
 }
 
 #[test]
@@ -503,14 +527,14 @@ fn assistant_events_and_linked_calls_need_an_open_step() {
         started("m"),
         fragment("m"),
         terminal("m"),
-        EventKind::StepEnded,
+        end_step("step"),
     ] {
         refused(&log, "outside", kind, TurnError::OutsideStep);
     }
     write(&log, "step", EventKind::StepStarted);
     write(&log, "m-start", started("m"));
     write(&log, "m-end", terminal("m"));
-    write(&log, "step-end", EventKind::StepEnded);
+    write(&log, "step-end", end_step("step"));
     refused(
         &log,
         "outside",
@@ -529,7 +553,7 @@ fn a_linked_call_stays_in_its_message_step() {
     assert_eq!(log.message_state(SESSION, "m").unwrap().unwrap().step, 1);
     write(&log, "c", call("c", Some("m")));
     write(&log, "r", result("c"));
-    write(&log, "s-end", EventKind::StepEnded);
+    write(&log, "s-end", end_step("step"));
     write(&log, "s2", EventKind::StepStarted);
     refused(
         &log,
@@ -537,7 +561,7 @@ fn a_linked_call_stays_in_its_message_step() {
         call("later", Some("m")),
         TurnError::OutsideStep,
     );
-    write(&log, "s2-end", EventKind::StepEnded);
+    write(&log, "s2-end", end_step("s2"));
     write(&log, "t-end", completed("turn"));
     write(&log, "t2", EventKind::TurnStarted);
     write(&log, "s3", EventKind::StepStarted);
@@ -557,7 +581,7 @@ fn direct_calls_inside_a_turn_need_no_step() {
     write(&log, "turn", EventKind::TurnStarted);
     let c = write(&log, "direct", call("direct", None));
     write(&log, "step", EventKind::StepStarted);
-    write(&log, "step-end", EventKind::StepEnded);
+    write(&log, "step-end", end_step("step"));
     let r = write(&log, "result", result("direct"));
     write(&log, "end", completed("turn"));
     for receipt in [c, r] {
@@ -582,7 +606,7 @@ fn only_the_opening_run_writes_inside_a_turn() {
     write(&log, "c", call("c", Some("m")));
     for kind in [
         EventKind::StepStarted,
-        EventKind::StepEnded,
+        end_step("step"),
         EventKind::AssistantMessage,
         started("other-message"),
         fragment("m"),
@@ -596,7 +620,7 @@ fn only_the_opening_run_writes_inside_a_turn() {
     }
     write(&log, "r", result("c"));
     write(&log, "m-end", terminal("m"));
-    write(&log, "s-end", EventKind::StepEnded);
+    write(&log, "s-end", end_step("step"));
     write(&log, "end", completed("turn"));
 }
 
@@ -620,13 +644,56 @@ fn a_turn_end_names_the_turn_it_ends() {
         assert!(log.operation_receipt(op).unwrap().is_none());
     };
     attempt(TurnError::TurnUnfinished);
-    write(&log, "se", EventKind::StepEnded);
+    write(&log, "se", end_step("step"));
     write(&log, "end", completed("first"));
     write(&other, "foreign", EventKind::TurnStarted);
     attempt(TurnError::OtherRun);
     write(&other, "foreign-end", completed("foreign"));
     write(&log, "next", EventKind::TurnStarted);
     attempt(TurnError::OtherTurn);
+}
+
+#[test]
+fn a_step_end_names_the_step_it_ends() {
+    let (_dir, db) = fixture();
+    let log = system(&db);
+    open_step(&log);
+    refused(
+        &log,
+        "wrong-end",
+        end_step("another-step"),
+        TurnError::OtherStep,
+    );
+
+    write(&log, "message", started("m"));
+    let stale_op = OperationId::new();
+    let stale = input("stale-end", end_step("step"));
+    assert!(matches!(
+        rejected_operation(&log, stale_op, stale.clone()),
+        ContextError::Turn(TurnError::StepUnfinished)
+    ));
+    write(&log, "terminal", terminal("m"));
+    let close_op = OperationId::new();
+    let close = input("step-end", end_step("step"));
+    let receipt = log.append(close_op, close.clone(), &[][..]).unwrap();
+    write(&log, "next-step", EventKind::StepStarted);
+
+    assert!(matches!(
+        rejected_operation(&log, stale_op, stale),
+        ContextError::Turn(TurnError::OtherStep)
+    ));
+    let before = log.position(SESSION).unwrap();
+    assert_eq!(log.append(close_op, close, &[][..]).unwrap(), receipt);
+    assert_eq!(log.position(SESSION).unwrap(), before);
+    let message = write(&log, "next-message", started("next"));
+    assert_eq!(
+        log.inspect_header(&message.pin)
+            .unwrap()
+            .event
+            .unwrap()
+            .turn,
+        stamp(1, Some(2))
+    );
 }
 
 #[test]
@@ -655,7 +722,7 @@ fn work_started_by_the_turn_run_writes_under_that_run() {
     assert_eq!(header.provenance.agent.as_deref(), Some("worker"));
     assert_eq!(header.event.unwrap().turn, stamp(1, Some(1)));
     write(&delegated, "r", result("c"));
-    write(&log, "se", EventKind::StepEnded);
+    write(&log, "se", end_step("step"));
     write(&log, "end", completed("turn"));
 }
 
@@ -690,16 +757,16 @@ fn a_step_ends_only_when_it_owes_nothing() {
     let log = system(&db);
     open_step(&log);
     write(&log, "m-start", started("m"));
-    refused(&log, "end", EventKind::StepEnded, TurnError::StepUnfinished);
+    refused(&log, "end", end_step("step"), TurnError::StepUnfinished);
     write(&log, "m-fragment", fragment("m"));
     write(&log, "c", call("c", Some("m")));
     write(&log, "direct", call("direct", None));
     write(&log, "m-end", terminal("m"));
-    refused(&log, "end", EventKind::StepEnded, TurnError::StepUnfinished);
+    refused(&log, "end", end_step("step"), TurnError::StepUnfinished);
     write(&log, "r", result("c"));
-    refused(&log, "end", EventKind::StepEnded, TurnError::StepUnfinished);
+    refused(&log, "end", end_step("step"), TurnError::StepUnfinished);
     write(&log, "r-direct", result("direct"));
-    write(&log, "end", EventKind::StepEnded);
+    write(&log, "end", end_step("step"));
     write(&log, "t-end", completed("turn"));
 }
 
@@ -709,7 +776,7 @@ fn completed_needs_no_open_step_and_no_unanswered_call() {
     let log = system(&db);
     open_step(&log);
     refused(&log, "end", completed("turn"), TurnError::TurnUnfinished);
-    write(&log, "s-end", EventKind::StepEnded);
+    write(&log, "s-end", end_step("step"));
     write(&log, "c", call("c", None));
     refused(&log, "end", completed("turn"), TurnError::TurnUnfinished);
     write(&log, "r", result("c"));
@@ -778,7 +845,7 @@ fn check_unfinished_turn(reason: TurnEndReason) {
         assert_eq!(paired.as_ref(), Some(result));
     }
     let step = events[4].event.as_ref().unwrap();
-    assert_eq!(step.kind, EventKind::StepEnded);
+    assert_eq!(step.kind, end_step("step"));
     assert_eq!(step.event_id, "mmdb:turn-1:step-end");
     let last = &events[5];
     let event = last.event.as_ref().unwrap();
@@ -973,7 +1040,7 @@ fn an_owed_call_gets_its_result_after_it_becomes_unreadable() {
             Err(ContextError::Unavailable(_))
         ));
         append(event("m-end", terminal("m")));
-        append(event("se", EventKind::StepEnded));
+        append(event("se", end_step("step")));
         append(event("end", completed("turn")));
     }
 }
@@ -999,7 +1066,7 @@ fn turn_errors_follow_their_precedence() {
     let (_dir, db) = fixture();
     let log = system(&db);
     let other = writer(&db, Actor::Operator, Some("other"));
-    for kind in [EventKind::AssistantMessage, started("m")] {
+    for kind in [EventKind::AssistantMessage, started("m"), end_step("wrong")] {
         refused(&log, "empty", kind, TurnError::OutsideTurn);
     }
     let missing = || input("call", call("c", Some("missing")));
@@ -1008,6 +1075,7 @@ fn turn_errors_follow_their_precedence() {
         ContextError::InvalidInput(_)
     ));
     write(&log, "turn", EventKind::TurnStarted);
+    refused(&log, "wrong-end", end_step("wrong"), TurnError::OutsideStep);
     refused(
         &other,
         "other",
@@ -1020,8 +1088,10 @@ fn turn_errors_follow_their_precedence() {
         ContextError::InvalidInput(_)
     ));
     write(&log, "start", started("m"));
+    refused(&other, "wrong-end", end_step("wrong"), TurnError::OtherRun);
+    refused(&log, "wrong-end", end_step("wrong"), TurnError::OtherStep);
     write(&log, "terminal", terminal("m"));
-    write(&log, "step-end", EventKind::StepEnded);
+    write(&log, "step-end", end_step("step"));
     write(&log, "turn-end", completed("turn"));
     refused(&log, "late", call("c", Some("m")), TurnError::OutsideTurn);
 }

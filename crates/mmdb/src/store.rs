@@ -393,7 +393,9 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(
             entries[0].event.as_ref().unwrap().kind,
-            EventKind::StepEnded
+            EventKind::StepEnded {
+                start_event_id: "step".into(),
+            }
         );
         assert_eq!(
             entries[1].event.as_ref().unwrap().kind,

@@ -129,9 +129,12 @@ pub enum EventKind {
         reason: TurnEndReason,
         start_event_id: String,
     },
-    /// Opens one model request in the current turn.
+    /// Opens one model request in the current turn. Its event ID names the step.
     StepStarted,
-    StepEnded,
+    /// Ends the open step, named by the event ID of its `StepStarted`.
+    StepEnded {
+        start_event_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

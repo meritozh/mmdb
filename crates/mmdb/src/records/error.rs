@@ -24,6 +24,8 @@ pub enum TurnError {
     StepOpen,
     /// The required step is closed or belongs to another message.
     OutsideStep,
+    /// The step end names another step.
+    OtherStep,
     /// This step still owes a terminal or a result.
     StepUnfinished,
     /// This turn still has an open step or an unanswered call.

@@ -249,7 +249,9 @@ fn a_cancel_with_a_lost_acknowledgement_published_all_its_closing_events() {
                 call_id: "c".into(),
                 outcome: ToolOutcome::EffectUnknown
             },
-            EventKind::StepEnded,
+            EventKind::StepEnded {
+                start_event_id: "step".into(),
+            },
             cancel,
         ]
     );

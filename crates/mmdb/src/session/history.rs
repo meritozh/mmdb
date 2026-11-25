@@ -1,4 +1,4 @@
-use super::turns::{self, Change, Closing, Numbers, OpenTurn, Owed, TurnState};
+use super::turns::{self, Change, Closing, Numbers, OpenStep, OpenTurn, Owed, TurnState};
 use super::*;
 use crate::records::codec::*;
 use crate::{Actor, OperationId, RecordState, Scope, TemporalFacts};
@@ -492,9 +492,12 @@ impl SessionLog<'_> {
                 let mut turn = state
                     .open
                     .ok_or_else(|| ContextError::Corrupt("step has no open turn".into()))?;
-                turn.step = if let Change::StartStep(step) = change {
-                    head.numbers.steps = step;
-                    Some(step)
+                turn.step = if let Change::StartStep(number) = change {
+                    head.numbers.steps = number;
+                    Some(OpenStep {
+                        number,
+                        start_event_id: input.event_id.clone(),
+                    })
                 } else {
                     None
                 };
@@ -697,7 +700,7 @@ impl SessionLog<'_> {
             EventKind::TurnStarted
                 | EventKind::TurnEnded { .. }
                 | EventKind::StepStarted
-                | EventKind::StepEnded
+                | EventKind::StepEnded { .. }
         ) && !matches!(self.scoped.access().actor, Actor::System | Actor::Operator)
         {
             return Err(ContextError::AccessDenied);
@@ -722,6 +725,9 @@ impl SessionLog<'_> {
             EventKind::ToolResult { call_id, .. } => validate_name(call_id, "tool call identity")?,
             EventKind::TurnEnded { start_event_id, .. } => {
                 validate_name(start_event_id, "turn start event identity")?
+            }
+            EventKind::StepEnded { start_event_id } => {
+                validate_name(start_event_id, "step start event identity")?
             }
             _ => {}
         }
