@@ -1,4 +1,4 @@
-use super::turns::{self, Change, Closing, Numbers, OpenStep, OpenTurn, Owed, TurnState};
+use super::turns::{self, Change, Numbers, OpenStep, OpenTurn, Owed, TurnState};
 use super::*;
 use crate::records::codec::*;
 use crate::{Actor, OperationId, RecordState, Scope, TemporalFacts};
@@ -64,12 +64,20 @@ fn identity_key(owner: &str, session: &str, identity: &str) -> Vec<u8> {
 }
 
 impl Owed {
-    // The identity is the last key component, so byte order is identity order.
+    const TERMINAL: u8 = 0;
+    const RESULT: u8 = 1;
+
     fn key(&self, session_key: &[u8]) -> Vec<u8> {
-        let (kind, id) = match self {
-            Self::Terminal { message_id, .. } => (0, message_id),
-            Self::Result { call_id, .. } => (1, call_id),
-        };
+        match self {
+            Self::Terminal { message_id, .. } => {
+                Self::row_key(session_key, Self::TERMINAL, message_id)
+            }
+            Self::Result { call_id, .. } => Self::row_key(session_key, Self::RESULT, call_id),
+        }
+    }
+
+    // The identity is the last key component, so byte order is identity order.
+    fn row_key(session_key: &[u8], kind: u8, id: &str) -> Vec<u8> {
         let mut key = session_key.to_vec();
         key.push(kind);
         key.extend_from_slice(id.as_bytes());
@@ -78,14 +86,14 @@ impl Owed {
 
     fn from_row(suffix: &[u8], value: &[u8]) -> ContextResult<Self> {
         let invalid = || ContextError::Corrupt("invalid owed item".into());
-        let (kind, id) = suffix.split_first().ok_or_else(invalid)?;
+        let (&kind, id) = suffix.split_first().ok_or_else(invalid)?;
         let id = std::str::from_utf8(id).map_err(|_| invalid())?.to_owned();
         match kind {
-            0 => Ok(Self::Terminal {
+            Self::TERMINAL => Ok(Self::Terminal {
                 message_id: id,
                 step: decode(value)?,
             }),
-            1 => Ok(Self::Result {
+            Self::RESULT => Ok(Self::Result {
                 call_id: id,
                 step: decode(value)?,
             }),
@@ -213,10 +221,15 @@ pub(crate) fn end_interrupted_turns(
             scoped: records.scoped(access),
             parts,
         };
-        let owed = log.owed_items(&key)?;
-        let closing = turns::close(&turn, &owed, TurnEndReason::Interrupted);
         let batch = batch.get_or_insert_with(|| log.scoped.batch());
-        log.put_turn_end(batch, &mut head, &turn, &owed, closing, occurred_at_ms)?;
+        log.put_turn_end(
+            batch,
+            &mut head,
+            &key,
+            &turn,
+            TurnEndReason::Interrupted,
+            occurred_at_ms,
+        )?;
         batch.insert(&parts.heads, &key, encode(&head)?);
         ended += 1;
     }
@@ -343,6 +356,7 @@ impl SessionLog<'_> {
                 kind: &input.kind,
                 run: self.scoped.access().run.as_deref(),
                 message_step,
+                owed: self.owed_to_settle(&session_key, &input.kind)?,
             },
         )
         .map_err(ContextError::Turn)?;
@@ -438,16 +452,24 @@ impl SessionLog<'_> {
             .get(key)?
             .map(|bytes| decode(&bytes))
             .transpose()?;
-        let owed = if open.is_some() {
-            self.owed_items(key)?
-        } else {
-            Vec::new()
+        Ok(TurnState { open, numbers })
+    }
+
+    fn owed_to_settle(&self, session_key: &[u8], kind: &EventKind) -> ContextResult<Option<Owed>> {
+        let key = match kind {
+            EventKind::AssistantTerminal { message_id, .. } => {
+                Owed::row_key(session_key, Owed::TERMINAL, message_id)
+            }
+            EventKind::ToolResult { call_id, .. } => {
+                Owed::row_key(session_key, Owed::RESULT, call_id)
+            }
+            _ => return Ok(None),
         };
-        Ok(TurnState {
-            open,
-            owed,
-            numbers,
-        })
+        self.parts
+            .owed
+            .get(&key)?
+            .map(|bytes| Owed::from_row(&key[session_key.len()..], &bytes))
+            .transpose()
     }
 
     fn owed_items(&self, key: &[u8]) -> ContextResult<Vec<Owed>> {
@@ -470,53 +492,66 @@ impl SessionLog<'_> {
         state: TurnState,
         change: Change,
     ) -> ContextResult<()> {
-        match change {
-            Change::Nothing => {}
+        let open_turn = || {
+            state
+                .open
+                .ok_or_else(|| ContextError::Corrupt("turn change has no open turn".into()))
+        };
+        let turn = match change {
+            Change::Nothing => return Ok(()),
             Change::Owe(item) => {
-                batch.insert(&self.parts.owed, item.key(key), encode(&item.step())?)
+                let mut turn = open_turn()?;
+                turn.owe(&item);
+                batch.insert(&self.parts.owed, item.key(key), encode(&item.step())?);
+                turn
             }
-            Change::Settle(item) => batch.remove(&self.parts.owed, item.key(key)),
+            Change::Settle(item) => {
+                let mut turn = open_turn()?;
+                if !turn.settle(&item) {
+                    return Err(ContextError::Corrupt("owed count underflow".into()));
+                }
+                batch.remove(&self.parts.owed, item.key(key));
+                turn
+            }
             Change::StartTurn { number, run } => {
                 head.numbers.turns = number;
-                let turn = OpenTurn {
+                OpenTurn {
                     owner: self.scoped.access().owner.clone(),
                     session: input.session.clone(),
                     number,
                     run,
                     start_event_id: input.event_id.clone(),
+                    owes: 0,
                     step: None,
-                };
-                batch.insert(&self.parts.open_turns, key, encode(&turn)?);
+                }
             }
-            Change::StartStep(_) | Change::EndStep => {
-                let mut turn = state
-                    .open
-                    .ok_or_else(|| ContextError::Corrupt("step has no open turn".into()))?;
-                turn.step = if let Change::StartStep(number) = change {
-                    head.numbers.steps = number;
-                    Some(OpenStep {
-                        number,
-                        start_event_id: input.event_id.clone(),
-                    })
-                } else {
-                    None
-                };
-                batch.insert(&self.parts.open_turns, key, encode(&turn)?);
+            Change::StartStep(number) => {
+                let mut turn = open_turn()?;
+                head.numbers.steps = number;
+                turn.step = Some(OpenStep {
+                    number,
+                    start_event_id: input.event_id.clone(),
+                    owes: 0,
+                });
+                turn
             }
-            Change::EndTurn { closing } => {
-                let turn = state
-                    .open
-                    .ok_or_else(|| ContextError::Corrupt("turn end has no open turn".into()))?;
-                self.put_turn_end(
+            Change::EndStep => {
+                let mut turn = open_turn()?;
+                turn.step = None;
+                turn
+            }
+            Change::EndTurn(reason) => {
+                return self.put_turn_end(
                     batch,
                     head,
-                    &turn,
-                    &state.owed,
-                    closing,
+                    key,
+                    &open_turn()?,
+                    reason,
                     input.occurred_at_ms,
-                )?;
+                );
             }
-        }
+        };
+        batch.insert(&self.parts.open_turns, key, encode(&turn)?);
         Ok(())
     }
 
@@ -524,15 +559,20 @@ impl SessionLog<'_> {
         &self,
         batch: &mut mmdb_kernel::Batch,
         head: &mut SessionHead,
+        key: &[u8],
         turn: &OpenTurn,
-        owed: &[Owed],
-        closing: Vec<Closing>,
+        reason: TurnEndReason,
         occurred_at_ms: i64,
     ) -> ContextResult<()> {
-        let key = session_key(&turn.owner, &turn.session);
-        batch.remove(&self.parts.open_turns, &key);
+        let owed = if turn.owes > 0 {
+            self.owed_items(key)?
+        } else {
+            Vec::new()
+        };
+        let closing = turns::close(turn, &owed, reason);
+        batch.remove(&self.parts.open_turns, key);
         for item in owed {
-            batch.remove(&self.parts.owed, item.key(&key));
+            batch.remove(&self.parts.owed, item.key(key));
         }
         if closing.is_empty() {
             return Ok(());

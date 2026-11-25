@@ -11,6 +11,7 @@ pub(super) struct OpenTurn {
     pub number: u64,
     pub run: String,
     pub start_event_id: String,
+    pub owes: u64,
     pub step: Option<OpenStep>,
 }
 
@@ -18,9 +19,38 @@ pub(super) struct OpenTurn {
 pub(super) struct OpenStep {
     pub number: u64,
     pub start_event_id: String,
+    pub owes: u64,
 }
 
 impl OpenTurn {
+    fn owing_step(&mut self, item: &Owed) -> Option<&mut OpenStep> {
+        self.step
+            .as_mut()
+            .filter(|step| Some(step.number) == item.step())
+    }
+
+    pub(super) fn owe(&mut self, item: &Owed) {
+        // Each owed row comes from a distinct event. Sequence overflow rejects the batch.
+        self.owes = self.owes.saturating_add(1);
+        if let Some(step) = self.owing_step(item) {
+            step.owes = step.owes.saturating_add(1);
+        }
+    }
+
+    pub(super) fn settle(&mut self, item: &Owed) -> bool {
+        if self.owes == 0 {
+            return false;
+        }
+        if let Some(step) = self.owing_step(item) {
+            if step.owes == 0 {
+                return false;
+            }
+            step.owes -= 1;
+        }
+        self.owes -= 1;
+        true
+    }
+
     fn stamp(&self) -> TurnStamp {
         TurnStamp {
             number: self.number,
@@ -52,7 +82,6 @@ pub(super) struct Numbers {
 
 pub(super) struct TurnState {
     pub open: Option<OpenTurn>,
-    pub owed: Vec<Owed>,
     pub numbers: Numbers,
 }
 
@@ -60,6 +89,7 @@ pub(super) struct Write<'a> {
     pub kind: &'a EventKind,
     pub run: Option<&'a str>,
     pub message_step: Option<u64>,
+    pub owed: Option<Owed>,
 }
 
 pub(super) enum Change {
@@ -69,7 +99,7 @@ pub(super) enum Change {
     StartTurn { number: u64, run: String },
     StartStep(u64),
     EndStep,
-    EndTurn { closing: Vec<Closing> },
+    EndTurn(TurnEndReason),
 }
 
 pub(super) struct Admitted {
@@ -181,18 +211,14 @@ pub(super) fn admit(state: &TurnState, write: Write<'_>) -> Result<Admitted, Tur
             if start_event_id != &turn.start_event_id {
                 return Err(TurnError::OtherTurn);
             }
-            if *reason == TurnEndReason::Completed
-                && (turn.step.is_some() || !state.owed.is_empty())
-            {
+            if *reason == TurnEndReason::Completed && (turn.step.is_some() || turn.owes > 0) {
                 return Err(TurnError::TurnUnfinished);
             }
             stamp = Some(TurnStamp {
                 number: turn.number,
                 step: None,
             });
-            Change::EndTurn {
-                closing: close(turn, &state.owed, *reason),
-            }
+            Change::EndTurn(*reason)
         }
         EventKind::StepStarted => {
             let turn = writing_turn()?;
@@ -211,11 +237,7 @@ pub(super) fn admit(state: &TurnState, write: Write<'_>) -> Result<Admitted, Tur
             if start_event_id != &step.start_event_id {
                 return Err(TurnError::OtherStep);
             }
-            if state
-                .owed
-                .iter()
-                .any(|owed| owed.step() == Some(step.number))
-            {
+            if step.owes > 0 {
                 return Err(TurnError::StepUnfinished);
             }
             Change::EndStep
@@ -224,10 +246,10 @@ pub(super) fn admit(state: &TurnState, write: Write<'_>) -> Result<Admitted, Tur
             message_id: message_id.clone(),
             step: writing_step()?.number,
         }),
-        EventKind::AssistantTerminal { message_id, .. } => Change::Settle(Owed::Terminal {
-            message_id: message_id.clone(),
-            step: writing_step()?.number,
-        }),
+        EventKind::AssistantTerminal { .. } => {
+            writing_step()?;
+            write.owed.map_or(Change::Nothing, Change::Settle)
+        }
         EventKind::AssistantMessage | EventKind::AssistantFragment { .. } => {
             writing_step()?;
             Change::Nothing
@@ -246,14 +268,10 @@ pub(super) fn admit(state: &TurnState, write: Write<'_>) -> Result<Admitted, Tur
                 step,
             })
         }
-        EventKind::ToolResult { call_id, .. } => {
-            let owed = state
-                .owed
-                .iter()
-                .find(|item| matches!(item, Owed::Result { call_id: id, .. } if id == call_id))
-                .ok_or(TurnError::Answered)?;
+        EventKind::ToolResult { .. } => {
+            let owed = write.owed.ok_or(TurnError::Answered)?;
             writing_turn()?;
-            Change::Settle(owed.clone())
+            Change::Settle(owed)
         }
     };
     Ok(Admitted { stamp, change })

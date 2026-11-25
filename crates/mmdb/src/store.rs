@@ -350,7 +350,9 @@ mod tests {
     use super::*;
     use crate::context::TypeDefinition;
     use crate::session::EventInput;
-    use crate::{Actor, EventKind, OperationId, Scope, TurnEndReason};
+    use crate::{
+        Actor, EventKind, MessageStatus, OperationId, Scope, ToolOutcome, TurnEndReason, TurnError,
+    };
 
     fn session_writer<'a>(store: &'a Store, owner: &str, session: &str) -> SessionLog<'a> {
         store
@@ -362,22 +364,22 @@ mod tests {
             .unwrap()
     }
 
+    fn event_input(session: &str, id: &str, kind: EventKind) -> EventInput {
+        EventInput {
+            session: session.into(),
+            event_id: id.into(),
+            kind,
+            sources: vec![],
+            scope: Scope::Personal,
+            media_type: "text/plain".into(),
+            occurred_at_ms: 1,
+            expected_sequence: None,
+        }
+    }
+
     fn append_event(log: &SessionLog<'_>, session: &str, id: &str, kind: EventKind) {
-        log.append(
-            OperationId::new(),
-            EventInput {
-                session: session.into(),
-                event_id: id.into(),
-                kind,
-                sources: vec![],
-                scope: Scope::Personal,
-                media_type: "text/plain".into(),
-                occurred_at_ms: 1,
-                expected_sequence: None,
-            },
-            &[][..],
-        )
-        .unwrap();
+        log.append(OperationId::new(), event_input(session, id, kind), &[][..])
+            .unwrap();
     }
 
     fn start_step(store: &Store, owner: &str, session: &str) {
@@ -436,6 +438,78 @@ mod tests {
         for owner in ["alice", "bob"] {
             assert_step_interrupted(&store, owner, "chat");
         }
+    }
+
+    #[test]
+    fn an_append_reads_only_the_owed_row_it_settles() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::create(temp.path().join("store")).unwrap();
+        start_step(&store, "alice", "chat");
+        let log = session_writer(&store, "alice", "chat");
+        let append =
+            |id: &str, kind| log.append(OperationId::new(), event_input("chat", id, kind), &[][..]);
+        append(
+            "message",
+            EventKind::AssistantStarted {
+                message_id: "m".into(),
+            },
+        )
+        .unwrap();
+        append(
+            "terminal",
+            EventKind::AssistantTerminal {
+                message_id: "m".into(),
+                status: MessageStatus::Completed,
+            },
+        )
+        .unwrap();
+        for id in ["A", "B"] {
+            append(
+                id,
+                EventKind::ToolCall {
+                    call_id: id.into(),
+                    tool_name: "read".into(),
+                    message_id: Some("m".into()),
+                },
+            )
+            .unwrap();
+        }
+        let mut key = session::session_key("alice", "chat");
+        key.extend_from_slice(&[1, b'B']);
+        let mut batch = store.kernel.batch();
+        batch.insert(&store.session.owed, key, b"invalid");
+        batch.commit().unwrap();
+
+        append("notice", EventKind::Notice).unwrap();
+        append(
+            "result",
+            EventKind::ToolResult {
+                call_id: "A".into(),
+                outcome: ToolOutcome::Succeeded,
+            },
+        )
+        .unwrap();
+        let before = log.position("chat").unwrap();
+        assert!(matches!(
+            append(
+                "step-end",
+                EventKind::StepEnded {
+                    start_event_id: "step".into()
+                }
+            ),
+            Err(ContextError::Turn(TurnError::StepUnfinished))
+        ));
+        assert!(matches!(
+            append(
+                "cancel",
+                EventKind::TurnEnded {
+                    reason: TurnEndReason::Cancelled,
+                    start_event_id: "turn".into(),
+                }
+            ),
+            Err(ContextError::Corrupt(_))
+        ));
+        assert_eq!(log.position("chat").unwrap(), before);
     }
 
     #[test]

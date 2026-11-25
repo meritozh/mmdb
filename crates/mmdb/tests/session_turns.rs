@@ -597,6 +597,19 @@ fn direct_calls_inside_a_turn_need_no_step() {
 }
 
 #[test]
+fn a_direct_call_outside_a_step_holds_the_turn_but_not_a_later_step() {
+    let (_dir, db) = fixture();
+    let log = system(&db);
+    write(&log, "turn", EventKind::TurnStarted);
+    write(&log, "call", call("direct", None));
+    write(&log, "step", EventKind::StepStarted);
+    write(&log, "step-end", end_step("step"));
+    refused(&log, "end", completed("turn"), TurnError::TurnUnfinished);
+    write(&log, "result", result("direct"));
+    write(&log, "end", completed("turn"));
+}
+
+#[test]
 fn only_the_opening_run_writes_inside_a_turn() {
     let (_dir, db) = fixture();
     let log = system(&db);
