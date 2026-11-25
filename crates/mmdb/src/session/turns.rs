@@ -1,7 +1,7 @@
 //! Turn and step rules for one session. The log loads the state and persists
 //! the admitted change in the same batch as the event.
 
-use crate::{EventKind, TurnEndReason, TurnError, TurnStamp};
+use crate::{EventKind, MessageStatus, ToolOutcome, TurnEndReason, TurnError, TurnStamp};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,12 +63,72 @@ pub(super) enum Change {
     StartTurn { number: u64, run: String },
     StartStep(u64),
     EndStep,
-    EndTurn,
+    EndTurn { closing: Vec<Closing> },
 }
 
 pub(super) struct Admitted {
     pub stamp: Option<TurnStamp>,
     pub change: Change,
+}
+
+pub(super) struct Closing {
+    pub event_id: String,
+    pub kind: EventKind,
+    pub stamp: TurnStamp,
+}
+
+/// Owed items arrive in identity order, terminals first and then results.
+pub(super) fn close(turn: &OpenTurn, owed: &[Owed], reason: TurnEndReason) -> Vec<Closing> {
+    let prefix = format!("mmdb:turn-{}", turn.number);
+    let stamp = turn.stamp();
+    let mut closing = Vec::new();
+    for item in owed {
+        let (tag, identity, kind) = match item {
+            Owed::Terminal { message_id, .. } => (
+                "terminal",
+                message_id,
+                EventKind::AssistantTerminal {
+                    message_id: message_id.clone(),
+                    status: MessageStatus::Interrupted,
+                },
+            ),
+            Owed::Result { call_id, .. } => (
+                "result",
+                call_id,
+                EventKind::ToolResult {
+                    call_id: call_id.clone(),
+                    outcome: ToolOutcome::EffectUnknown,
+                },
+            ),
+        };
+        let hash = blake3::hash(identity.as_bytes());
+        closing.push(Closing {
+            event_id: format!("{prefix}:{tag}-{hash}"),
+            kind,
+            stamp,
+        });
+    }
+    if stamp.step.is_some() {
+        closing.push(Closing {
+            event_id: format!("{prefix}:step-end"),
+            kind: EventKind::StepEnded,
+            stamp,
+        });
+    }
+    if matches!(reason, TurnEndReason::Interrupted | TurnEndReason::Forked) {
+        closing.push(Closing {
+            event_id: format!("{prefix}:end"),
+            kind: EventKind::TurnEnded {
+                reason,
+                start_event_id: turn.start_event_id.clone(),
+            },
+            stamp: TurnStamp {
+                step: None,
+                ..stamp
+            },
+        });
+    }
+    closing
 }
 
 /// Link lookups have already established that a result's call exists and
@@ -105,15 +165,26 @@ pub(super) fn admit(state: &TurnState, write: Write<'_>) -> Result<Admitted, Tur
                 run: run.to_owned(),
             }
         }
-        EventKind::TurnEnded { start_event_id, .. } => {
+        EventKind::TurnEnded {
+            start_event_id,
+            reason,
+        } => {
             let turn = writing_turn()?;
             if start_event_id != &turn.start_event_id {
                 return Err(TurnError::OtherTurn);
             }
-            if turn.step.is_some() || !state.owed.is_empty() {
+            if *reason == TurnEndReason::Completed
+                && (turn.step.is_some() || !state.owed.is_empty())
+            {
                 return Err(TurnError::TurnUnfinished);
             }
-            Change::EndTurn
+            stamp = Some(TurnStamp {
+                number: turn.number,
+                step: None,
+            });
+            Change::EndTurn {
+                closing: close(turn, &state.owed, *reason),
+            }
         }
         EventKind::StepStarted => {
             let turn = writing_turn()?;

@@ -297,6 +297,25 @@ fn retrying_a_turn_event_after_the_turn_moved_on_returns_its_receipt() {
         ContextError::IdempotencyConflict
     ));
     assert_eq!(log.position(SESSION).unwrap(), before);
+
+    write(&log, "step", EventKind::StepStarted);
+    write(&log, "call", call("c", None));
+    let operation = OperationId::new();
+    let cancel = EventInput {
+        expected_sequence: Some(log.position(SESSION).unwrap()),
+        ..input("cancel", end("next", TurnEndReason::Cancelled))
+    };
+    let receipt = log.append(operation, cancel.clone(), &[][..]).unwrap();
+    assert_eq!(
+        receipt.sequence,
+        Some(cancel.expected_sequence.unwrap() + 3)
+    );
+    write(&log, "later", EventKind::TurnStarted);
+    let before_retry = log.position(SESSION).unwrap();
+    for retry in [operation, OperationId::new()] {
+        assert_eq!(log.append(retry, cancel.clone(), &[][..]).unwrap(), receipt);
+    }
+    assert_eq!(log.position(SESSION).unwrap(), before_retry);
 }
 
 #[test]
@@ -569,6 +588,201 @@ fn completed_needs_no_open_step_and_no_unanswered_call() {
     refused(&log, "end", completed("turn"), TurnError::TurnUnfinished);
     write(&log, "r", result("c"));
     write(&log, "end", completed("turn"));
+}
+
+fn check_unfinished_turn(reason: TurnEndReason) {
+    let (_dir, db) = fixture();
+    let log = writer(&db, Actor::Operator, Some("run"));
+    open_step(&log);
+    for id in ["z", "alpha"] {
+        write(&log, &format!("start-{id}"), started(id));
+        write(&log, &format!("call-{id}"), call(id, Some(id)));
+    }
+    let before = log.position(SESSION).unwrap();
+    let operation = OperationId::new();
+    let finish = EventInput {
+        occurred_at_ms: 987,
+        expected_sequence: Some(before),
+        ..input("end", end("turn", reason))
+    };
+    let receipt = log.append(operation, finish, &b"details"[..]).unwrap();
+    let events = log.events(SESSION, before, 10).unwrap().entries;
+    assert_eq!(events.len(), 6);
+    for (i, header) in events[..5].iter().enumerate() {
+        let event = header.event.as_ref().unwrap();
+        assert_eq!(event.sequence, before + i as u64 + 1);
+        assert_eq!(event.turn, stamp(1, Some(1)));
+        assert_eq!(event.media_type, "application/octet-stream");
+        assert_eq!(header.scope, Scope::Personal);
+        assert_eq!(header.temporal.observed_at_ms, 987);
+        assert_eq!(header.provenance.actor, Actor::System);
+        assert_eq!(header.provenance.run.as_deref(), Some("run"));
+        assert_eq!(header.provenance.session.as_deref(), Some(SESSION));
+        assert!(log
+            .read_payload(&header.pin, 0, 32)
+            .unwrap()
+            .bytes
+            .is_empty());
+    }
+    for (i, id) in ["alpha", "z"].into_iter().enumerate() {
+        let hash = blake3::hash(id.as_bytes());
+        let terminal = events[i].event.as_ref().unwrap();
+        assert_eq!(
+            terminal.kind,
+            EventKind::AssistantTerminal {
+                message_id: id.into(),
+                status: MessageStatus::Interrupted,
+            }
+        );
+        assert_eq!(terminal.event_id, format!("mmdb:turn-1:terminal-{hash}"));
+        let message = log.message_state(SESSION, id).unwrap().unwrap();
+        assert_eq!(message.terminal, Some(MessageStatus::Interrupted));
+        let result = &events[i + 2];
+        let event = result.event.as_ref().unwrap();
+        assert_eq!(
+            event.kind,
+            EventKind::ToolResult {
+                call_id: id.into(),
+                outcome: ToolOutcome::EffectUnknown,
+            }
+        );
+        assert_eq!(event.event_id, format!("mmdb:turn-1:result-{hash}"));
+        let (call, paired) = log.tool_pair(SESSION, id).unwrap();
+        assert_eq!(result.sources, [call.unwrap().pin]);
+        assert_eq!(paired.as_ref(), Some(result));
+    }
+    let step = events[4].event.as_ref().unwrap();
+    assert_eq!(step.kind, EventKind::StepEnded);
+    assert_eq!(step.event_id, "mmdb:turn-1:step-end");
+    let last = &events[5];
+    let event = last.event.as_ref().unwrap();
+    assert_eq!(event.kind, end("turn", reason));
+    assert_eq!(event.event_id, "end");
+    assert_eq!(event.turn, stamp(1, None));
+    assert_eq!(last.provenance.actor, Actor::Operator);
+    assert_eq!(receipt.sequence, Some(before + 6));
+    assert_eq!(receipt.pin, last.pin);
+    assert_eq!(
+        log.read_payload(&receipt.pin, 0, 32).unwrap().bytes,
+        b"details"
+    );
+    assert_eq!(log.operation_receipt(operation).unwrap(), Some(receipt));
+    write(&log, "later", EventKind::TurnStarted);
+    write(&log, "later-end", completed("later"));
+}
+
+#[test]
+fn cancelling_a_turn_closes_what_it_owes_in_one_batch() {
+    check_unfinished_turn(TurnEndReason::Cancelled);
+}
+
+#[test]
+fn failed_turns_close_like_cancelled_ones() {
+    check_unfinished_turn(TurnEndReason::Failed);
+}
+
+#[test]
+fn results_written_before_the_end_are_kept() {
+    let (_dir, db) = fixture();
+    let log = system(&db);
+    open_step(&log);
+    write(&log, "call", call("c", None));
+    let rejected = EventKind::ToolResult {
+        call_id: "c".into(),
+        outcome: ToolOutcome::RejectedBeforeDispatch,
+    };
+    let known = log
+        .append(
+            OperationId::new(),
+            input("known", rejected.clone()),
+            &b"offline"[..],
+        )
+        .unwrap();
+    let before = log.position(SESSION).unwrap();
+    write(&log, "end", end("turn", TurnEndReason::Cancelled));
+    assert_eq!(log.position(SESSION).unwrap(), before + 2);
+    let result = log.tool_pair(SESSION, "c").unwrap().1.unwrap();
+    assert_eq!(result.pin, known.pin);
+    assert_eq!(result.event.unwrap().kind, rejected);
+    assert_eq!(
+        log.read_payload(&known.pin, 0, 32).unwrap().bytes,
+        b"offline"
+    );
+}
+
+#[test]
+fn a_late_result_after_cancel_is_refused() {
+    let (_dir, db) = fixture();
+    let log = writer(&db, Actor::Operator, Some("run"));
+    let other = writer(&db, Actor::System, Some("other"));
+    write(&log, "turn", EventKind::TurnStarted);
+    let request = write(&log, "call", call("c", None));
+    write(&log, "cancel", end("turn", TurnEndReason::Cancelled));
+    refused(&log, "late", result("c"), TurnError::Answered);
+    write(&other, "other", EventKind::TurnStarted);
+    refused(&log, "late", result("c"), TurnError::Answered);
+    write(&other, "other-end", completed("other"));
+    write(&log, "later", EventKind::TurnStarted);
+    refused(&log, "late", result("c"), TurnError::Answered);
+    log.purge(OperationId::new(), request.pin).unwrap();
+    refused(&log, "late", result("c"), TurnError::Answered);
+}
+
+#[test]
+fn a_closing_result_fits_the_reserved_budget() {
+    let (_dir, db) = fixture();
+    let workspace = Scope::Workspace(ulid::Ulid::new());
+    let access = ContextAccess {
+        run: Some("run".into()),
+        scopes: vec![Scope::Personal, workspace.clone()],
+        ..ContextAccess::new("owner", Actor::System)
+    };
+    let log = db.session_log(access.clone()).unwrap();
+    let mut source = write(&log, "depth-0", EventKind::Notice).pin;
+    for depth in 1..=30 {
+        let event = EventInput {
+            sources: vec![source],
+            ..input(&format!("depth-{depth}"), EventKind::Notice)
+        };
+        source = log.append(OperationId::new(), event, &[][..]).unwrap().pin;
+    }
+    let event = |id, kind| EventInput {
+        session: "workspace-chat".into(),
+        scope: workspace.clone(),
+        ..input(id, kind)
+    };
+    log.append(
+        OperationId::new(),
+        event("turn", EventKind::TurnStarted),
+        &[][..],
+    )
+    .unwrap();
+    let mut request = event("call", call("c", None));
+    request.sources.push(source);
+    let call = log.append(OperationId::new(), request, &[][..]).unwrap();
+    // The end writer can read the call's header, but cannot walk its Personal source.
+    let closer = db
+        .session_log(ContextAccess {
+            scopes: vec![workspace.clone()],
+            ..access.clone()
+        })
+        .unwrap();
+    closer
+        .append(
+            OperationId::new(),
+            event("cancel", end("turn", TurnEndReason::Cancelled)),
+            &[][..],
+        )
+        .unwrap();
+    let result = log.tool_pair("workspace-chat", "c").unwrap().1.unwrap();
+    assert_eq!(result.scope, workspace);
+    assert_eq!(result.source_scopes, [Scope::Personal]);
+    assert_eq!(result.sources, [call.pin]);
+    assert_eq!(result.event.unwrap().turn, stamp(1, None));
+    db.context(access)
+        .unwrap()
+        .validate_current(&[result.pin], None)
+        .unwrap();
 }
 
 #[test]

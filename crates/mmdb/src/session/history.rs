@@ -1,4 +1,4 @@
-use super::turns::{self, Change, Numbers, OpenTurn, Owed, TurnState};
+use super::turns::{self, Change, Closing, Numbers, OpenTurn, Owed, TurnState};
 use super::*;
 use crate::records::codec::*;
 use crate::{Actor, OperationId, RecordState, Scope, TemporalFacts};
@@ -308,7 +308,7 @@ impl SessionLog<'_> {
             answers.as_ref(),
             reserve,
         )?;
-        let message = self.message_transition(&input, admitted.stamp)?;
+        let message = self.message_transition(&input.session, &input.kind, admitted.stamp)?;
         let pin = self.scoped.fresh_pin(RecordKind::Event);
         let streamed = self
             .scoped
@@ -320,7 +320,7 @@ impl SessionLog<'_> {
             &mut head,
             &session_key,
             &input,
-            state.open,
+            state,
             admitted.change,
         )?;
         let sources = answers
@@ -413,7 +413,7 @@ impl SessionLog<'_> {
         head: &mut SessionHead,
         key: &[u8],
         input: &EventInput,
-        open: Option<OpenTurn>,
+        state: TurnState,
         change: Change,
     ) -> ContextResult<()> {
         match change {
@@ -435,8 +435,9 @@ impl SessionLog<'_> {
                 batch.insert(&self.parts.open_turns, key, encode(&turn)?);
             }
             Change::StartStep(_) | Change::EndStep => {
-                let mut turn =
-                    open.ok_or_else(|| ContextError::Corrupt("step has no open turn".into()))?;
+                let mut turn = state
+                    .open
+                    .ok_or_else(|| ContextError::Corrupt("step has no open turn".into()))?;
                 turn.step = if let Change::StartStep(step) = change {
                     head.numbers.steps = step;
                     Some(step)
@@ -445,7 +446,78 @@ impl SessionLog<'_> {
                 };
                 batch.insert(&self.parts.open_turns, key, encode(&turn)?);
             }
-            Change::EndTurn => batch.remove(&self.parts.open_turns, key),
+            Change::EndTurn { closing } => {
+                let turn = state
+                    .open
+                    .ok_or_else(|| ContextError::Corrupt("turn end has no open turn".into()))?;
+                self.put_turn_end(
+                    batch,
+                    head,
+                    &turn,
+                    &state.owed,
+                    closing,
+                    input.occurred_at_ms,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn put_turn_end(
+        &self,
+        batch: &mut mmdb_kernel::Batch,
+        head: &mut SessionHead,
+        turn: &OpenTurn,
+        owed: &[Owed],
+        closing: Vec<Closing>,
+        occurred_at_ms: i64,
+    ) -> ContextResult<()> {
+        let key = session_key(&turn.owner, &turn.session);
+        batch.remove(&self.parts.open_turns, &key);
+        for item in owed {
+            batch.remove(&self.parts.owed, item.key(&key));
+        }
+        if closing.is_empty() {
+            return Ok(());
+        }
+        let payload = self
+            .scoped
+            .stream_payload(std::io::empty(), None)?
+            .descriptor;
+        for event in closing {
+            let (sources, source_scopes) = match &event.kind {
+                EventKind::ToolResult { call_id, .. } => {
+                    // The call reserved this result's budget and recorded its source scopes.
+                    let call = self.indexed_call(&turn.session, call_id)?;
+                    let header = self.scoped.head_locked(&call.record)?;
+                    (vec![header.pin], header.source_scopes)
+                }
+                _ => (Vec::new(), Vec::new()),
+            };
+            let stamp = Some(event.stamp);
+            let message = self.message_transition(&turn.session, &event.kind, stamp)?;
+            let new_event = NewEvent {
+                session: turn.session.clone(),
+                event_id: event.event_id,
+                kind: event.kind,
+                media_type: "application/octet-stream".into(),
+                scope: head.scope.clone(),
+                occurred_at_ms,
+                provenance: Provenance {
+                    actor: Actor::System,
+                    agent: None,
+                    session: Some(turn.session.clone()),
+                    run: Some(turn.run.clone()),
+                    parent_run: None,
+                },
+                sources,
+                source_scopes,
+                pin: self.scoped.fresh_pin(RecordKind::Event),
+                payload: payload.clone(),
+                message,
+                turn: stamp,
+            };
+            self.put_event(batch, head, new_event)?;
         }
         Ok(())
     }
@@ -604,20 +676,21 @@ impl SessionLog<'_> {
 
     fn message_transition(
         &self,
-        input: &EventInput,
+        session: &str,
+        kind: &EventKind,
         stamp: Option<TurnStamp>,
     ) -> ContextResult<Option<MessageState>> {
-        let Some(message_id) = assistant_message_id(&input.kind) else {
+        let Some(message_id) = assistant_message_id(kind) else {
             return Ok(None);
         };
-        let key = identity_key(&self.scoped.access().owner, &input.session, message_id);
+        let key = identity_key(&self.scoped.access().owner, session, message_id);
         let previous: Option<MessageState> = self
             .parts
             .messages
             .get(&key)?
             .map(|bytes| decode(&bytes))
             .transpose()?;
-        let state = match (&input.kind, previous) {
+        let state = match (kind, previous) {
             (EventKind::AssistantStarted { .. }, None) => MessageState {
                 next_fragment: 0,
                 terminal: None,
