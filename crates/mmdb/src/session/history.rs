@@ -10,6 +10,43 @@ struct SessionHead {
     scope: Scope,
 }
 
+/// One event ready to write into the session's batch.
+struct NewEvent {
+    session: String,
+    event_id: String,
+    kind: EventKind,
+    media_type: String,
+    scope: Scope,
+    occurred_at_ms: i64,
+    provenance: Provenance,
+    sources: Vec<RecordPin>,
+    source_scopes: Vec<Scope>,
+    pin: RecordPin,
+    payload: PayloadDescriptor,
+    message: Option<MessageState>,
+}
+
+impl NewEvent {
+    fn identity_input(&self) -> EventInput {
+        // A result's first source is its implicit call link. Only the caller's
+        // explicit sources participate in the persisted event identity.
+        let sources = match self.kind {
+            EventKind::ToolResult { .. } => &self.sources[1..],
+            _ => &self.sources[..],
+        };
+        EventInput {
+            sources: sources.to_vec(),
+            session: self.session.clone(),
+            event_id: self.event_id.clone(),
+            scope: self.scope.clone(),
+            kind: self.kind.clone(),
+            media_type: self.media_type.clone(),
+            occurred_at_ms: self.occurred_at_ms,
+            expected_sequence: None,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct ToolCallIndex {
     record: ContextRef,
@@ -21,6 +58,15 @@ fn identity_key(owner: &str, session: &str, identity: &str) -> Vec<u8> {
     let mut key = session_key(owner, session);
     segment(&mut key, identity.as_bytes());
     key
+}
+
+fn assistant_message_id(kind: &EventKind) -> Option<&str> {
+    match kind {
+        EventKind::AssistantStarted { message_id }
+        | EventKind::AssistantFragment { message_id, .. }
+        | EventKind::AssistantTerminal { message_id, .. } => Some(message_id),
+        _ => None,
+    }
 }
 
 pub(crate) struct LogGate {
@@ -194,14 +240,17 @@ impl SessionLog<'_> {
                 ));
             }
         }
-        let sequence = head.map_or(0, |head| head.sequence);
+        let mut head = head.unwrap_or_else(|| SessionHead {
+            sequence: 0,
+            scope: input.scope.clone(),
+        });
         let writing = !previous_operation && previous_event.is_none();
         let (sources, source_scopes) = if writing {
             if let Some(expected) = input.expected_sequence {
-                if expected != sequence {
+                if expected != head.sequence {
                     return Err(ContextError::PositionConflict {
                         expected,
-                        actual: sequence,
+                        actual: head.sequence,
                     });
                 }
             }
@@ -229,13 +278,12 @@ impl SessionLog<'_> {
         if let Some(receipt) = self.scoped.replay(operation, digest)? {
             return Ok(receipt);
         }
-        let mut event_input = input.clone();
-        event_input.expected_sequence = None;
-        let event_digest = self
-            .scoped
-            .digest("history-event", &(&event_input, length, payload_digest))?;
         if let Some(previous) = previous_event {
-            if previous.digest != event_digest {
+            let event_input = EventInput {
+                expected_sequence: None,
+                ..input
+            };
+            if previous.digest != self.event_digest(&event_input, &streamed.descriptor)? {
                 return Err(ContextError::IdempotencyConflict);
             }
             self.scoped.header_locked(&previous.receipt.pin)?;
@@ -249,86 +297,116 @@ impl SessionLog<'_> {
         if !writing {
             return Err(ContextError::IdempotencyConflict);
         }
-        let next_sequence = sequence
-            .checked_add(1)
-            .ok_or(ContextError::BudgetExceeded)?;
-        let event = LogEvent {
-            session: input.session.clone(),
-            event_id: input.event_id,
-            sequence: next_sequence,
-            kind: input.kind.clone(),
-            media_type: input.media_type,
-        };
         let mut provenance = self.scoped.provenance();
         provenance.session = Some(input.session.clone());
-        let header = RecordHeader {
-            pin: pin.clone(),
-            scope: input.scope.clone(),
-            state: RecordState::Active,
-            type_pin: None,
+        let event = NewEvent {
+            session: input.session,
+            event_id: input.event_id,
+            kind: input.kind,
+            media_type: input.media_type,
+            scope: input.scope,
+            occurred_at_ms: input.occurred_at_ms,
+            provenance,
             sources,
             source_scopes,
-            provenance,
-            information: InformationKind::Observation,
-            temporal: TemporalFacts::observed_at(input.occurred_at_ms),
-            recorded_at_ms: super::super::now_ms(),
+            pin,
             payload: streamed.descriptor.clone(),
-            endpoints: None,
-            event: Some(event),
-            checkpoint: None,
-        };
-        let receipt = WriteReceipt {
-            pin: pin.clone(),
-            sequence: Some(next_sequence),
+            message: message_transition,
         };
         let mut batch = self.scoped.batch();
-        if let Some((key, state)) = message_transition {
-            batch.insert(&self.parts.messages, key, encode(&state)?);
-        }
-        self.scoped.put_header(&mut batch, &header)?;
-        let mut order_key = session_key.clone();
-        order_key.extend_from_slice(&next_sequence.to_be_bytes());
-        batch.insert(&self.parts.order, order_key, encode(&pin.record)?);
-        batch.insert(
-            &self.parts.heads,
-            session_key,
-            encode(&SessionHead {
-                sequence: next_sequence,
-                scope: input.scope,
-            })?,
-        );
+        let receipt = self.put_event(&mut batch, &mut head, event)?;
+        batch.insert(&self.parts.heads, session_key, encode(&head)?);
+        streamed.publish(&mut batch);
+        self.scoped
+            .commit_operation(batch, operation, digest, receipt)
+    }
+
+    fn event_digest(
+        &self,
+        input: &EventInput,
+        payload: &PayloadDescriptor,
+    ) -> ContextResult<[u8; 32]> {
+        self.scoped
+            .digest("history-event", &(input, payload.bytes, payload.digest))
+    }
+
+    fn put_event(
+        &self,
+        batch: &mut mmdb_kernel::Batch,
+        head: &mut SessionHead,
+        event: NewEvent,
+    ) -> ContextResult<WriteReceipt> {
+        let sequence = head
+            .sequence
+            .checked_add(1)
+            .ok_or(ContextError::BudgetExceeded)?;
+        let digest = self.event_digest(&event.identity_input(), &event.payload)?;
+        let owner = &self.scoped.access().owner;
+        let receipt = WriteReceipt {
+            pin: event.pin.clone(),
+            sequence: Some(sequence),
+        };
+        let mut order_key = session_key(owner, &event.session);
+        order_key.extend_from_slice(&sequence.to_be_bytes());
+        batch.insert(&self.parts.order, order_key, encode(&event.pin.record)?);
         batch.insert(
             &self.parts.events,
-            event_key,
+            identity_key(owner, &event.session, &event.event_id),
             encode(&StoredEvent {
-                digest: event_digest,
+                digest,
                 receipt: receipt.clone(),
             })?,
         );
-        match input.kind {
+        if let Some((id, state)) = assistant_message_id(&event.kind).zip(event.message) {
+            let key = identity_key(owner, &event.session, id);
+            batch.insert(&self.parts.messages, key, encode(&state)?);
+        }
+        match &event.kind {
             EventKind::ToolCall {
                 call_id,
                 message_id,
                 ..
             } => batch.insert(
                 &self.parts.calls,
-                identity_key(&self.scoped.access().owner, &input.session, &call_id),
+                identity_key(owner, &event.session, call_id),
                 encode(&ToolCallIndex {
-                    record: pin.record.clone(),
-                    message_id,
+                    record: event.pin.record.clone(),
+                    message_id: message_id.clone(),
                     purged: false,
                 })?,
             ),
             EventKind::ToolResult { call_id, .. } => batch.insert(
                 &self.parts.results,
-                identity_key(&self.scoped.access().owner, &input.session, &call_id),
-                encode(&pin.record)?,
+                identity_key(owner, &event.session, call_id),
+                encode(&event.pin.record)?,
             ),
             _ => {}
         }
-        streamed.publish(&mut batch);
-        self.scoped
-            .commit_operation(batch, operation, digest, receipt)
+        let header = RecordHeader {
+            pin: event.pin,
+            scope: event.scope,
+            state: RecordState::Active,
+            type_pin: None,
+            sources: event.sources,
+            source_scopes: event.source_scopes,
+            provenance: event.provenance,
+            information: InformationKind::Observation,
+            temporal: TemporalFacts::observed_at(event.occurred_at_ms),
+            recorded_at_ms: super::super::now_ms(),
+            payload: event.payload,
+            endpoints: None,
+            event: Some(LogEvent {
+                session: event.session,
+                event_id: event.event_id,
+                sequence,
+                kind: event.kind,
+                media_type: event.media_type,
+            }),
+            checkpoint: None,
+        };
+        self.scoped.put_header(batch, &header)?;
+        head.sequence = sequence;
+        Ok(receipt)
     }
 
     fn validate_event_input(&self, input: &EventInput) -> ContextResult<()> {
@@ -376,15 +454,9 @@ impl SessionLog<'_> {
         Ok(())
     }
 
-    fn message_transition(
-        &self,
-        input: &EventInput,
-    ) -> ContextResult<Option<(Vec<u8>, MessageState)>> {
-        let message_id = match &input.kind {
-            EventKind::AssistantStarted { message_id }
-            | EventKind::AssistantFragment { message_id, .. }
-            | EventKind::AssistantTerminal { message_id, .. } => message_id,
-            _ => return Ok(None),
+    fn message_transition(&self, input: &EventInput) -> ContextResult<Option<MessageState>> {
+        let Some(message_id) = assistant_message_id(&input.kind) else {
+            return Ok(None);
         };
         let key = identity_key(&self.scoped.access().owner, &input.session, message_id);
         let previous: Option<MessageState> = self
@@ -420,7 +492,7 @@ impl SessionLog<'_> {
                 ))
             }
         };
-        Ok(Some((key, state)))
+        Ok(Some(state))
     }
 
     pub fn message_state(
