@@ -158,7 +158,7 @@ pub const STORE_FORMAT_ID: &str = "mmdb-store-v3";
 ```
 
 - Invariants: `LogEvent::turn` is `Some` exactly for events written while a turn was open, including `TurnStarted` (its new number, no step) and `TurnEnded` (no step: the step ended first). `StepStarted` and `StepEnded` carry their own step. Every call without a result is owed by its session's open turn, so every turn that has ended owes nothing: every message in it has a terminal and every call has a result.
-- Errors: `ContextError::Turn` for every rule above; `AccessDenied` when a turn or step event comes from an actor other than System or Operator. When an event breaks several rules, the first in the order of the variants above wins: a linked call or an `AssistantMessage` in an empty session is `OutsideTurn`, and another run's assistant event in a turn with no open step is `OtherRun`.
+- Errors: `ContextError::Turn` for every rule above; `AccessDenied` when a turn or step event comes from an actor other than System or Operator. When an event breaks several turn rules, the first in the order of the variants above wins: an `AssistantMessage` in an empty session is `OutsideTurn`, a linked call to a message of an ended turn with no turn open is `OutsideTurn`, and another run's assistant event in a turn with no open step is `OtherRun`. The link lookups run before the turn rules, because the rules need the linked message's step, so a linked call to a missing message is `InvalidInput` whether or not a turn is open.
 
 ### `SessionLog::append` (changed, `crates/mmdb/src/session/history.rs`)
 
@@ -494,7 +494,7 @@ No new seam. The commit hook moves down a layer so that recovery's commit, which
    - `completed_needs_no_open_step_and_no_unanswered_call`
    - `an_owed_call_gets_its_result_after_it_becomes_unreadable`: after a purge of the call, a retraction of the call, and a withdrawn fragment of its message. Each result is accepted, is unreadable, carries the call's `source_scopes`, and lets the step and turn end Completed.
    - `a_second_result_for_a_call_is_answered`: a second result under a new event ID is `Answered`, in the same turn and in a later one.
-   - `turn_errors_follow_their_precedence`: an `AssistantMessage`, an `AssistantStarted` and a linked call in an empty session are `OutsideTurn`. Another run's assistant event with no open step is `OtherRun`.
+   - `turn_errors_follow_their_precedence`: an `AssistantMessage` and an `AssistantStarted` in an empty session are `OutsideTurn`. A linked call to a missing message is `InvalidInput`, both in an empty session and inside an open step. A linked call to a terminated message of a turn that has ended Completed, with no turn open, is `OutsideTurn`. Another run's assistant event with no open step is `OtherRun`.
 
    After: 3. Check: `cargo test --workspace --locked`
 5. Close Cancelled and Failed turns. Add `turns::close` and write its events through `put_event` in the end event's batch, with the IDs, provenance, sources and order above. This replaces step 4's refusal. Tests in `crates/mmdb/tests/session_turns.rs`:
