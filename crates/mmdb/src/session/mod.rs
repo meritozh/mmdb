@@ -10,7 +10,7 @@ use crate::records::codec::{owner_key, segment};
 pub use crate::records::RecoveryReport;
 use crate::records::*;
 use crate::OperationId;
-pub(crate) use history::LogGate;
+pub(crate) use history::{end_interrupted_turns, LogGate};
 pub use types::*;
 
 const CALLS: &str = "session_tool_calls_v1";
@@ -33,7 +33,7 @@ pub struct SessionLog<'a> {
     pub(crate) parts: &'a SessionParts,
 }
 
-fn session_key(owner: &str, session: &str) -> Vec<u8> {
+pub(crate) fn session_key(owner: &str, session: &str) -> Vec<u8> {
     let mut key = owner_key(owner);
     segment(&mut key, session.as_bytes());
     key

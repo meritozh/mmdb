@@ -117,6 +117,132 @@ fn stamp(number: u64, step: Option<u64>) -> Option<TurnStamp> {
 }
 
 #[test]
+fn a_turn_left_open_by_an_exited_process_ends_interrupted_on_open() {
+    const CHILD_ROOT: &str = "MMDB_TEST_INTERRUPTED_TURN_ROOT";
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        let store = Store::create(root).unwrap();
+        let log = system(&store);
+        open_step(&log);
+        write(&log, "message", started("m"));
+        write(&log, "call", call("c", Some("m")));
+        std::process::exit(77);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("store");
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "a_turn_left_open_by_an_exited_process_ends_interrupted_on_open",
+        ])
+        .env(CHILD_ROOT, &root)
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(77));
+
+    let store = Store::open(&root).unwrap();
+    let log = system(&store);
+    let entries = log.events(SESSION, 4, 10).unwrap().entries;
+    let expected = [
+        EventKind::AssistantTerminal {
+            message_id: "m".into(),
+            status: MessageStatus::Interrupted,
+        },
+        EventKind::ToolResult {
+            call_id: "c".into(),
+            outcome: ToolOutcome::EffectUnknown,
+        },
+        EventKind::StepEnded,
+        end("turn", TurnEndReason::Interrupted),
+    ];
+    assert_eq!(entries.len(), expected.len());
+    for (header, kind) in entries.iter().zip(expected) {
+        assert_eq!(header.event.as_ref().unwrap().kind, kind);
+        assert_eq!(header.provenance.actor, Actor::System);
+        assert_eq!(header.provenance.run.as_deref(), Some("run"));
+        assert_eq!(header.provenance.session.as_deref(), Some(SESSION));
+        assert!(header.temporal.observed_at_ms > 1);
+    }
+    assert_eq!(
+        log.message_state(SESSION, "m").unwrap().unwrap().terminal,
+        Some(MessageStatus::Interrupted)
+    );
+    let (call, result) = log.tool_pair(SESSION, "c").unwrap();
+    assert_eq!(result.as_ref(), Some(&entries[1]));
+    assert_eq!(entries[1].sources, [call.unwrap().pin]);
+    let end = entries.last().unwrap().event.as_ref().unwrap();
+    assert_eq!(end.event_id, "mmdb:turn-1:end");
+    assert_eq!(end.turn, stamp(1, None));
+}
+
+#[test]
+fn reopening_in_the_same_process_ends_its_own_open_turn() {
+    let (dir, store) = fixture();
+    write(&system(&store), "turn", EventKind::TurnStarted);
+    drop(store);
+
+    let store = Store::open(dir.path().join("store")).unwrap();
+    let log = system(&store);
+    let entries = log.events(SESSION, 1, 10).unwrap().entries;
+    assert_eq!(entries.len(), 1);
+    let event = entries[0].event.as_ref().unwrap();
+    assert_eq!(event.kind, end("turn", TurnEndReason::Interrupted));
+    assert_eq!(event.event_id, "mmdb:turn-1:end");
+    let next = write(&log, "next", EventKind::TurnStarted);
+    assert_eq!(
+        log.inspect_header(&next.pin).unwrap().event.unwrap().turn,
+        stamp(2, None)
+    );
+}
+
+#[test]
+fn recovery_reads_no_source_of_an_owed_call() {
+    let (dir, store) = fixture();
+    let workspace = Scope::Workspace(ulid::Ulid::new());
+    let access = ContextAccess {
+        run: Some("run".into()),
+        scopes: vec![workspace.clone(), Scope::Personal],
+        ..ContextAccess::new("owner", Actor::System)
+    };
+    let log = store.session_log(access.clone()).unwrap();
+    let personal = write(&log, "personal", EventKind::Notice);
+    let event = |id, kind| EventInput {
+        session: "workspace-chat".into(),
+        scope: workspace.clone(),
+        ..input(id, kind)
+    };
+    log.append(
+        OperationId::new(),
+        event("turn", EventKind::TurnStarted),
+        &[][..],
+    )
+    .unwrap();
+    let request = EventInput {
+        sources: vec![personal.pin],
+        ..event("call", call("c", None))
+    };
+    let request = log.append(OperationId::new(), request, &[][..]).unwrap();
+    drop(store);
+
+    let store = Store::open(dir.path().join("store")).unwrap();
+    let log = store.session_log(access).unwrap();
+    let (call, result) = log.tool_pair("workspace-chat", "c").unwrap();
+    let call = call.unwrap();
+    let result = result.unwrap();
+    assert_eq!(call.pin, request.pin);
+    assert_eq!(call.source_scopes, [Scope::Personal]);
+    assert_eq!(result.scope, workspace);
+    assert_eq!(result.sources, [call.pin]);
+    assert_eq!(result.source_scopes, call.source_scopes);
+    assert_eq!(
+        result.event.unwrap().kind,
+        EventKind::ToolResult {
+            call_id: "c".into(),
+            outcome: ToolOutcome::EffectUnknown,
+        }
+    );
+}
+
+#[test]
 fn turn_and_step_numbers_increase_across_the_session() {
     let (dir, db) = fixture();
     let log = system(&db);

@@ -23,8 +23,10 @@ directory so workflows and queues survive a memory-store reset.
 
 The `mmdb::context` contract provides versioned object and relation types,
 source-backed records, and bounded lexical and graph recall. The
-`mmdb::session` module provides ordered session events and checkpoints. Both modules
-share the store lease, write lock and durable batches. An assistant can save validated
+`mmdb::session` module provides ordered session events and checkpoints.
+Reopening the store ends each unfinished turn as `Interrupted` after closing its
+pending messages, tool calls and step. Both modules share the store lease, write
+lock and durable batches. An assistant can save validated
 context directly, with provenance and an explicit inference label.
 
 Create a fresh root with `mmdb::Store::create(path)` and reopen it with

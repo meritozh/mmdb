@@ -181,6 +181,51 @@ fn load_call(
         .transpose()
 }
 
+/// End every turn left open by the previous lease holder in one batch.
+/// Store::open calls this while it still has exclusive access to the store.
+pub(crate) fn end_interrupted_turns(
+    records: &Records,
+    parts: &SessionParts,
+) -> ContextResult<usize> {
+    let mut batch = None;
+    let mut ended = 0;
+    let occurred_at_ms = crate::now_ms();
+    for entry in parts.open_turns.iter() {
+        let (key, value) = entry?;
+        let turn: OpenTurn = decode(&value)?;
+        if key.as_ref() != session_key(&turn.owner, &turn.session) {
+            return Err(ContextError::Corrupt(
+                "open turn identity disagrees with key".into(),
+            ));
+        }
+        let value = parts
+            .heads
+            .get(&key)?
+            .ok_or_else(|| ContextError::Corrupt("open turn has no session head".into()))?;
+        let mut head: SessionHead = decode(&value)?;
+        let access = ContextAccess {
+            session: Some(turn.session.clone()),
+            run: Some(turn.run.clone()),
+            scopes: vec![head.scope.clone()],
+            ..ContextAccess::new(&turn.owner, Actor::System)
+        };
+        let log = SessionLog {
+            scoped: records.scoped(access),
+            parts,
+        };
+        let owed = log.owed_items(&key)?;
+        let closing = turns::close(&turn, &owed, TurnEndReason::Interrupted);
+        let batch = batch.get_or_insert_with(|| log.scoped.batch());
+        log.put_turn_end(batch, &mut head, &turn, &owed, closing, occurred_at_ms)?;
+        batch.insert(&parts.heads, &key, encode(&head)?);
+        ended += 1;
+    }
+    if let Some(batch) = batch {
+        batch.commit()?;
+    }
+    Ok(ended)
+}
+
 impl SessionLog<'_> {
     /// Enumerate sessions without relying on an application projection.
     /// This recovery catalog requires trusted harness authority.
@@ -393,18 +438,27 @@ impl SessionLog<'_> {
             .get(key)?
             .map(|bytes| decode(&bytes))
             .transpose()?;
-        let mut owed = Vec::new();
-        if open.is_some() {
-            for row in self.parts.owed.prefix(key) {
-                let (entry, value) = row?;
-                owed.push(Owed::from_row(&entry[key.len()..], &value)?);
-            }
-        }
+        let owed = if open.is_some() {
+            self.owed_items(key)?
+        } else {
+            Vec::new()
+        };
         Ok(TurnState {
             open,
             owed,
             numbers,
         })
+    }
+
+    fn owed_items(&self, key: &[u8]) -> ContextResult<Vec<Owed>> {
+        self.parts
+            .owed
+            .prefix(key)
+            .map(|row| {
+                let (entry, value) = row?;
+                Owed::from_row(&entry[key.len()..], &value)
+            })
+            .collect()
     }
 
     fn put_turn_change(

@@ -65,7 +65,9 @@ impl Store {
     /// Open an existing directory with the exact store format.
     pub fn open(root: impl AsRef<Path>) -> StoreResult<Self> {
         let format = StoreFormatDescriptor::new(STORE_FORMAT_ID).map_err(KernelError::Format)?;
-        Self::from_kernel(Kernel::open(root.as_ref(), &format, MODULES)?)
+        let store = Self::from_kernel(Kernel::open(root.as_ref(), &format, MODULES)?)?;
+        session::end_interrupted_turns(&store.records, &store.session)?;
+        Ok(store)
     }
 
     fn from_kernel(kernel: Kernel) -> StoreResult<Self> {
@@ -347,7 +349,117 @@ impl From<ContextError> for StoreError {
 mod tests {
     use super::*;
     use crate::context::TypeDefinition;
-    use crate::{Actor, OperationId, Scope};
+    use crate::session::EventInput;
+    use crate::{Actor, EventKind, OperationId, Scope, TurnEndReason};
+
+    fn session_writer<'a>(store: &'a Store, owner: &str, session: &str) -> SessionLog<'a> {
+        store
+            .session_log(ContextAccess {
+                session: Some(session.into()),
+                run: Some(format!("run-{owner}-{session}")),
+                ..ContextAccess::new(owner, Actor::System)
+            })
+            .unwrap()
+    }
+
+    fn append_event(log: &SessionLog<'_>, session: &str, id: &str, kind: EventKind) {
+        log.append(
+            OperationId::new(),
+            EventInput {
+                session: session.into(),
+                event_id: id.into(),
+                kind,
+                sources: vec![],
+                scope: Scope::Personal,
+                media_type: "text/plain".into(),
+                occurred_at_ms: 1,
+                expected_sequence: None,
+            },
+            &[][..],
+        )
+        .unwrap();
+    }
+
+    fn start_step(store: &Store, owner: &str, session: &str) {
+        let log = session_writer(store, owner, session);
+        append_event(&log, session, "turn", EventKind::TurnStarted);
+        append_event(&log, session, "step", EventKind::StepStarted);
+    }
+
+    fn assert_step_interrupted(store: &Store, owner: &str, session: &str) {
+        let log = session_writer(store, owner, session);
+        let entries = log.events(session, 2, 10).unwrap().entries;
+        assert_eq!(log.position(session).unwrap(), 4);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].event.as_ref().unwrap().kind,
+            EventKind::StepEnded
+        );
+        assert_eq!(
+            entries[1].event.as_ref().unwrap().kind,
+            EventKind::TurnEnded {
+                reason: TurnEndReason::Interrupted,
+                start_event_id: "turn".into(),
+            }
+        );
+        for header in entries {
+            assert_eq!(header.provenance.session.as_deref(), Some(session));
+            assert_eq!(
+                header.provenance.run,
+                Some(format!("run-{owner}-{session}"))
+            );
+        }
+    }
+
+    #[test]
+    fn opening_reads_only_sessions_with_open_turns() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let store = Store::create(&root).unwrap();
+        for owner in ["alice", "bob"] {
+            start_step(&store, owner, "chat");
+        }
+        let idle = session_writer(&store, "alice", "idle");
+        append_event(&idle, "idle", "notice", EventKind::Notice);
+        let mut batch = store.kernel.batch();
+        batch.insert(
+            &store.session.heads,
+            session::session_key("alice", "idle"),
+            b"invalid",
+        );
+        batch.commit().unwrap();
+        drop(store);
+
+        let store = Store::open(&root).unwrap();
+        for owner in ["alice", "bob"] {
+            assert_step_interrupted(&store, owner, "chat");
+        }
+    }
+
+    #[test]
+    fn an_unknown_recovery_commit_closes_each_turn_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let store = Store::create(&root).unwrap();
+        for session in ["first", "second"] {
+            start_step(&store, "owner", session);
+        }
+        store.kernel.lose_next_commit_ack(&store.session.open_turns);
+        assert!(matches!(
+            session::end_interrupted_turns(&store.records, &store.session),
+            Err(ContextError::Storage(KernelError::CommitUnknown))
+        ));
+        for session in ["first", "second"] {
+            assert_step_interrupted(&store, "owner", session);
+        }
+        assert!(store.session.open_turns.iter().next().is_none());
+        drop(store);
+
+        let store = Store::open(&root).unwrap();
+        for session in ["first", "second"] {
+            assert_step_interrupted(&store, "owner", session);
+        }
+    }
 
     #[test]
     fn changing_the_replacement_era_invalidates_a_confirmed_digest() {
