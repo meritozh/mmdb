@@ -257,7 +257,11 @@ impl<'a> View<'a> {
 ```
 
 - Invariants: positions `1..=ancestors[0].upto` are rows of `ancestors[0].session`, each later segment covers `(previous upto, upto]`, and the session's own rows cover the positions after the last `upto`. An identity lookup takes the session's own row first, then each ancestor from newest to oldest, accepting a row only when the position it records is at or before that ancestor's `upto`. A session without a lineage row is a single segment.
-- Errors: `Corrupt` when a lineage row or an order entry disagrees with its key.
+- Errors: `Corrupt` in two cases:
+  - A lineage row is empty, holds more than 63 segments, has an `upto` of 0 or one that does not strictly increase, or names the session itself.
+  - An order entry's record is not an `Event` of the view's owner.
+
+  Each check reads only the row itself and its key. Swapping two well-formed order rows of one session is not detected, because a row holds neither its session nor its position.
 - Performance: `load` is one point read. A lookup costs at most one point read per segment. `entry` is a binary search over segments plus one read.
 
 Behind the seam: `fork_ancestors` flattens. When `position` falls in an inherited segment, the new list ends at that ancestor with `upto = position`, so depth does not grow; otherwise it appends `{ self.session, position }`. `history`, `checkpoints`, `search`, `fork` and `LogGate` never read `order`, `events`, `calls`, `results` or `messages` except through a `View`.
