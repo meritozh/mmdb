@@ -3,6 +3,7 @@
 mod catalog;
 pub use catalog::{NewSession, SessionPage, SessionQuery, SessionState};
 mod checkpoints;
+mod fork;
 mod history;
 mod search;
 mod turns;
@@ -19,6 +20,7 @@ pub use types::*;
 const CALLS: &str = "session_tool_calls_v1";
 const MESSAGES: &str = "session_messages_v1";
 module_partitions!(SessionParts, SESSION_PARTITIONS, {
+    lineage => "session_lineage_v1",
     order => "session_order_v1",
     changes => "session_changes_v1",
     heads => "session_heads_v1",

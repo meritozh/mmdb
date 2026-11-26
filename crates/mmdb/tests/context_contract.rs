@@ -3330,6 +3330,202 @@ mod sessions {
         }
     }
 
+    fn origin(session: &str, position: u64) -> mmdb::SessionOrigin {
+        mmdb::SessionOrigin {
+            session: session.into(),
+            position,
+        }
+    }
+
+    #[test]
+    fn a_fork_reads_the_source_prefix_then_its_own_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        let log = store.session_log(access("owner")).unwrap();
+        log.create_session(OperationId::new(), new("source"), Scope::Personal)
+            .unwrap();
+        let prefix = log
+            .append(
+                OperationId::new(),
+                event_input("source", "a"),
+                &b"needle"[..],
+            )
+            .unwrap();
+        log.append(
+            OperationId::new(),
+            event_input("source", "b"),
+            &b"needle"[..],
+        )
+        .unwrap();
+        let before = log.session("source").unwrap();
+        let mut child = new("fork");
+        child.parent = Some(SessionParent {
+            session: "source".into(),
+            run: "parent-run".into(),
+        });
+        let receipt = log
+            .fork_session(OperationId::new(), child.clone(), origin("source", 1))
+            .unwrap();
+        assert_eq!(receipt.sequence, Some(1));
+        assert_eq!(log.session("source").unwrap(), before);
+        assert_eq!(log.session("fork").unwrap().header.parent, child.parent);
+        assert_eq!(
+            log.append(OperationId::new(), event_input("fork", "a"), &b"needle"[..])
+                .unwrap(),
+            prefix
+        );
+        assert!(matches!(
+            log.append(
+                OperationId::new(),
+                event_input("fork", "a"),
+                &b"changed"[..]
+            ),
+            Err(ContextError::IdempotencyConflict)
+        ));
+        let suffix = log
+            .append(OperationId::new(), event_input("fork", "b"), &b"needle"[..])
+            .unwrap();
+        assert_eq!(suffix.sequence, Some(2));
+        let query = LogQuery {
+            session: Some("fork".into()),
+            text: "needle".into(),
+            max_events: 1,
+            max_bytes: 128,
+            limit: 1,
+            cursor: None,
+        };
+        let first = log.search(query.clone()).unwrap();
+        assert_eq!(first.matches[0].header.pin, prefix.pin);
+        let next = log
+            .search(LogQuery {
+                cursor: first.cursor,
+                ..query
+            })
+            .unwrap();
+        assert_eq!(next.matches[0].header.pin, suffix.pin);
+        assert_eq!(
+            log.events("fork", 0, 10)
+                .unwrap()
+                .entries
+                .into_iter()
+                .map(|h| h.pin)
+                .collect::<Vec<_>>(),
+            vec![prefix.pin, suffix.pin]
+        );
+        assert_eq!(
+            log.fork_session(OperationId::new(), child, origin("source", 1))
+                .unwrap(),
+            receipt
+        );
+    }
+
+    #[test]
+    fn a_fork_starts_without_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        let log = store.session_log(access("owner")).unwrap();
+        log.create_session(OperationId::new(), new("source"), Scope::Personal)
+            .unwrap();
+        let event = log
+            .append(OperationId::new(), event_input("source", "first"), &[][..])
+            .unwrap();
+        let checkpoint = |session: &str| CheckpointInput {
+            session: session.into(),
+            run: "run".into(),
+            scope: CheckpointScope::Session,
+            sequence: 1,
+            expected_previous: None,
+            expected_availability_epoch: store
+                .context(access("owner"))
+                .unwrap()
+                .availability_epoch()
+                .unwrap(),
+            sources: vec![],
+            payload: json!("summary"),
+        };
+        log.save_checkpoint(OperationId::new(), checkpoint("source"))
+            .unwrap();
+        log.fork_session(OperationId::new(), new("fork"), origin("source", 1))
+            .unwrap();
+        assert!(log.latest_checkpoint("fork").unwrap().is_none());
+        let receipt = log
+            .save_checkpoint(OperationId::new(), checkpoint("fork"))
+            .unwrap();
+        assert_eq!(
+            log.inspect_header(&receipt.pin).unwrap().sources,
+            vec![event.pin]
+        );
+    }
+
+    #[test]
+    fn purging_a_prefix_event_hides_it_in_every_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        let log = store
+            .session_log(ContextAccess::new("owner", Actor::Operator))
+            .unwrap();
+        log.create_session(OperationId::new(), new("source"), Scope::Personal)
+            .unwrap();
+        let event = log
+            .append(
+                OperationId::new(),
+                event_input("source", "first"),
+                &b"needle"[..],
+            )
+            .unwrap();
+        for name in ["first-fork", "second-fork"] {
+            log.fork_session(OperationId::new(), new(name), origin("source", 1))
+                .unwrap();
+        }
+        log.purge(OperationId::new(), event.pin).unwrap();
+        for name in ["source", "first-fork", "second-fork"] {
+            assert_eq!(
+                log.events(name, 0, 1).unwrap().entries[0].state,
+                RecordState::Purged
+            );
+            assert!(log
+                .search(LogQuery {
+                    session: Some(name.into()),
+                    text: "needle".into(),
+                    max_events: 10,
+                    max_bytes: 100,
+                    limit: 10,
+                    cursor: None
+                })
+                .unwrap()
+                .matches
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn fork_chains_stop_at_64_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        let log = store.session_log(access("owner")).unwrap();
+        log.create_session(OperationId::new(), new("0"), Scope::Personal)
+            .unwrap();
+        for depth in 1..=64 {
+            let source = (depth - 1).to_string();
+            log.append(
+                OperationId::new(),
+                event_input(&source, &format!("event-{source}")),
+                &[][..],
+            )
+            .unwrap();
+            let child = new(&depth.to_string());
+            let result = log.fork_session(OperationId::new(), child, origin(&source, depth));
+            if depth == 64 {
+                assert!(matches!(result, Err(ContextError::ForkTooDeep)));
+                assert!(log
+                    .fork_session(OperationId::new(), new("flattened"), origin(&source, 1))
+                    .is_ok());
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+
     #[test]
     fn update_replaces_metadata_by_expected_revision() {
         let dir = tempfile::tempdir().unwrap();

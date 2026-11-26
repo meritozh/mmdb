@@ -282,6 +282,17 @@ impl SessionLog<'_> {
         session: NewSession,
         scope: Scope,
     ) -> ContextResult<WriteReceipt> {
+        let _guard = self.scoped.lock();
+        self.create_locked(operation, session, scope, None)
+    }
+
+    pub(super) fn create_locked(
+        &self,
+        operation: OperationId,
+        session: NewSession,
+        scope: Scope,
+        origin: Option<SessionOrigin>,
+    ) -> ContextResult<WriteReceipt> {
         let access = self.scoped.access();
         if !matches!(access.actor, Actor::Operator | Actor::System)
             || access
@@ -295,13 +306,11 @@ impl SessionLog<'_> {
         validate_name(&session.kind, "session kind")?;
         validate_metadata(&session.metadata)?;
         self.scoped.check_scope(&scope)?;
-        let _guard = self.scoped.lock();
         if let Some(parent) = &session.parent {
             validate_name(&parent.session, "parent session")?;
             self.scoped
                 .check_scope(&self.session_head(&parent.session)?.scope)?;
         }
-        let origin: Option<SessionOrigin> = None;
         let content = (&session, &scope, &origin);
         let digest = self.scoped.digest("create-session", &content)?;
         let creation = self.scoped.content_digest(&encode(&content)?);
@@ -329,6 +338,10 @@ impl SessionLog<'_> {
                 },
             );
         }
+        let (created, numbers) = match &origin {
+            Some(origin) => self.put_lineage(&mut batch, &session.session, origin)?,
+            None => (0, Numbers::default()),
+        };
         let pin = self.scoped.fresh_pin(RecordKind::Session);
         let now = crate::now_ms();
         let row = ChangeRow {
@@ -365,9 +378,9 @@ impl SessionLog<'_> {
             header: pin.record.clone(),
             scope,
             creation,
-            created: 0,
-            sequence: 0,
-            numbers: Numbers::default(),
+            created,
+            sequence: created,
+            numbers,
             change: 0,
             changed_at_ms: now,
         };
@@ -378,7 +391,7 @@ impl SessionLog<'_> {
             digest,
             WriteReceipt {
                 pin,
-                sequence: Some(0),
+                sequence: Some(created),
             },
         )
     }

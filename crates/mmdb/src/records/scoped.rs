@@ -565,9 +565,18 @@ impl Scoped<'_> {
         domain: &'static str,
         input: &T,
     ) -> ContextResult<[u8; 32]> {
+        self.digest_with_provenance(domain, self.provenance(), input)
+    }
+
+    pub(crate) fn digest_with_provenance<T: Serialize>(
+        &self,
+        domain: &'static str,
+        provenance: Provenance,
+        input: &T,
+    ) -> ContextResult<[u8; 32]> {
         let mut h = self.records.kernel.keyed_hasher("context-operation");
         h.update(domain.as_bytes());
-        h.update(&encode(&(&self.access.owner, self.provenance(), input))?);
+        h.update(&encode(&(&self.access.owner, provenance, input))?);
         Ok(*h.finalize().as_bytes())
     }
 

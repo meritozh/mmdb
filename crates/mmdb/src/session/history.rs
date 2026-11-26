@@ -129,6 +129,7 @@ impl LogGate {
             EventKind::ToolCall { call_id, .. } | EventKind::ToolResult { call_id, .. } => {
                 call = view
                     .call(call_id)?
+                    .map(|found| found.row)
                     .ok_or_else(|| ContextError::Corrupt("missing tool call index".into()))?;
                 if call.purged {
                     return Ok(false);
@@ -142,6 +143,7 @@ impl LogGate {
         };
         let state: MessageState = view
             .message(id)?
+            .map(|found| found.row)
             .ok_or_else(|| ContextError::Corrupt("missing message lifecycle".into()))?;
         Ok(!state.unavailable)
     }
@@ -200,7 +202,7 @@ pub(crate) fn end_interrupted_turns(
 }
 
 impl SessionLog<'_> {
-    fn view<'a>(&'a self, session: &'a str) -> ContextResult<View<'a>> {
+    pub(super) fn view<'a>(&'a self, session: &'a str) -> ContextResult<View<'a>> {
         View::load(self.parts, &self.scoped.access().owner, session)
     }
     /// Appends an exact payload using bounded buffers. No event becomes visible
@@ -214,7 +216,7 @@ impl SessionLog<'_> {
         self.validate_event_input(&input)?;
         let _guard = self.scoped.lock();
         let previous_operation = self.scoped.has_operation(operation)?;
-        let previous_event: Option<StoredEvent> =
+        let previous_event: Option<super::view::Found<StoredEvent>> =
             self.view(&input.session)?.event(&input.event_id)?;
         let session_key = session_key(&self.scoped.access().owner, &input.session);
         let mut head = self.session_head(&input.session)?;
@@ -312,7 +314,7 @@ impl SessionLog<'_> {
         operation: OperationId,
         input: EventInput,
         payload: R,
-        previous_event: Option<StoredEvent>,
+        previous_event: Option<super::view::Found<StoredEvent>>,
     ) -> ContextResult<WriteReceipt> {
         let streamed = self.scoped.stream_payload(payload, None)?;
         let digest = self.append_digest(&input, &streamed.descriptor)?;
@@ -320,11 +322,27 @@ impl SessionLog<'_> {
             return Ok(receipt);
         }
         let previous = previous_event.ok_or(ContextError::IdempotencyConflict)?;
+        let mut provenance = self.scoped.provenance();
+        if provenance.session.as_ref() == Some(&input.session) {
+            provenance.session = Some(previous.session.clone());
+        }
         let event_input = EventInput {
+            session: previous.session,
             expected_sequence: None,
             ..input
         };
-        if previous.digest != self.event_digest(&event_input, &streamed.descriptor)? {
+        let previous = previous.row;
+        if previous.digest
+            != self.scoped.digest_with_provenance(
+                "history-event",
+                provenance,
+                &(
+                    &event_input,
+                    streamed.descriptor.bytes,
+                    streamed.descriptor.digest,
+                ),
+            )?
+        {
             return Err(ContextError::IdempotencyConflict);
         }
         self.scoped.header_locked(&previous.receipt.pin)?;
@@ -676,7 +694,10 @@ impl SessionLog<'_> {
         let Some(message_id) = turns::assistant_message_id(kind) else {
             return Ok(None);
         };
-        let previous = self.view(session)?.message(message_id)?;
+        let previous = self
+            .view(session)?
+            .message(message_id)?
+            .map(|found| found.row);
         turns::message_transition(kind, previous, stamp, position).map(Some)
     }
 
@@ -697,7 +718,10 @@ impl SessionLog<'_> {
         if let Some(head) = head {
             self.scoped.check_scope(&head.scope)?;
         }
-        self.view(session)?.message(message_id)
+        Ok(self
+            .view(session)?
+            .message(message_id)?
+            .map(|found| found.row))
     }
 
     pub(crate) fn event_anchor_locked(
@@ -714,7 +738,7 @@ impl SessionLog<'_> {
     }
 
     fn call_index(&self, session: &str, call_id: &str) -> ContextResult<Option<ToolCallIndex>> {
-        self.view(session)?.call(call_id)
+        Ok(self.view(session)?.call(call_id)?.map(|found| found.row))
     }
 
     fn indexed_call(&self, session: &str, call_id: &str) -> ContextResult<ToolCallIndex> {
@@ -745,10 +769,16 @@ impl SessionLog<'_> {
             }
             _ => return Ok(()),
         };
-        let key = identity_key(&self.scoped.access().owner, &event.session, id);
-        let mut state: MessageState = self
-            .view(&event.session)?
+        let view = self.view(&event.session)?;
+        let overlay = view
             .message(id)?
+            .ok_or_else(|| ContextError::Corrupt("missing message lifecycle".into()))?;
+        let holder = view.holder(overlay.row.started);
+        let key = identity_key(&self.scoped.access().owner, holder, id);
+        let mut state: MessageState = self
+            .view(holder)?
+            .message(id)?
+            .map(|found| found.row)
             .ok_or_else(|| ContextError::Corrupt("missing message lifecycle".into()))?;
         state.unavailable = true;
         batch.insert(&self.parts.messages, key, encode(&state)?);
@@ -769,6 +799,7 @@ impl SessionLog<'_> {
                     let state: MessageState = self
                         .view(&input.session)?
                         .message(message_id)?
+                        .map(|found| found.row)
                         .ok_or_else(|| {
                             ContextError::InvalidInput(
                                 "tool references an unknown assistant message".into(),
@@ -834,7 +865,7 @@ impl SessionLog<'_> {
         let result = self
             .view(session)?
             .result(call_id)?
-            .map(|result| self.scoped.head_locked(&result.record))
+            .map(|result| self.scoped.head_locked(&result.row.record))
             .transpose()?;
         Ok((call, result))
     }
