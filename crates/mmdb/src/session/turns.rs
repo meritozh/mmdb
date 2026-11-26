@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct OpenTurn {
+    pub start: u64,
     pub owner: String,
     pub session: String,
     pub number: u64,

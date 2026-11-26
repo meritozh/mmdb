@@ -5,6 +5,7 @@ mod history;
 mod search;
 mod turns;
 mod types;
+mod view;
 
 use crate::records::codec::{owner_key, segment};
 pub use crate::records::RecoveryReport;

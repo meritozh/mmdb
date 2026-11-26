@@ -11,7 +11,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const STORE_FORMAT_ID: &str = "mmdb-store-v3";
+pub const STORE_FORMAT_ID: &str = "mmdb-store-v4";
 const SESSION: ModuleId = StoreModule::Session.id();
 const MEMORY: ModuleId = StoreModule::Memory.id();
 

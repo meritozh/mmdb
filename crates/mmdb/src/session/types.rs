@@ -4,6 +4,7 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageState {
+    pub started: u64,
     pub next_fragment: u64,
     pub terminal: Option<MessageStatus>,
     /// A withdrawn fragment also invalidates aggregate copies of the message.

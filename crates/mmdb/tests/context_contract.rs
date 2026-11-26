@@ -1072,6 +1072,7 @@ fn format_and_store_identity_prevent_accidental_adoption() {
         "mmdb-store-dev11",
         "mmdb-store-v1",
         "mmdb-store-v2",
+        "mmdb-store-v3",
     ] {
         let legacy = dir.path().join(legacy_format);
         std::fs::create_dir(&legacy).unwrap();

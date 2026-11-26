@@ -80,15 +80,12 @@ impl SessionLog<'_> {
             bytes_examined: 0,
             events_examined: 0,
         };
-        for entry in self.parts.order.range(start.clone()..) {
-            let (key, reference) = entry?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
+        for entry in super::view::scan(self.parts, prefix, start) {
+            let (key, entry) = entry?;
             let mut offset = query
                 .cursor
                 .as_ref()
-                .filter(|cursor| cursor.key.as_slice() == key.as_ref())
+                .filter(|cursor| cursor.key.as_slice() == key.as_slice())
                 .map_or(0, |cursor| cursor.offset);
             if result.events_examined == query.max_events || result.matches.len() == query.limit {
                 result.cursor = Some(LogSearchCursor {
@@ -99,7 +96,7 @@ impl SessionLog<'_> {
                 return Ok(result);
             }
             result.events_examined += 1;
-            let header = match self.scoped.head_locked(&decode(&reference)?) {
+            let header = match self.scoped.head_locked(&entry.record) {
                 Ok(header) => header,
                 Err(ContextError::AccessDenied) => continue,
                 Err(error) => return Err(error),

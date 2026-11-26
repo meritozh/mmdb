@@ -1,4 +1,5 @@
 use super::turns::{self, Change, Numbers, OpenStep, OpenTurn, Owed, TurnState};
+use super::view::{identity_key, OrderEntry, ResultIndex, ToolCallIndex, View};
 use super::*;
 use crate::records::codec::*;
 use crate::{Actor, OperationId, RecordState, Scope, TemporalFacts};
@@ -50,19 +51,6 @@ impl NewEvent {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct ToolCallIndex {
-    record: ContextRef,
-    message_id: Option<String>,
-    purged: bool,
-}
-
-fn identity_key(owner: &str, session: &str, identity: &str) -> Vec<u8> {
-    let mut key = session_key(owner, session);
-    segment(&mut key, identity.as_bytes());
-    key
-}
-
 impl Owed {
     const TERMINAL: u8 = 0;
     const RESULT: u8 = 1;
@@ -112,15 +100,13 @@ fn assistant_message_id(kind: &EventKind) -> Option<&str> {
 }
 
 pub(crate) struct LogGate {
-    calls: mmdb_kernel::Partition,
-    messages: mmdb_kernel::Partition,
+    parts: SessionParts,
 }
 
 impl LogGate {
     pub(crate) fn open(session: &mmdb_kernel::EraPartitions) -> mmdb_kernel::KernelResult<Self> {
         Ok(Self {
-            calls: session.partition(CALLS)?,
-            messages: session.partition(MESSAGES)?,
+            parts: SessionParts::open(session)?,
         })
     }
 }
@@ -149,13 +135,15 @@ impl crate::records::Gate for LogGate {
 
 impl LogGate {
     fn message_available_locked(&self, owner: &str, event: &LogEvent) -> ContextResult<bool> {
+        let view = View::load(&self.parts, owner, &event.session)?;
         let call;
         let id = match &event.kind {
             EventKind::AssistantStarted { message_id }
             | EventKind::AssistantFragment { message_id, .. }
             | EventKind::AssistantTerminal { message_id, .. } => message_id,
             EventKind::ToolCall { call_id, .. } | EventKind::ToolResult { call_id, .. } => {
-                call = load_call(&self.calls, owner, &event.session, call_id)?
+                call = view
+                    .call(call_id)?
                     .ok_or_else(|| ContextError::Corrupt("missing tool call index".into()))?;
                 if call.purged {
                     return Ok(false);
@@ -167,26 +155,11 @@ impl LogGate {
             }
             _ => return Ok(true),
         };
-        let state: MessageState = self
-            .messages
-            .get(identity_key(owner, &event.session, id))?
-            .map(|bytes| decode(&bytes))
-            .transpose()?
+        let state: MessageState = view
+            .message(id)?
             .ok_or_else(|| ContextError::Corrupt("missing message lifecycle".into()))?;
         Ok(!state.unavailable)
     }
-}
-
-fn load_call(
-    calls: &mmdb_kernel::Partition,
-    owner: &str,
-    session: &str,
-    call_id: &str,
-) -> ContextResult<Option<ToolCallIndex>> {
-    calls
-        .get(identity_key(owner, session, call_id))?
-        .map(|bytes| decode(&bytes))
-        .transpose()
 }
 
 /// End every turn left open by the previous lease holder in one batch.
@@ -240,6 +213,9 @@ pub(crate) fn end_interrupted_turns(
 }
 
 impl SessionLog<'_> {
+    fn view<'a>(&'a self, session: &'a str) -> ContextResult<View<'a>> {
+        View::load(self.parts, &self.scoped.access().owner, session)
+    }
     /// Enumerate sessions without relying on an application projection.
     /// This recovery catalog requires trusted harness authority.
     pub fn sessions(&self, limit: usize, after: Option<&str>) -> ContextResult<SessionPage> {
@@ -309,14 +285,9 @@ impl SessionLog<'_> {
     ) -> ContextResult<WriteReceipt> {
         self.validate_event_input(&input)?;
         let _guard = self.scoped.lock();
-        let event_key = identity_key(&self.scoped.access().owner, &input.session, &input.event_id);
         let previous_operation = self.scoped.has_operation(operation)?;
-        let previous_event: Option<StoredEvent> = self
-            .parts
-            .events
-            .get(&event_key)?
-            .map(|bytes| decode(&bytes))
-            .transpose()?;
+        let previous_event: Option<StoredEvent> =
+            self.view(&input.session)?.event(&input.event_id)?;
         let session_key = session_key(&self.scoped.access().owner, &input.session);
         let head: Option<SessionHead> = self
             .parts
@@ -361,6 +332,15 @@ impl SessionLog<'_> {
         )
         .map_err(ContextError::Turn)?;
         let mut batch = self.scoped.batch();
+        let next = head
+            .sequence
+            .checked_add(1)
+            .ok_or(ContextError::BudgetExceeded)?;
+        let open_start = match &admitted.change {
+            Change::StartTurn { .. } => Some(next),
+            Change::EndTurn(_) => None,
+            _ => state.open.as_ref().map(|turn| turn.start),
+        };
         self.put_turn_change(
             &mut batch,
             &mut head,
@@ -376,7 +356,7 @@ impl SessionLog<'_> {
             answers.as_ref(),
             reserve,
         )?;
-        let message = self.message_transition(&input.session, &input.kind, admitted.stamp)?;
+        let message = self.message_transition(&input.session, &input.kind, admitted.stamp, next)?;
         let pin = self.scoped.fresh_pin(RecordKind::Event);
         let streamed = self
             .scoped
@@ -404,7 +384,7 @@ impl SessionLog<'_> {
             message,
             turn: admitted.stamp,
         };
-        let receipt = self.put_event(&mut batch, &mut head, event)?;
+        let receipt = self.put_event(&mut batch, &mut head, event, open_start)?;
         batch.insert(&self.parts.heads, session_key, encode(&head)?);
         streamed.publish(&mut batch);
         self.scoped
@@ -516,6 +496,10 @@ impl SessionLog<'_> {
             Change::StartTurn { number, run } => {
                 head.numbers.turns = number;
                 OpenTurn {
+                    start: head
+                        .sequence
+                        .checked_add(1)
+                        .ok_or(ContextError::BudgetExceeded)?,
                     owner: self.scoped.access().owner.clone(),
                     session: input.session.clone(),
                     number,
@@ -588,7 +572,14 @@ impl SessionLog<'_> {
                 _ => (Vec::new(), Vec::new()),
             };
             let stamp = Some(event.stamp);
-            let message = self.message_transition(&turn.session, &event.kind, stamp)?;
+            let message = self.message_transition(
+                &turn.session,
+                &event.kind,
+                stamp,
+                head.sequence
+                    .checked_add(1)
+                    .ok_or(ContextError::BudgetExceeded)?,
+            )?;
             let new_event = NewEvent {
                 session: turn.session.clone(),
                 event_id: event.event_id,
@@ -610,7 +601,9 @@ impl SessionLog<'_> {
                 message,
                 turn: stamp,
             };
-            self.put_event(batch, head, new_event)?;
+            let open_start =
+                (!matches!(new_event.kind, EventKind::TurnEnded { .. })).then_some(turn.start);
+            self.put_event(batch, head, new_event, open_start)?;
         }
         Ok(())
     }
@@ -629,6 +622,7 @@ impl SessionLog<'_> {
         batch: &mut mmdb_kernel::Batch,
         head: &mut SessionHead,
         event: NewEvent,
+        open_turn: Option<u64>,
     ) -> ContextResult<WriteReceipt> {
         let sequence = head
             .sequence
@@ -642,7 +636,15 @@ impl SessionLog<'_> {
         };
         let mut order_key = session_key(owner, &event.session);
         order_key.extend_from_slice(&sequence.to_be_bytes());
-        batch.insert(&self.parts.order, order_key, encode(&event.pin.record)?);
+        batch.insert(
+            &self.parts.order,
+            order_key,
+            encode(&OrderEntry {
+                record: event.pin.record.clone(),
+                numbers: head.numbers,
+                open_turn,
+            })?,
+        );
         batch.insert(
             &self.parts.events,
             identity_key(owner, &event.session, &event.event_id),
@@ -664,6 +666,7 @@ impl SessionLog<'_> {
                 &self.parts.calls,
                 identity_key(owner, &event.session, call_id),
                 encode(&ToolCallIndex {
+                    sequence,
                     record: event.pin.record.clone(),
                     message_id: message_id.clone(),
                     purged: false,
@@ -672,7 +675,10 @@ impl SessionLog<'_> {
             EventKind::ToolResult { call_id, .. } => batch.insert(
                 &self.parts.results,
                 identity_key(owner, &event.session, call_id),
-                encode(&event.pin.record)?,
+                encode(&ResultIndex {
+                    record: event.pin.record.clone(),
+                    sequence,
+                })?,
             ),
             _ => {}
         }
@@ -775,19 +781,15 @@ impl SessionLog<'_> {
         session: &str,
         kind: &EventKind,
         stamp: Option<TurnStamp>,
+        position: u64,
     ) -> ContextResult<Option<MessageState>> {
         let Some(message_id) = assistant_message_id(kind) else {
             return Ok(None);
         };
-        let key = identity_key(&self.scoped.access().owner, session, message_id);
-        let previous: Option<MessageState> = self
-            .parts
-            .messages
-            .get(&key)?
-            .map(|bytes| decode(&bytes))
-            .transpose()?;
+        let previous = self.view(session)?.message(message_id)?;
         let state = match (kind, previous) {
             (EventKind::AssistantStarted { .. }, None) => MessageState {
+                started: position,
                 next_fragment: 0,
                 terminal: None,
                 unavailable: false,
@@ -836,15 +838,7 @@ impl SessionLog<'_> {
         if let Some(head) = head {
             self.scoped.check_scope(&head.scope)?;
         }
-        self.parts
-            .messages
-            .get(identity_key(
-                &self.scoped.access().owner,
-                session,
-                message_id,
-            ))?
-            .map(|bytes| decode(&bytes))
-            .transpose()
+        self.view(session)?.message(message_id)
     }
 
     pub(crate) fn event_anchor_locked(
@@ -852,23 +846,16 @@ impl SessionLog<'_> {
         session: &str,
         sequence: u64,
     ) -> ContextResult<RecordHeader> {
-        let mut key = session_key(&self.scoped.access().owner, session);
-        key.extend_from_slice(&sequence.to_be_bytes());
-        let record = self.parts.order.get(key)?.ok_or_else(|| {
+        let entry = self.view(session)?.entry(sequence)?.ok_or_else(|| {
             ContextError::InvalidInput(
                 "checkpoint session log position has not been committed".into(),
             )
         })?;
-        self.scoped.head_locked(&decode(&record)?)
+        self.scoped.head_locked(&entry.record)
     }
 
     fn call_index(&self, session: &str, call_id: &str) -> ContextResult<Option<ToolCallIndex>> {
-        load_call(
-            &self.parts.calls,
-            &self.scoped.access().owner,
-            session,
-            call_id,
-        )
+        self.view(session)?.call(call_id)
     }
 
     fn indexed_call(&self, session: &str, call_id: &str) -> ContextResult<ToolCallIndex> {
@@ -901,11 +888,8 @@ impl SessionLog<'_> {
         };
         let key = identity_key(&self.scoped.access().owner, &event.session, id);
         let mut state: MessageState = self
-            .parts
-            .messages
-            .get(&key)?
-            .map(|bytes| decode(&bytes))
-            .transpose()?
+            .view(&event.session)?
+            .message(id)?
             .ok_or_else(|| ContextError::Corrupt("missing message lifecycle".into()))?;
         state.unavailable = true;
         batch.insert(&self.parts.messages, key, encode(&state)?);
@@ -924,15 +908,8 @@ impl SessionLog<'_> {
             } => {
                 let step = if let Some(message_id) = message_id {
                     let state: MessageState = self
-                        .parts
-                        .messages
-                        .get(identity_key(
-                            &self.scoped.access().owner,
-                            &input.session,
-                            message_id,
-                        ))?
-                        .map(|bytes| decode(&bytes))
-                        .transpose()?
+                        .view(&input.session)?
+                        .message(message_id)?
                         .ok_or_else(|| {
                             ContextError::InvalidInput(
                                 "tool references an unknown assistant message".into(),
@@ -947,11 +924,7 @@ impl SessionLog<'_> {
                 } else {
                     None
                 };
-                if self.parts.calls.contains_key(identity_key(
-                    &self.scoped.access().owner,
-                    &input.session,
-                    call_id,
-                ))? {
+                if self.call_index(&input.session, call_id)?.is_some() {
                     return Err(ContextError::IdempotencyConflict);
                 }
                 Ok((step, None))
@@ -995,16 +968,14 @@ impl SessionLog<'_> {
         validate_name(session, "session")?;
         validate_name(call_id, "tool call identity")?;
         let _guard = self.scoped.lock();
-        let key = identity_key(&self.scoped.access().owner, session, call_id);
         let call = self
             .call_index(session, call_id)?
             .map(|call| self.scoped.head_locked(&call.record))
             .transpose()?;
         let result = self
-            .parts
-            .results
-            .get(&key)?
-            .map(|bytes| self.scoped.head_locked(&decode(&bytes)?))
+            .view(session)?
+            .result(call_id)?
+            .map(|result| self.scoped.head_locked(&result.record))
             .transpose()?;
         Ok((call, result))
     }
@@ -1022,18 +993,9 @@ impl SessionLog<'_> {
             ));
         }
         let _guard = self.scoped.lock();
-        let prefix = session_key(&self.scoped.access().owner, session);
-        let mut start = prefix.clone();
-        start.extend_from_slice(&after_sequence.to_be_bytes());
         let mut entries = Vec::new();
-        for entry in self.parts.order.range(start.clone()..) {
-            let (key, reference) = entry?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            if key.as_ref() == start {
-                continue;
-            }
+        for row in self.view(session)?.entries_after(after_sequence) {
+            let (_, entry) = row?;
             if entries.len() == limit {
                 let next_sequence = entries.last().and_then(|header: &RecordHeader| {
                     header.event.as_ref().map(|event| event.sequence)
@@ -1043,7 +1005,7 @@ impl SessionLog<'_> {
                     next_sequence,
                 });
             }
-            let header = self.scoped.head_locked(&decode(&reference)?)?;
+            let header = self.scoped.head_locked(&entry.record)?;
             entries.push(header);
         }
         Ok(EventPage {
