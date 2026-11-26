@@ -1,6 +1,6 @@
 # 会话头、会话列表与 fork: implement spec
 
-Feature: `docs/feature/sessions.md` @ `e0705ac95f03ce9dbdc9b283e37daef51ed838a2`
+Feature: `docs/feature/sessions.md` @ `1961656feddaeeb82d20e88010280bf3e249cf99`
 
 This spec is open until the feature ships, and `/go-work` carries it out. Do not edit it while working it; only `to-implement-spec` changes it. Before work starts or resumes, check that the hash above still matches `git hash-object docs/feature/sessions.md`; if it does not, the feature changed, so stop and rerun `to-implement-spec`. Each step is one commit whose message ends with the trailer `Spec-Step: sessions#<n>`. The commit that lands the last step sets the feature doc's Status to `shipped` and moves this file to `docs/spec/archived/<YYYY-MM-DD>-sessions.md` with `git mv`, dated that day. Nothing reads an archived spec again.
 
@@ -30,7 +30,7 @@ This spec is open until the feature ships, and `/go-work` carries it out. Do not
 | Fails: 违规调用被拒绝且不写入 | `session::catalog`, `session::fork` | `sessions::refused_creates_and_forks_write_nothing` |
 | Fails: 同一操作同内容重试返回原回执；同名不同内容冲突 | `session::catalog`, `session::fork` | `sessions::create_and_fork_retries_return_the_original_receipt` |
 | Fails: fork 整体提交，中途退出则没有发生 | `session::fork` | `session::fork::tests::a_lost_fork_commit_leaves_no_session` |
-| Fails: 追加前缀中已有的事件 ID，同内容取回原回执，不同内容冲突 | `session::history` | `sessions::prefix_event_identities_are_taken_in_the_fork` |
+| Fails: 追加前缀中已有的事件 ID，除所指的会话外同内容取回原回执，否则冲突 | `session::history` | `sessions::prefix_event_identities_are_taken_in_the_fork` |
 | Fails: `update_session` 预期修订不符时不改变 | `session::catalog` | `sessions::update_replaces_metadata_by_expected_revision` |
 | Fails: 前缀中已撤回或清除的事件在 fork 里保持状态 | `session::view` | `sessions::withdrawn_prefix_events_keep_their_state_in_a_fork` |
 | Fails: 之前格式的存储打开时被拒绝 | `store` (`STORE_FORMAT_ID`) | `context_contract::format_and_store_identity_prevent_accidental_adoption` |
@@ -95,7 +95,7 @@ pub enum ContextError {
 ```
 
 - Invariants: `RecordKind::Session.module()` is `StoreModule::Session`. A header record has `session: Some(_)`, empty sources, and the session's scope as its record scope. Only its current revision row exists.
-- Errors: `header_locked` for a pin whose revision row is gone while the head revision is higher returns `RevisionConflict { expected: pin.revision, actual: head }`. `validate_sources` and `validate_copy_sources` refuse a `RecordKind::Session` pin with `InvalidInput`, as they refuse type definitions today.
+- Errors: `header_locked` for a pin whose revision row is gone while the head revision is higher returns `RevisionConflict { expected: pin.revision, actual: head }`. `validate_sources` refuses a `RecordKind::Session` pin with `InvalidInput`, beside its type-definition check. `validate_copy_sources` gets its own `RecordKind::Session` check and keeps accepting type definitions, which original snapshots copy. `session_headers_are_not_sources` drives both paths through public writers: an object, a relation and a checkpoint citing a header pin, and an append whose sources include one.
 
 ### `session::catalog` (new)
 
@@ -151,13 +151,13 @@ impl SessionLog<'_> {
 }
 ```
 
-- Invariants: every write to `session_heads_v1` goes through `Changes::put_head`, which gives the session the owner's next change number, moves its `session_changes_v1` row and sets `changed_at_ms`. A change number is greater than every number the owner has used, so none is reused. `SessionHead.scope` equals the header record's scope; both are written once, in the creating batch.
+- Invariants: every write to `session_heads_v1` goes through `Changes::put_head`, which gives the session the owner's next change number, moves its `session_changes_v1` row and sets `changed_at_ms`. A change number is greater than every number the owner has used, so none is reused. `SessionHead.scope`, which equals the header record's scope, and `SessionHead.created` are written once, in the creating batch.
 - Ordering: `create_session` and `fork_session` write the header record, `SessionHead` and change row in one batch before any event of the session exists. `append`, the turn closings at `Store::open`, and `retract`/`purge` of an event put the head of the event's own session in the batch that writes the event or state.
 - Errors: `AccessDenied` when the actor is not System or Operator, a bound `access.session` differs from `NewSession.session`, or the reader lacks the session's, the parent's or the source's scope. `UnknownSession` for a missing parent, `session()` of a missing session, and `append` to a session without a header. `InvalidInput` for a name outside 1..=256 bytes or with control characters, metadata over 4 KiB encoded, a limit outside 1..=100, and `retract`/`purge` of a session header. `IdempotencyConflict` for an existing session whose creation content differs, or a reused operation. `RevisionConflict` for a stale `expected` in `update_session`.
 - Configuration: none.
 - Performance: `session` is a few point reads. `sessions` examines at most 4,096 change rows a page and reads the header and head of each match. Every write adds one reverse seek, one delete and one insert in `session_changes_v1`.
 
-Behind the seam: the header record, `SessionHead` and the change index stay private. Creation identity is a digest of `(NewSession, scope, origin)` kept in `SessionHead`; a create or fork with the same session name and the same digest returns the creation receipt `{ pin: revision 1, sequence: position after creation }` even under another operation. `update_session` writes revision n+1, removes revision n's header row and returns `{ pin: n+1, sequence: position }`. `Changes` caches the next number per owner for one batch, so `Store::open` can close turns of many sessions in one commit. A change row holds `{ session, kind, parent session }` so filters do not read headers.
+Behind the seam: the header record, `SessionHead` and the change index stay private. Creation identity is a digest of `(NewSession, scope, origin)` kept in `SessionHead.creation`. `SessionHead.created` is the session's position after its creating batch: 0 for a create, P plus the closing events for a fork. A create or fork with the same session name and the same digest returns the creation receipt `{ pin: revision 1, sequence: Some(created) }`, even under another operation and after later appends. `update_session` writes revision n+1, removes revision n's header row and returns `{ pin: n+1, sequence: position }`. `Changes` caches the next number per owner for one batch, so `Store::open` can close turns of many sessions in one commit. A change row holds `{ session, kind, parent session }` so filters do not read headers.
 
 Call site:
 
@@ -204,7 +204,7 @@ impl SessionLog<'_> {
 - Errors: as `create_session`, plus `UnknownSession` for a missing source, `InvalidInput` for position 0, `PositionConflict { expected: P, actual: source position }` for P past the source's position, and `ForkTooDeep` past 64 sessions.
 - Performance: reads the order entry at P; when a turn is open at P, reads the order entries and headers from that turn's `TurnStarted` to P. Never reads the rest of the prefix.
 
-Behind the seam: the turn open at P is found from the order entry at P (`open_turn`), the turn is rebuilt by `turns::replay` from its events, and `turns::close` gives the closing events. Messages that are unterminated at P get an overlay row in the fork (`next_fragment` as of P, terminal Interrupted, `started` unchanged); results for owed calls take the call as their source through `View::call`. The receipt is `{ pin: header revision 1, sequence: position after the closings }`.
+Behind the seam: the turn open at P is found from the order entry at P (`open_turn`), the turn is rebuilt by `turns::replay` from its events, and `turns::close` gives the closing events. Messages that are unterminated at P get an overlay row in the fork (`next_fragment` as of P, terminal Interrupted, `started` unchanged); results for owed calls take the call as their source through `View::call`. The receipt is `{ pin: header revision 1, sequence: Some(created) }`, where `created` is the position after the closings.
 
 Call site:
 
@@ -219,6 +219,14 @@ let receipt = system.fork_session(OperationId::new(), NewSession {
 }, SessionOrigin { session: "chat-7".into(), position })?;
 // The child's own turn starts after receipt.sequence.
 ```
+
+### `session::history` (changed)
+
+`append`, `retract` and `purge` keep their signatures.
+
+- Errors: `UnknownSession` when the session has no `SessionHead`. When `View::event` finds the event ID in an ancestor segment, the retry is compared as if addressed to `Found.session`. The event digest is computed over the input with `session` set to `Found.session`, and with the provenance session set to it as well when the access binds the fork. Every other field must match: kind, payload, sources, scope, `occurred_at_ms`, actor, agent and run. A match returns the stored receipt; anything else is `IdempotencyConflict`.
+
+Behind the seam: only the content comparison is rebased. The operation receipt stays bound to the digest of the request as sent, naming the fork, so a reuse of that operation with other content still conflicts.
 
 ### `session::view` (new, crate-internal)
 
@@ -257,8 +265,12 @@ Behind the seam: `fork_ancestors` flattens. When `position` falls in an inherite
 ### `session::turns` (changed)
 
 ```rust
+/// The session that holds a turn being started or rebuilt.
+#[derive(Clone, Copy)]
+pub(super) struct TurnHolder<'a> { pub owner: &'a str, pub session: &'a str }
+
 /// The state change `admit` decided, applied in memory. Owed rows are the caller's.
-pub(super) fn apply(state: TurnState, change: &Change, event_id: &str, position: u64)
+pub(super) fn apply(state: TurnState, change: &Change, holder: TurnHolder<'_>, event_id: &str, position: u64)
     -> ContextResult<TurnState>;
 
 pub(super) struct Replayed<'a> { pub position: u64, pub event_id: &'a str, pub kind: &'a EventKind, pub stamp: Option<TurnStamp>, pub run: Option<&'a str> }
@@ -271,11 +283,12 @@ pub(super) struct Replay {
     pub open_messages: BTreeMap<String, MessageState>,
 }
 
-/// Rebuilds the turn open after the last event from events that start at its TurnStarted.
-pub(super) fn replay<'a>(events: impl IntoIterator<Item = Replayed<'a>>) -> ContextResult<Replay>;
+/// Rebuilds, as held by `holder`, the turn open after the last event from events that start at its TurnStarted.
+pub(super) fn replay<'a>(holder: TurnHolder<'_>, events: impl IntoIterator<Item = Replayed<'a>>)
+    -> ContextResult<Replay>;
 ```
 
-- Invariants: for any admitted sequence of events, `replay` of the turn's events up to position k equals the `OpenTurn` and owed rows the live log held after position k. `OpenTurn` records `start: u64`, the position of its `TurnStarted`.
+- Invariants: for any admitted sequence of events, `replay` with the source as holder, of the turn's events up to position k, equals the `OpenTurn` and owed rows the live log held after position k. `OpenTurn` records `start: u64`, the position of its `TurnStarted`. A live append passes the appending session as holder; `fork_session` passes the fork, so the turn it closes, its closing events and their call lookups all belong to the fork, and the source's open-turn and owed rows are never written.
 - Errors: `Corrupt` when the events do not start with `TurnStarted` or contradict admission.
 - Performance: linear in the events given; no I/O.
 
@@ -285,12 +298,15 @@ Behind the seam: `put_turn_change` uses `turns::apply` instead of building turns
 
 - Stored:
   - Session header record: `RecordKind::Session` in the session module's record table, `RecordHeader { session: Some(SessionHeader), scope, sources: [], .. }`, metadata inline. Only the current revision row is kept. Writer: `session::catalog` and `session::fork`.
-  - `session_heads_v1`: `SessionHead { header: ContextRef, scope, creation: [u8; 32], sequence, numbers, change, changed_at_ms }`. Writer: `Changes::put_head`.
+  - `session_heads_v1`: `SessionHead { header: ContextRef, scope, creation: [u8; 32], created: u64, sequence, numbers, change, changed_at_ms }`. Writer: `Changes::put_head`.
   - `session_changes_v1` (new): key `(owner, change as big-endian u64)`, value `{ session, kind, parent: Option<String> }`, one row per session. Writer: `Changes::put_head`.
   - `session_lineage_v1` (new): key `(owner, session)`, value `Vec<Segment>`, only for forks, written once. Writer: `session::fork`.
   - `session_order_v1`: value becomes `OrderEntry { record: ContextRef, numbers: Numbers, open_turn: Option<u64> }`, the counters and the open turn's start position after the event. Writer: `history::put_event`.
   - `session_tool_calls_v1`: `ToolCallIndex` gains `sequence`. `session_tool_results_v1`: value becomes `ResultIndex { record, sequence }`. `session_messages_v1`: `MessageState` gains `pub started: u64`; a fork holds overlay rows for messages it closed. Writer: `history` (and `fork` for overlays).
-- Existing records: reset (status `startup`). `STORE_FORMAT_ID` becomes `mmdb-store-v4` in step 1, and `Store::open` refuses `mmdb-store-v3` stores, which need a whole-store reset. Later steps change session rows again before the feature ships; a store made at an intermediate commit is reset, not migrated.
+- Existing records: reset (status `startup`). A step that changes what a stored row holds, or must hold, sets a new `STORE_FORMAT_ID` and refuses the earlier ones, so `Store::open` turns away a store made at an earlier step and it needs a whole-store reset:
+  - Step 1 sets `mmdb-store-v4`: rows carry positions. It refuses `mmdb-store-v3`.
+  - Step 3 sets `mmdb-store-v5`: headers are required, and `SessionHead` gains change numbers and `created`. It refuses `mmdb-store-v4`.
+  - Steps 4–7 add no shape that an earlier `mmdb-store-v5` store lacks. The kernel checks only module names on open, so the new `session_lineage_v1` partition needs no new ID, and a store without lineage rows holds no forks.
 
 ## Dependencies
 
@@ -303,16 +319,16 @@ No new seam.
 
 ## Steps
 
-1. Record each session log row's position: order rows carry `OrderEntry`, call, result and message rows carry their sequence, `OpenTurn` records its start position, and `View` (one segment) serves every identity read in `history`, `checkpoints`, `search` and `LogGate`. Store format becomes `mmdb-store-v4`; apart from refusing `mmdb-store-v3` stores, no behavior changes. After: none. Check: `cargo test --workspace --locked`
-2. Move turn bookkeeping into `turns::apply` and `turns::replay`; `put_turn_end` takes the owed items. Add `replay_matches_live_turn_state`, which appends turns with steps, messages, direct calls and results, and compares `replay` at every position with the live state. After: 1. Check: `cargo test --workspace --locked`
-3. Add session headers and require them: `RecordKind::Session`, `RecordHeader.session`, `create_session`, `session`, `SessionHead` with change numbers, `session_changes_v1` and `Changes::put_head` on every head write, `UnknownSession` for appends without a header. Refuse `retract`/`purge` of headers and headers as sources. Create sessions in every test, `context/tests.rs`, `src/tests` and example before they append. After: 2. Check: `cargo test --workspace --locked`
+1. Record each session log row's position: order rows carry `OrderEntry`, call, result and message rows carry their sequence, `OpenTurn` records its start position, and `View` (one segment) serves every identity read in `history`, `checkpoints`, `search` and `LogGate`. Store format becomes `mmdb-store-v4`: add `mmdb-store-v3` to the refused formats in `context_contract::format_and_store_identity_prevent_accidental_adoption`, and update the constant assertion in `native_memory::tests::fresh_store_gets_a_stable_era_and_foreign_roots_are_refused`. Apart from refusing `mmdb-store-v3` stores, no behavior changes. After: none. Check: `cargo test --workspace --locked`
+2. Move turn bookkeeping into `turns::apply` and `turns::replay`, both taking a `TurnHolder`; `put_turn_end` takes the owed items. Add `replay_matches_live_turn_state`, which appends turns with steps, messages, direct calls and results, and compares `replay`, with the session as holder, at every position with the live state. After: 1. Check: `cargo test --workspace --locked`
+3. Add session headers and require them: `RecordKind::Session`, `RecordHeader.session`, `create_session`, `session`, `SessionHead` with change numbers, `creation` and `created`, `session_changes_v1` and `Changes::put_head` on every head write, `UnknownSession` for appends without a header. Refuse `retract`/`purge` of headers, and headers as sources in both `validate_sources` and `validate_copy_sources`. Store format becomes `mmdb-store-v5`: add `mmdb-store-v4` to the refused formats and update the constant assertion again. Create sessions in every test, `context/tests.rs`, `src/tests` and example before they append. After: 2. Check: `cargo test --workspace --locked`
 4. Replace the session catalog with `sessions(SessionQuery)`: newest change first, `before` cursor, kind and parent filters, reader scope, the 4,096-row scan bound. Move the catalog paging assertions out of `copied_history_tracks_source_availability_and_session_catalog_pages`. After: 3. Check: `cargo test --workspace --locked`
 5. Add `update_session`: replace metadata by expected revision, keep only the current header revision, read older pins as `RevisionConflict`. After: 4. Check: `cargo test --workspace --locked`
-6. Fork at positions outside a turn: `session_lineage_v1`, multi-segment `View` with `fork_ancestors` and the 64-session bound, `fork_session` validation, receipts and retries, prefix identities taken in the fork, availability and withdrawal through the row where a message or call started, `events`, `search`, `tool_pair`, `message_state` and checkpoint anchors over the whole log. A fork at a position inside a turn returns `Turn(TurnOpen)` until step 7. After: 5. Check: `cargo test --workspace --locked`
-7. Close the cut turn: a fork at a position inside a turn replays it, writes overlay message rows and the closing events ending with Forked in its batch, and leaves the source untouched. Add `a_fork_never_sees_source_writes_after_the_cut`, `forking_reads_only_the_cut_turn` and `a_lost_fork_commit_leaves_no_session`. Show create, list and fork in `examples/context_harness.rs`. Set `docs/feature/sessions.md` and `docs/feature/session-log.md` to `shipped`, and archive this spec. After: 6. Check: `cargo test --workspace --locked`
+6. Fork at positions outside a turn: `session_lineage_v1`, multi-segment `View` with `fork_ancestors` and the 64-session bound, `fork_session` validation, receipts and retries, prefix identities taken in the fork with retries compared as addressed to the session that holds the row, availability and withdrawal through the row where a message or call started, `events`, `search`, `tool_pair`, `message_state` and checkpoint anchors over the whole log. A fork at a position inside a turn returns `Turn(TurnOpen)` until step 7. After: 5. Check: `cargo test --workspace --locked`
+7. Close the cut turn: a fork at a position inside a turn replays it with the fork as holder, writes overlay message rows and the closing events ending with Forked in its batch, and leaves the source untouched. `a_fork_closes_the_cut_turn_while_the_source_continues` checks that after the fork the source settles its owed items and ends the turn Completed. `create_and_fork_retries_return_the_original_receipt` retries a fork that closed a turn, under a fresh operation, after an append and a reopen. Add `a_fork_never_sees_source_writes_after_the_cut`, `forking_reads_only_the_cut_turn` and `a_lost_fork_commit_leaves_no_session`. Show create, list and fork in `examples/context_harness.rs`. Set `docs/feature/sessions.md` and `docs/feature/session-log.md` to `shipped`, and archive this spec. After: 6. Check: `cargo test --workspace --locked`
 
 ## Not this
 
 - MiuMiu's switch from `NS_CHAT_SESSIONS` to MMDB session headers; that is MiuMiu's change.
-- A migration from `mmdb-store-v3`.
+- A migration from `mmdb-store-v3`, or from the intermediate `mmdb-store-v4`.
 - Secondary indexes for kind or parent; filters scan the change index.
