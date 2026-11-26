@@ -1,4 +1,4 @@
-use super::turns::{self, Change, Numbers, OpenStep, OpenTurn, Owed, TurnState};
+use super::turns::{self, Change, Numbers, OpenTurn, Owed, TurnHolder, TurnState};
 use super::view::{identity_key, OrderEntry, ResultIndex, ToolCallIndex, View};
 use super::*;
 use crate::records::codec::*;
@@ -87,15 +87,6 @@ impl Owed {
             }),
             _ => Err(invalid()),
         }
-    }
-}
-
-fn assistant_message_id(kind: &EventKind) -> Option<&str> {
-    match kind {
-        EventKind::AssistantStarted { message_id }
-        | EventKind::AssistantFragment { message_id, .. }
-        | EventKind::AssistantTerminal { message_id, .. } => Some(message_id),
-        _ => None,
     }
 }
 
@@ -200,6 +191,7 @@ pub(crate) fn end_interrupted_turns(
             &mut head,
             &key,
             &turn,
+            &log.owed_items(&key)?,
             TurnEndReason::Interrupted,
             occurred_at_ms,
         )?;
@@ -472,69 +464,42 @@ impl SessionLog<'_> {
         state: TurnState,
         change: Change,
     ) -> ContextResult<()> {
-        let open_turn = || {
-            state
-                .open
-                .ok_or_else(|| ContextError::Corrupt("turn change has no open turn".into()))
-        };
-        let turn = match change {
+        match &change {
             Change::Nothing => return Ok(()),
-            Change::Owe(item) => {
-                let mut turn = open_turn()?;
-                turn.owe(&item);
-                batch.insert(&self.parts.owed, item.key(key), encode(&item.step())?);
-                turn
-            }
-            Change::Settle(item) => {
-                let mut turn = open_turn()?;
-                if !turn.settle(&item) {
-                    return Err(ContextError::Corrupt("owed count underflow".into()));
-                }
-                batch.remove(&self.parts.owed, item.key(key));
-                turn
-            }
-            Change::StartTurn { number, run } => {
-                head.numbers.turns = number;
-                OpenTurn {
-                    start: head
-                        .sequence
-                        .checked_add(1)
-                        .ok_or(ContextError::BudgetExceeded)?,
-                    owner: self.scoped.access().owner.clone(),
-                    session: input.session.clone(),
-                    number,
-                    run,
-                    start_event_id: input.event_id.clone(),
-                    owes: 0,
-                    step: None,
-                }
-            }
-            Change::StartStep(number) => {
-                let mut turn = open_turn()?;
-                head.numbers.steps = number;
-                turn.step = Some(OpenStep {
-                    number,
-                    start_event_id: input.event_id.clone(),
-                    owes: 0,
-                });
-                turn
-            }
-            Change::EndStep => {
-                let mut turn = open_turn()?;
-                turn.step = None;
-                turn
-            }
             Change::EndTurn(reason) => {
+                let turn = state
+                    .open
+                    .as_ref()
+                    .ok_or_else(|| ContextError::Corrupt("turn end without open turn".into()))?;
                 return self.put_turn_end(
                     batch,
                     head,
                     key,
-                    &open_turn()?,
-                    reason,
+                    turn,
+                    &self.owed_items(key)?,
+                    *reason,
                     input.occurred_at_ms,
                 );
             }
+            Change::Owe(item) => {
+                batch.insert(&self.parts.owed, item.key(key), encode(&item.step())?)
+            }
+            Change::Settle(item) => batch.remove(&self.parts.owed, item.key(key)),
+            _ => {}
+        }
+        let holder = TurnHolder {
+            owner: &self.scoped.access().owner,
+            session: &input.session,
         };
+        let position = head
+            .sequence
+            .checked_add(1)
+            .ok_or(ContextError::BudgetExceeded)?;
+        let state = turns::apply(state, &change, holder, &input.event_id, position)?;
+        head.numbers = state.numbers;
+        let turn = state
+            .open
+            .ok_or_else(|| ContextError::Corrupt("turn change without open turn".into()))?;
         batch.insert(&self.parts.open_turns, key, encode(&turn)?);
         Ok(())
     }
@@ -545,11 +510,11 @@ impl SessionLog<'_> {
         head: &mut SessionHead,
         key: &[u8],
         turn: &OpenTurn,
+        owed: &[Owed],
         reason: TurnEndReason,
         occurred_at_ms: i64,
     ) -> ContextResult<()> {
-        let owed = self.owed_items(key)?;
-        let closing = turns::close(turn, &owed, reason)?;
+        let closing = turns::close(turn, owed, reason)?;
         batch.remove(&self.parts.open_turns, key);
         for item in owed {
             batch.remove(&self.parts.owed, item.key(key));
@@ -653,7 +618,7 @@ impl SessionLog<'_> {
                 receipt: receipt.clone(),
             })?,
         );
-        if let Some((id, state)) = assistant_message_id(&event.kind).zip(event.message) {
+        if let Some((id, state)) = turns::assistant_message_id(&event.kind).zip(event.message) {
             let key = identity_key(owner, &event.session, id);
             batch.insert(&self.parts.messages, key, encode(&state)?);
         }
@@ -783,42 +748,11 @@ impl SessionLog<'_> {
         stamp: Option<TurnStamp>,
         position: u64,
     ) -> ContextResult<Option<MessageState>> {
-        let Some(message_id) = assistant_message_id(kind) else {
+        let Some(message_id) = turns::assistant_message_id(kind) else {
             return Ok(None);
         };
         let previous = self.view(session)?.message(message_id)?;
-        let state = match (kind, previous) {
-            (EventKind::AssistantStarted { .. }, None) => MessageState {
-                started: position,
-                next_fragment: 0,
-                terminal: None,
-                unavailable: false,
-                step: stamp
-                    .and_then(|stamp| stamp.step)
-                    .ok_or_else(|| ContextError::Corrupt("admitted message has no step".into()))?,
-            },
-            (EventKind::AssistantFragment { ordinal, .. }, Some(mut state))
-                if state.terminal.is_none() && *ordinal == state.next_fragment =>
-            {
-                state.next_fragment = state
-                    .next_fragment
-                    .checked_add(1)
-                    .ok_or(ContextError::BudgetExceeded)?;
-                state
-            }
-            (EventKind::AssistantTerminal { status, .. }, Some(mut state))
-                if state.terminal.is_none() =>
-            {
-                state.terminal = Some(*status);
-                state
-            }
-            _ => {
-                return Err(ContextError::InvalidInput(
-                    "assistant stream identity, fragment order or terminal state conflict".into(),
-                ))
-            }
-        };
-        Ok(Some(state))
+        turns::message_transition(kind, previous, stamp, position).map(Some)
     }
 
     pub fn message_state(
@@ -1012,5 +946,149 @@ impl SessionLog<'_> {
             entries,
             next_sequence: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_matches_live_turn_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::create(dir.path().join("store")).unwrap();
+        let log = store
+            .session_log(ContextAccess {
+                run: Some("run".into()),
+                ..ContextAccess::new("owner", Actor::System)
+            })
+            .unwrap();
+        let holder = TurnHolder {
+            owner: "owner",
+            session: "session",
+        };
+        let key = session_key(holder.owner, holder.session);
+        let mut headers = Vec::new();
+        for (id, kind) in [
+            ("first", EventKind::TurnStarted),
+            ("first-step", EventKind::StepStarted),
+            (
+                "end-step",
+                EventKind::StepEnded {
+                    start_event_id: "first-step".into(),
+                },
+            ),
+            (
+                "end",
+                EventKind::TurnEnded {
+                    reason: TurnEndReason::Completed,
+                    start_event_id: "first".into(),
+                },
+            ),
+            ("second", EventKind::TurnStarted),
+            (
+                "call",
+                EventKind::ToolCall {
+                    call_id: "direct".into(),
+                    tool_name: "tool".into(),
+                    message_id: None,
+                },
+            ),
+            ("step", EventKind::StepStarted),
+            (
+                "start",
+                EventKind::AssistantStarted {
+                    message_id: "msg".into(),
+                },
+            ),
+            (
+                "frag",
+                EventKind::AssistantFragment {
+                    message_id: "msg".into(),
+                    ordinal: 0,
+                },
+            ),
+            (
+                "result",
+                EventKind::ToolResult {
+                    call_id: "direct".into(),
+                    outcome: ToolOutcome::Succeeded,
+                },
+            ),
+            (
+                "terminal",
+                EventKind::AssistantTerminal {
+                    message_id: "msg".into(),
+                    status: MessageStatus::Completed,
+                },
+            ),
+            (
+                "linked",
+                EventKind::ToolCall {
+                    call_id: "linked".into(),
+                    tool_name: "tool".into(),
+                    message_id: Some("msg".into()),
+                },
+            ),
+            (
+                "answer",
+                EventKind::ToolResult {
+                    call_id: "linked".into(),
+                    outcome: ToolOutcome::Succeeded,
+                },
+            ),
+            (
+                "step-end",
+                EventKind::StepEnded {
+                    start_event_id: "step".into(),
+                },
+            ),
+        ] {
+            let input = EventInput {
+                sources: vec![],
+                session: holder.session.into(),
+                event_id: id.into(),
+                scope: Scope::Personal,
+                kind,
+                media_type: "text/plain".into(),
+                occurred_at_ms: 0,
+                expected_sequence: None,
+            };
+            let receipt = log.append(OperationId::new(), input, &[][..]).unwrap();
+            let header = log.inspect_header(&receipt.pin).unwrap();
+            if matches!(
+                header.event.as_ref().unwrap().kind,
+                EventKind::TurnEnded { .. }
+            ) {
+                headers.clear();
+                assert!(log.parts.open_turns.get(&key).unwrap().is_none());
+                continue;
+            }
+            headers.push(header);
+            let replay = turns::replay(
+                holder,
+                headers.iter().map(|h| {
+                    let e = h.event.as_ref().unwrap();
+                    turns::Replayed {
+                        position: e.sequence,
+                        event_id: &e.event_id,
+                        kind: &e.kind,
+                        stamp: e.turn,
+                        run: h.provenance.run.as_deref(),
+                    }
+                }),
+            )
+            .unwrap();
+            let live: OpenTurn = decode(&log.parts.open_turns.get(&key).unwrap().unwrap()).unwrap();
+            assert_eq!(replay.turn, live);
+            assert_eq!(replay.owed, log.owed_items(&key).unwrap());
+            assert_eq!(
+                replay.open_messages.get("msg"),
+                log.message_state(holder.session, "msg")
+                    .unwrap()
+                    .filter(|m| m.terminal.is_none())
+                    .as_ref()
+            );
+        }
     }
 }
