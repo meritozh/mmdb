@@ -11,7 +11,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const STORE_FORMAT_ID: &str = "mmdb-store-v4";
+pub const STORE_FORMAT_ID: &str = "mmdb-store-v5";
 const SESSION: ModuleId = StoreModule::Session.id();
 const MEMORY: ModuleId = StoreModule::Memory.id();
 
@@ -384,6 +384,17 @@ mod tests {
 
     fn start_step(store: &Store, owner: &str, session: &str) {
         let log = session_writer(store, owner, session);
+        log.create_session(
+            OperationId::new(),
+            crate::session::NewSession {
+                session: session.into(),
+                kind: "chat".into(),
+                parent: None,
+                metadata: serde_json::Value::Null,
+            },
+            Scope::Personal,
+        )
+        .unwrap();
         append_event(&log, session, "turn", EventKind::TurnStarted);
         append_event(&log, session, "step", EventKind::StepStarted);
     }
@@ -424,6 +435,17 @@ mod tests {
             start_step(&store, owner, "chat");
         }
         let idle = session_writer(&store, "alice", "idle");
+        idle.create_session(
+            OperationId::new(),
+            crate::session::NewSession {
+                session: "idle".into(),
+                kind: "chat".into(),
+                parent: None,
+                metadata: serde_json::Value::Null,
+            },
+            Scope::Personal,
+        )
+        .unwrap();
         append_event(&idle, "idle", "notice", EventKind::Notice);
         let mut batch = store.kernel.batch();
         batch.insert(

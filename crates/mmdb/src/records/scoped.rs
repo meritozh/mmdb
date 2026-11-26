@@ -457,6 +457,11 @@ impl Scoped<'_> {
         let mut memo = BTreeMap::new();
         for source in sources {
             let header = self.header_locked(source)?;
+            if source.record.kind == RecordKind::Session {
+                return Err(ContextError::InvalidInput(
+                    "session headers cannot be sources".into(),
+                ));
+            }
             if source.record.kind == RecordKind::Type {
                 return Err(ContextError::InvalidInput(
                     "type definitions are not observation sources".into(),
@@ -517,6 +522,11 @@ impl Scoped<'_> {
         }
         for source in sources {
             let header = self.header_locked(source)?;
+            if source.record.kind == RecordKind::Session {
+                return Err(ContextError::InvalidInput(
+                    "session headers cannot be sources".into(),
+                ));
+            }
             if header.scope != *scope && header.scope != Scope::Personal {
                 return Err(ContextError::AccessDenied);
             }

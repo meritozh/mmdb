@@ -464,6 +464,7 @@ impl ContextStore<'_> {
     ) -> RecordHeader {
         let now = super::super::now_ms();
         RecordHeader {
+            session: None,
             pin: pin.clone(),
             scope,
             state: RecordState::Active,

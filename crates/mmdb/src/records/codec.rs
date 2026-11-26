@@ -34,6 +34,7 @@ pub(crate) fn kind_byte(kind: RecordKind) -> u8 {
         RecordKind::Checkpoint => 4,
         RecordKind::Action => 5,
         RecordKind::ActionExecution => 6,
+        RecordKind::Session => 7,
     }
 }
 

@@ -1,5 +1,7 @@
 //! Continuous, owner-scoped session events and recovery checkpoints.
 
+mod catalog;
+pub use catalog::{NewSession, SessionState};
 mod checkpoints;
 mod history;
 mod search;
@@ -18,6 +20,7 @@ const CALLS: &str = "session_tool_calls_v1";
 const MESSAGES: &str = "session_messages_v1";
 module_partitions!(SessionParts, SESSION_PARTITIONS, {
     order => "session_order_v1",
+    changes => "session_changes_v1",
     heads => "session_heads_v1",
     open_turns => "session_open_turns_v1",
     owed => "session_owed_v1",
@@ -97,6 +100,11 @@ impl SessionLog<'_> {
         state: RecordState,
     ) -> ContextResult<WriteReceipt> {
         expected.record.kind.require_module(StoreModule::Session)?;
+        if expected.record.kind == RecordKind::Session {
+            return Err(ContextError::InvalidInput(
+                "session headers are permanent".into(),
+            ));
+        }
         let redacts = state == RecordState::Purged || expected.record.kind == RecordKind::Event;
         if redacts && !matches!(self.scoped.access().actor, Actor::User | Actor::Operator) {
             return Err(ContextError::AccessDenied);
@@ -105,6 +113,8 @@ impl SessionLog<'_> {
             .commit_state_change(operation, expected, state, redacts, |batch, _, header| {
                 if let Some(event) = &header.event {
                     self.withdraw_event(batch, event)?;
+                    let mut head = self.session_head(&event.session)?;
+                    catalog::Changes::default().put_head(self, batch, &event.session, &mut head, None)?;
                 }
                 Ok(())
             })

@@ -144,7 +144,7 @@ impl RecordKind {
 
     pub fn module(self) -> StoreModule {
         match self {
-            Self::Event | Self::Checkpoint => StoreModule::Session,
+            Self::Session | Self::Event | Self::Checkpoint => StoreModule::Session,
             _ => StoreModule::Memory,
         }
     }
@@ -209,6 +209,7 @@ mod tests {
                 .put_header(
                     &mut batch,
                     &RecordHeader {
+                        session: None,
                         pin: pin.clone(),
                         scope: Scope::Personal,
                         state: RecordState::Active,

@@ -185,6 +185,7 @@ impl ContextStore<'_> {
         let bytes = encode(&properties)?;
         let mut batch = self.scoped.batch();
         let header = RecordHeader {
+            session: None,
             pin: pin.clone(),
             scope: Scope::Personal,
             state: RecordState::Active,

@@ -15,6 +15,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         access.agent = Some("research".into());
         let log = db.session_log(access.clone())?;
         let context = db.context(access)?;
+        log.create_session(
+            OperationId::new(),
+            mmdb::session::NewSession {
+                session: "research-session".into(),
+                kind: "chat".into(),
+                parent: None,
+                metadata: serde_json::Value::Null,
+            },
+            Scope::Personal,
+        )?;
         let evidence = log.append(
             OperationId::new(),
             EventInput {

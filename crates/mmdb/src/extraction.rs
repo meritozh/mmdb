@@ -307,6 +307,7 @@ impl ContextStore<'_> {
         let now = crate::now_ms();
         let bytes = encode(properties)?;
         let header = RecordHeader {
+            session: None,
             pin: pin.clone(),
             scope,
             state: RecordState::Active,

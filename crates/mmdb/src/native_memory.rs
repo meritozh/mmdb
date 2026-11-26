@@ -8392,7 +8392,7 @@ mod tests {
 
     #[test]
     fn fresh_store_gets_a_stable_era_and_foreign_roots_are_refused() {
-        assert_eq!(STORE_FORMAT_ID, "mmdb-store-v4");
+        assert_eq!(STORE_FORMAT_ID, "mmdb-store-v5");
         let fresh = tempfile::tempdir().unwrap();
         let fresh_root = fresh.path().join("memory");
         let first_era = {

@@ -3,15 +3,9 @@ use super::view::{identity_key, OrderEntry, ResultIndex, ToolCallIndex, View};
 use super::*;
 use crate::records::codec::*;
 use crate::{Actor, OperationId, RecordState, Scope, TemporalFacts};
-use serde::{Deserialize, Serialize};
 use std::io::Read;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SessionHead {
-    sequence: u64,
-    scope: Scope,
-    numbers: Numbers,
-}
+use super::catalog::{Changes, SessionHead};
 
 /// One event ready to write into the session's batch.
 struct NewEvent {
@@ -161,6 +155,7 @@ pub(crate) fn end_interrupted_turns(
 ) -> ContextResult<usize> {
     let mut batch = None;
     let mut ended = 0;
+    let mut changes = Changes::default();
     let occurred_at_ms = crate::now_ms();
     for entry in parts.open_turns.iter() {
         let (key, value) = entry?;
@@ -195,7 +190,7 @@ pub(crate) fn end_interrupted_turns(
             TurnEndReason::Interrupted,
             occurred_at_ms,
         )?;
-        batch.insert(&parts.heads, &key, encode(&head)?);
+        changes.put_head(&log, batch, &turn.session, &mut head, None)?;
         ended += 1;
     }
     if let Some(batch) = batch {
@@ -281,28 +276,16 @@ impl SessionLog<'_> {
         let previous_event: Option<StoredEvent> =
             self.view(&input.session)?.event(&input.event_id)?;
         let session_key = session_key(&self.scoped.access().owner, &input.session);
-        let head: Option<SessionHead> = self
-            .parts
-            .heads
-            .get(&session_key)?
-            .map(|bytes| decode(&bytes))
-            .transpose()?;
-        if let Some(head) = &head {
-            self.scoped.check_scope(&head.scope)?;
-            if head.scope != input.scope {
-                return Err(ContextError::InvalidInput(
-                    "a session's log scope cannot change".into(),
-                ));
-            }
+        let mut head = self.session_head(&input.session)?;
+        self.scoped.check_scope(&head.scope)?;
+        if head.scope != input.scope {
+            return Err(ContextError::InvalidInput(
+                "a session's log scope cannot change".into(),
+            ));
         }
         if previous_operation || previous_event.is_some() {
             return self.retry_append(operation, input, payload, previous_event);
         }
-        let mut head = head.unwrap_or_else(|| SessionHead {
-            sequence: 0,
-            scope: input.scope.clone(),
-            numbers: Numbers::default(),
-        });
         if let Some(expected) = input.expected_sequence {
             if expected != head.sequence {
                 return Err(ContextError::PositionConflict {
@@ -362,7 +345,7 @@ impl SessionLog<'_> {
         let mut provenance = self.scoped.provenance();
         provenance.session = Some(input.session.clone());
         let event = NewEvent {
-            session: input.session,
+            session: input.session.clone(),
             event_id: input.event_id,
             kind: input.kind,
             media_type: input.media_type,
@@ -377,7 +360,7 @@ impl SessionLog<'_> {
             turn: admitted.stamp,
         };
         let receipt = self.put_event(&mut batch, &mut head, event, open_start)?;
-        batch.insert(&self.parts.heads, session_key, encode(&head)?);
+        Changes::default().put_head(self, &mut batch, &input.session, &mut head, None)?;
         streamed.publish(&mut batch);
         self.scoped
             .commit_operation(batch, operation, digest, receipt)
@@ -648,6 +631,7 @@ impl SessionLog<'_> {
             _ => {}
         }
         let header = RecordHeader {
+            session: None,
             pin: event.pin,
             scope: event.scope,
             state: RecordState::Active,
@@ -963,6 +947,17 @@ mod tests {
                 ..ContextAccess::new("owner", Actor::System)
             })
             .unwrap();
+        log.create_session(
+            OperationId::new(),
+            crate::session::NewSession {
+                session: "session".into(),
+                kind: "chat".into(),
+                parent: None,
+                metadata: serde_json::Value::Null,
+            },
+            Scope::Personal,
+        )
+        .unwrap();
         let holder = TurnHolder {
             owner: "owner",
             session: "session",
