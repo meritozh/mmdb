@@ -3331,6 +3331,67 @@ mod sessions {
     }
 
     #[test]
+    fn update_replaces_metadata_by_expected_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        let log = store.session_log(access("owner")).unwrap();
+        let creation = OperationId::new();
+        let original = log
+            .create_session(creation, new("s"), Scope::Personal)
+            .unwrap();
+        let before = log.session("s").unwrap();
+        let op = OperationId::new();
+        let metadata = json!({"label":"updated"});
+        for actor in [Actor::User, Actor::Assistant] {
+            let restricted = store
+                .session_log(ContextAccess::new("owner", actor))
+                .unwrap();
+            assert!(matches!(
+                restricted.update_session(op, before.pin.clone(), metadata.clone()),
+                Err(ContextError::AccessDenied)
+            ));
+        }
+        let updated = log
+            .update_session(op, before.pin.clone(), metadata.clone())
+            .unwrap();
+        assert_eq!(updated.sequence, Some(0));
+        let after = log.session("s").unwrap();
+        assert_eq!(after.pin, updated.pin);
+        assert_eq!(after.pin.revision, 2);
+        let mut expected_header = before.header;
+        expected_header.metadata = metadata.clone();
+        assert_eq!(after.header, expected_header);
+        assert!(after.change > before.change);
+        assert!(matches!(
+            log.inspect_header(&before.pin),
+            Err(ContextError::RevisionConflict {
+                expected: 1,
+                actual: 2
+            })
+        ));
+        assert!(matches!(
+            log.update_session(OperationId::new(), before.pin.clone(), json!({})),
+            Err(ContextError::RevisionConflict {
+                expected: 1,
+                actual: 2
+            })
+        ));
+        assert_eq!(log.session("s").unwrap(), after);
+        log.update_session(OperationId::new(), updated.pin.clone(), json!({}))
+            .unwrap();
+        assert_eq!(
+            log.update_session(op, before.pin, metadata).unwrap(),
+            updated
+        );
+        assert_eq!(
+            log.create_session(creation, new("s"), Scope::Personal)
+                .unwrap(),
+            original
+        );
+        assert_eq!(log.operation_receipt(op).unwrap(), Some(updated));
+    }
+
+    #[test]
     fn filtered_pages_stop_after_4096_index_rows() {
         let dir = tempfile::tempdir().unwrap();
         let db = Store::create(dir.path().join("store")).unwrap();

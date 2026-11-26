@@ -118,6 +118,15 @@ fn change_key(owner: &str, change: u64) -> Vec<u8> {
     key
 }
 
+fn validate_metadata(metadata: &serde_json::Value) -> ContextResult<()> {
+    if encode(metadata)?.len() > 4096 {
+        return Err(ContextError::InvalidInput(
+            "session metadata exceeds 4 KiB".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl SessionLog<'_> {
     pub(super) fn session_head(&self, session: &str) -> ContextResult<SessionHead> {
         let bytes = self
@@ -220,6 +229,53 @@ impl SessionLog<'_> {
         Ok(SessionPage { sessions, next })
     }
 
+    pub fn update_session(
+        &self,
+        operation: OperationId,
+        expected: RecordPin,
+        metadata: serde_json::Value,
+    ) -> ContextResult<WriteReceipt> {
+        if !matches!(self.scoped.access().actor, Actor::System | Actor::Operator) {
+            return Err(ContextError::AccessDenied);
+        }
+        if expected.record.kind != RecordKind::Session {
+            return Err(ContextError::InvalidInput(
+                "expected a session header".into(),
+            ));
+        }
+        validate_metadata(&metadata)?;
+        let _guard = self.scoped.lock();
+        let digest = self
+            .scoped
+            .digest("update-session", &(&expected, &metadata))?;
+        if let Some(receipt) = self.scoped.replay(operation, digest)? {
+            return Ok(receipt);
+        }
+        let (mut header, pin) = self.scoped.next_revision(&expected)?;
+        let session = header
+            .session
+            .as_mut()
+            .ok_or_else(|| ContextError::Corrupt("missing session header".into()))?;
+        session.metadata = metadata;
+        let name = session.session.clone();
+        let mut head = self.session_head(&name)?;
+        header.pin = pin.clone();
+        header.provenance = self.scoped.provenance();
+        header.recorded_at_ms = crate::now_ms();
+        let mut batch = self.scoped.batch();
+        self.scoped.put_header(&mut batch, &header)?;
+        Changes::default().put_head(self, &mut batch, &name, &mut head, None)?;
+        self.scoped.commit_operation(
+            batch,
+            operation,
+            digest,
+            WriteReceipt {
+                pin,
+                sequence: Some(head.sequence),
+            },
+        )
+    }
+
     pub fn create_session(
         &self,
         operation: OperationId,
@@ -237,11 +293,7 @@ impl SessionLog<'_> {
         }
         validate_name(&session.session, "session")?;
         validate_name(&session.kind, "session kind")?;
-        if encode(&session.metadata)?.len() > 4096 {
-            return Err(ContextError::InvalidInput(
-                "session metadata exceeds 4 KiB".into(),
-            ));
-        }
+        validate_metadata(&session.metadata)?;
         self.scoped.check_scope(&scope)?;
         let _guard = self.scoped.lock();
         if let Some(parent) = &session.parent {
