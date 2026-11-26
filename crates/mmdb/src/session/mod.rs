@@ -1,7 +1,7 @@
 //! Continuous, owner-scoped session events and recovery checkpoints.
 
 mod catalog;
-pub use catalog::{NewSession, SessionState};
+pub use catalog::{NewSession, SessionPage, SessionQuery, SessionState};
 mod checkpoints;
 mod history;
 mod search;
@@ -114,7 +114,13 @@ impl SessionLog<'_> {
                 if let Some(event) = &header.event {
                     self.withdraw_event(batch, event)?;
                     let mut head = self.session_head(&event.session)?;
-                    catalog::Changes::default().put_head(self, batch, &event.session, &mut head, None)?;
+                    catalog::Changes::default().put_head(
+                        self,
+                        batch,
+                        &event.session,
+                        &mut head,
+                        None,
+                    )?;
                 }
                 Ok(())
             })

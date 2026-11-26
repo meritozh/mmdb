@@ -26,6 +26,22 @@ pub struct SessionState {
     pub change: u64,
 }
 
+/// Select sessions in descending change-number order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionQuery {
+    pub kind: Option<String>,
+    pub parent: Option<String>,
+    /// Continue below this change number.
+    pub before: Option<u64>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPage {
+    pub sessions: Vec<SessionState>,
+    pub next: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct SessionHead {
     pub header: ContextRef,
@@ -116,6 +132,10 @@ impl SessionLog<'_> {
         validate_name(session, "session")?;
         let _guard = self.scoped.lock();
         let head = self.session_head(session)?;
+        self.session_state(session, head)
+    }
+
+    fn session_state(&self, session: &str, head: SessionHead) -> ContextResult<SessionState> {
         let header = self.scoped.head_locked(&head.header)?;
         let turn: Option<OpenTurn> = self
             .parts
@@ -135,6 +155,69 @@ impl SessionLog<'_> {
             changed_at_ms: head.changed_at_ms,
             change: head.change,
         })
+    }
+
+    pub fn sessions(&self, query: SessionQuery) -> ContextResult<SessionPage> {
+        use std::ops::Bound::{Excluded, Included};
+
+        let access = self.scoped.access();
+        if !matches!(access.actor, Actor::System | Actor::Operator) {
+            return Err(ContextError::AccessDenied);
+        }
+        if !(1..=100).contains(&query.limit) {
+            return Err(ContextError::InvalidInput(
+                "session page limit must be 1..=100".into(),
+            ));
+        }
+        if let Some(kind) = &query.kind {
+            validate_name(kind, "session kind")?;
+        }
+        if let Some(parent) = &query.parent {
+            validate_name(parent, "parent session")?;
+        }
+        let _guard = self.scoped.lock();
+        let prefix = owner_key(&access.owner);
+        let upper = match query.before {
+            Some(before) => Excluded(change_key(&access.owner, before)),
+            None => Included(change_key(&access.owner, u64::MAX)),
+        };
+        let mut sessions = Vec::new();
+        let mut next = None;
+        let range = (Included(prefix.clone()), upper);
+        for (scanned, item) in self.parts.changes.range(range).rev().take(4096).enumerate() {
+            let (key, value) = item?;
+            let change = u64::from_be_bytes(
+                key[prefix.len()..]
+                    .try_into()
+                    .map_err(|_| ContextError::Corrupt("invalid change number".into()))?,
+            );
+            let row: ChangeRow = decode(&value)?;
+            if query.kind.as_ref().is_none_or(|kind| kind == &row.kind)
+                && query
+                    .parent
+                    .as_ref()
+                    .is_none_or(|parent| Some(parent) == row.parent.as_ref())
+            {
+                let head = self.session_head(&row.session)?;
+                if access.scopes.contains(&head.scope) {
+                    sessions.push(self.session_state(&row.session, head)?);
+                }
+            }
+            if sessions.len() == query.limit || scanned + 1 == 4096 {
+                if self
+                    .parts
+                    .changes
+                    .range_keys(prefix.clone()..key.to_vec())
+                    .next_back()
+                    .transpose()?
+                    .is_some()
+                {
+                    next = Some(change);
+                }
+                break;
+            }
+        }
+        Ok(SessionPage { sessions, next })
     }
 
     pub fn create_session(

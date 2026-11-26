@@ -8,6 +8,15 @@ use std::io::{self, Read};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+fn catalog_query(limit: usize) -> SessionQuery {
+    SessionQuery {
+        limit,
+        before: None,
+        kind: None,
+        parent: None,
+    }
+}
+
 fn access(owner: &str) -> ContextAccess {
     ContextAccess::new(owner, Actor::System)
 }
@@ -1390,7 +1399,7 @@ fn action_contract_enforces_authority_versions_conditions_and_one_preparation() 
 }
 
 #[test]
-fn copied_history_tracks_source_availability_and_session_catalog_pages() {
+fn copied_history_tracks_source_availability() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Store::create(tmp.path().join("context")).unwrap();
     create_session(&db, "owner", "model-session", Scope::Personal);
@@ -1420,41 +1429,6 @@ fn copied_history_tracks_source_availability_and_session_catalog_pages() {
     assert!(matches!(
         store.validate_current(&[copy.pin], None),
         Err(ContextError::Unavailable(_))
-    ));
-    for index in 0..7 {
-        create_session(&db, "owner", &format!("session-{index}"), Scope::Personal);
-        log.append(
-            OperationId::new(),
-            event_input(&format!("session-{index}"), "input"),
-            b"original".as_slice(),
-        )
-        .unwrap();
-    }
-    let mut sessions = BTreeSet::new();
-    let mut after = None;
-    loop {
-        let page = log.sessions(2, after.as_deref()).unwrap();
-        for session in page.sessions {
-            assert!(sessions.insert(session));
-        }
-        match page.next {
-            Some(next) => after = Some(next),
-            None => break,
-        }
-    }
-    assert_eq!(sessions.len(), 9);
-    assert!(db
-        .session_log(access("another-owner"))
-        .unwrap()
-        .sessions(2, None)
-        .unwrap()
-        .sessions
-        .is_empty());
-    assert!(matches!(
-        db.session_log(ContextAccess::new("owner", Actor::Assistant))
-            .unwrap()
-            .sessions(2, None),
-        Err(ContextError::AccessDenied)
     ));
 }
 
@@ -2471,7 +2445,7 @@ fn a_legacy_directory_resets_into_an_empty_store() {
     let store = Store::open(&root).unwrap();
     let log = store.session_log(access("owner")).unwrap();
     let context = store.context(access("owner")).unwrap();
-    assert!(log.sessions(10, None).unwrap().sessions.is_empty());
+    assert!(log.sessions(catalog_query(10)).unwrap().sessions.is_empty());
     assert!(context
         .query_current_valid(None, None, 10)
         .unwrap()
@@ -2544,9 +2518,10 @@ fn log_permissions_follow_the_actor() {
         } else {
             message.unwrap();
         }
-        let sessions = log.sessions(5, None);
+        let sessions = log.sessions(catalog_query(5));
         if matches!(actor, Actor::System | Actor::Operator) {
-            assert_eq!(sessions.unwrap().sessions, ["s"]);
+            let page = sessions.unwrap();
+            assert_eq!(page.sessions, [log.session("s").unwrap()]);
         } else {
             assert!(matches!(sessions, Err(ContextError::AccessDenied)));
         }
@@ -3353,6 +3328,115 @@ mod sessions {
             parent: None,
             metadata: json!({"title":"Inbox"}),
         }
+    }
+
+    #[test]
+    fn filtered_pages_stop_after_4096_index_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Store::create(dir.path().join("store")).unwrap();
+        let log = db.session_log(access("owner")).unwrap();
+        log.create_session(OperationId::new(), new("match"), Scope::Personal)
+            .unwrap();
+        for index in 0..4096 {
+            let input = NewSession {
+                kind: "worker".into(),
+                ..new(&format!("child-{index}"))
+            };
+            log.create_session(OperationId::new(), input, Scope::Personal)
+                .unwrap();
+        }
+        let mut query = SessionQuery {
+            kind: Some("chat".into()),
+            ..catalog_query(100)
+        };
+        let first = log.sessions(query.clone()).unwrap();
+        assert!(first.sessions.is_empty());
+        assert_eq!(first.next, Some(log.session("child-0").unwrap().change));
+        query.before = first.next;
+        let last = log.sessions(query).unwrap();
+        assert_eq!(last.sessions, [log.session("match").unwrap()]);
+        assert_eq!(last.next, None);
+    }
+
+    #[test]
+    fn sessions_list_newest_change_first_with_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Store::create(dir.path().join("store")).unwrap();
+        let workspace = Scope::Workspace(ulid::Ulid::new());
+        let mut profile = access("owner");
+        profile.scopes.push(workspace.clone());
+        let writer = db.session_log(profile).unwrap();
+        for (name, kind, parent, scope) in [
+            ("root", "chat", None, Scope::Personal),
+            ("first", "worker", Some("root"), Scope::Personal),
+            ("second", "worker", Some("root"), Scope::Personal),
+            ("hidden", "worker", Some("root"), workspace),
+            ("other", "chat", Some("root"), Scope::Personal),
+            ("orphan", "worker", None, Scope::Personal),
+        ] {
+            let input = NewSession {
+                kind: kind.into(),
+                parent: parent.map(|name| SessionParent {
+                    session: name.into(),
+                    run: "r".into(),
+                }),
+                ..new(name)
+            };
+            writer
+                .create_session(OperationId::new(), input, scope)
+                .unwrap();
+        }
+        let log = db.session_log(access("owner")).unwrap();
+        let mut query = SessionQuery {
+            kind: Some("worker".into()),
+            parent: Some("root".into()),
+            ..catalog_query(1)
+        };
+        let page = log.sessions(query.clone()).unwrap();
+        assert_eq!(page.sessions, [log.session("second").unwrap()]);
+        assert_eq!(page.next, Some(page.sessions[0].change));
+        query.before = page.next;
+        query.limit = 2;
+        let page = log.sessions(query).unwrap();
+        assert_eq!(page.sessions, [log.session("first").unwrap()]);
+        assert_eq!(page.next, None);
+        assert!(db
+            .session_log(access("another-owner"))
+            .unwrap()
+            .sessions(catalog_query(1))
+            .unwrap()
+            .sessions
+            .is_empty());
+        for limit in [0, 101] {
+            assert!(matches!(
+                log.sessions(catalog_query(limit)),
+                Err(ContextError::InvalidInput(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn incremental_sync_stops_at_the_last_seen_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Store::create(dir.path().join("store")).unwrap();
+        let log = db.session_log(access("owner")).unwrap();
+        for name in ["older", "unchanged"] {
+            log.create_session(OperationId::new(), new(name), Scope::Personal)
+                .unwrap();
+        }
+        let seen = log.sessions(catalog_query(1)).unwrap().sessions[0].change;
+        log.append(OperationId::new(), event_input("older", "event"), &b"x"[..])
+            .unwrap();
+        log.create_session(OperationId::new(), new("new"), Scope::Personal)
+            .unwrap();
+        let states = log.sessions(catalog_query(10)).unwrap().sessions;
+        assert_eq!(states.len(), 3);
+        let changed: Vec<_> = states
+            .iter()
+            .take_while(|s| s.change > seen)
+            .map(|s| s.header.session.as_str())
+            .collect();
+        assert_eq!(changed, ["new", "older"]);
     }
 
     #[test]

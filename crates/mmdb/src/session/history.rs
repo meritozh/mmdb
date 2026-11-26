@@ -203,65 +203,6 @@ impl SessionLog<'_> {
     fn view<'a>(&'a self, session: &'a str) -> ContextResult<View<'a>> {
         View::load(self.parts, &self.scoped.access().owner, session)
     }
-    /// Enumerate sessions without relying on an application projection.
-    /// This recovery catalog requires trusted harness authority.
-    pub fn sessions(&self, limit: usize, after: Option<&str>) -> ContextResult<SessionPage> {
-        if !matches!(self.scoped.access().actor, Actor::System | Actor::Operator) {
-            return Err(ContextError::AccessDenied);
-        }
-        if limit == 0 || limit > 100 {
-            return Err(ContextError::InvalidInput(
-                "session page limit must be 1..=100".into(),
-            ));
-        }
-        if let Some(after) = after {
-            validate_name(after, "session cursor")?;
-        }
-        let _guard = self.scoped.lock();
-        let prefix = owner_key(&self.scoped.access().owner);
-        let start = after.map_or_else(
-            || prefix.clone(),
-            |session| session_key(&self.scoped.access().owner, session),
-        );
-        let mut sessions = Vec::new();
-        let mut next = None;
-        for (scanned, entry) in self.parts.heads.range(start.clone()..).enumerate() {
-            let (key, value) = entry?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            if after.is_some() && key.as_ref() == start {
-                continue;
-            }
-            if sessions.len() == limit || scanned >= 4096 {
-                return Ok(SessionPage { sessions, next });
-            }
-            let tail = &key[prefix.len()..];
-            if tail.len() < 4 {
-                return Err(ContextError::Corrupt("invalid session index".into()));
-            }
-            let length = u32::from_be_bytes(
-                tail[..4]
-                    .try_into()
-                    .map_err(|_| ContextError::Corrupt("invalid session length".into()))?,
-            ) as usize;
-            if length != tail.len() - 4 {
-                return Err(ContextError::Corrupt("invalid session key length".into()));
-            }
-            let session = String::from_utf8(tail[4..].to_vec())
-                .map_err(|_| ContextError::Corrupt("invalid session identity".into()))?;
-            let head: SessionHead = decode(&value)?;
-            next = Some(session.clone());
-            if self.scoped.check_scope(&head.scope).is_ok() {
-                sessions.push(session);
-            }
-        }
-        Ok(SessionPage {
-            sessions,
-            next: None,
-        })
-    }
-
     /// Appends an exact payload using bounded buffers. No event becomes visible
     /// until its complete payload, session log position and receipt are committed.
     pub fn append<R: Read>(

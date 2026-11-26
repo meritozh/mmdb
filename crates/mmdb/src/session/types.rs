@@ -88,13 +88,6 @@ pub(super) struct StoredEvent {
     pub receipt: WriteReceipt,
 }
 
-/// Owner-scoped session catalog for trusted harness recovery.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionPage {
-    pub sessions: Vec<String>,
-    pub next: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CheckpointRecord {
     pub header: RecordHeader,
