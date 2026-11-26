@@ -203,6 +203,10 @@ impl Scoped<'_> {
         &self.table(kind.module()).payloads
     }
     #[cfg(test)]
+    pub(crate) fn drop_next_commit(&self, partition: &Partition) {
+        self.records.kernel.drop_next_commit(partition);
+    }
+    #[cfg(test)]
     pub(crate) fn lose_next_commit_ack(&self) {
         self.records
             .kernel

@@ -92,6 +92,19 @@ impl<'a> View<'a> {
         Ok(segments)
     }
 
+    pub fn fork(&self, session: &'a str, position: u64) -> ContextResult<Self> {
+        Ok(Self {
+            parts: self.parts,
+            owner: self.owner,
+            session,
+            ancestors: self.fork_ancestors(position)?,
+        })
+    }
+
+    pub fn ancestors(&self) -> &[Segment] {
+        &self.ancestors
+    }
+
     fn lookup<T: DeserializeOwned>(
         &self,
         partition: &mmdb_kernel::Partition,

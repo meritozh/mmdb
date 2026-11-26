@@ -338,10 +338,6 @@ impl SessionLog<'_> {
                 },
             );
         }
-        let (created, numbers) = match &origin {
-            Some(origin) => self.put_lineage(&mut batch, &session.session, origin)?,
-            None => (0, Numbers::default()),
-        };
         let pin = self.scoped.fresh_pin(RecordKind::Session);
         let now = crate::now_ms();
         let row = ChangeRow {
@@ -354,7 +350,7 @@ impl SessionLog<'_> {
                 session: session.session.clone(),
                 kind: session.kind,
                 parent: session.parent,
-                origin,
+                origin: origin.clone(),
                 created_at_ms: now,
                 metadata: session.metadata,
             }),
@@ -378,12 +374,17 @@ impl SessionLog<'_> {
             header: pin.record.clone(),
             scope,
             creation,
-            created,
-            sequence: created,
-            numbers,
+            created: 0,
+            sequence: 0,
+            numbers: Numbers::default(),
             change: 0,
             changed_at_ms: now,
         };
+        if let Some(origin) = origin {
+            self.put_lineage(&mut batch, &session.session, &origin, &mut head)?;
+        }
+        let created = head.sequence;
+        head.created = created;
         Changes::default().put_head(self, &mut batch, &session.session, &mut head, Some(row))?;
         self.scoped.commit_operation(
             batch,

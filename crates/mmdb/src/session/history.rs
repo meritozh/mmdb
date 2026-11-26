@@ -191,6 +191,8 @@ pub(crate) fn end_interrupted_turns(
             &log.owed_items(&key)?,
             TurnEndReason::Interrupted,
             occurred_at_ms,
+            &log.view(&turn.session)?,
+            None,
         )?;
         changes.put_head(&log, batch, &turn.session, &mut head, None)?;
         ended += 1;
@@ -421,6 +423,8 @@ impl SessionLog<'_> {
                     &self.owed_items(key)?,
                     *reason,
                     input.occurred_at_ms,
+                    &self.view(&turn.session)?,
+                    None,
                 );
             }
             Change::Owe(item) => {
@@ -446,7 +450,7 @@ impl SessionLog<'_> {
         Ok(())
     }
 
-    fn put_turn_end(
+    pub(super) fn put_turn_end(
         &self,
         batch: &mut mmdb_kernel::Batch,
         head: &mut SessionHead,
@@ -455,6 +459,8 @@ impl SessionLog<'_> {
         owed: &[Owed],
         reason: TurnEndReason,
         occurred_at_ms: i64,
+        view: &View<'_>,
+        mut replayed_messages: Option<&mut std::collections::BTreeMap<String, MessageState>>,
     ) -> ContextResult<()> {
         let closing = turns::close(turn, owed, reason)?;
         batch.remove(&self.parts.open_turns, key);
@@ -472,21 +478,32 @@ impl SessionLog<'_> {
             let (sources, source_scopes) = match &event.kind {
                 EventKind::ToolResult { call_id, .. } => {
                     // The call reserved this result's budget and recorded its source scopes.
-                    let call = self.indexed_call(&turn.session, call_id)?;
+                    let call = view
+                        .call(call_id)?
+                        .ok_or_else(|| ContextError::Corrupt("missing owed call".into()))?
+                        .row;
                     let header = self.scoped.head_locked(&call.record)?;
                     (vec![header.pin], header.source_scopes)
                 }
                 _ => (Vec::new(), Vec::new()),
             };
             let stamp = Some(event.stamp);
-            let message = self.message_transition(
-                &turn.session,
-                &event.kind,
-                stamp,
-                head.sequence
-                    .checked_add(1)
-                    .ok_or(ContextError::BudgetExceeded)?,
-            )?;
+            let message = if let Some(id) = turns::assistant_message_id(&event.kind) {
+                let previous = match replayed_messages.as_deref_mut() {
+                    Some(messages) => messages.remove(id),
+                    None => view.message(id)?.map(|found| found.row),
+                };
+                Some(turns::message_transition(
+                    &event.kind,
+                    previous,
+                    stamp,
+                    head.sequence
+                        .checked_add(1)
+                        .ok_or(ContextError::BudgetExceeded)?,
+                )?)
+            } else {
+                None
+            };
             let new_event = NewEvent {
                 session: turn.session.clone(),
                 event_id: event.event_id,

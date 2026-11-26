@@ -39,6 +39,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             b"A capacity constraint affects the next trading decision.".as_slice(),
         )?;
+        log.fork_session(
+            OperationId::new(),
+            mmdb::session::NewSession {
+                session: "trading-session".into(),
+                kind: "analysis".into(),
+                parent: None,
+                metadata: json!({}),
+            },
+            mmdb::SessionOrigin {
+                session: "research-session".into(),
+                position: log.position("research-session")?,
+            },
+        )?;
+        let listed = log.sessions(mmdb::session::SessionQuery {
+            kind: Some("analysis".into()),
+            parent: None,
+            before: None,
+            limit: 10,
+        })?;
+        assert_eq!(listed.sessions[0].header.session, "trading-session");
         let note_type = context.define_type(
             OperationId::new(),
             TypeDefinition {

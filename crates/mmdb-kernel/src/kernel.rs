@@ -373,6 +373,8 @@ struct Inner {
     write_lock: Mutex<()>,
     #[cfg(any(test, feature = "test-hooks"))]
     lose_ack_partition: Mutex<Option<String>>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    drop_commit_partition: Mutex<Option<String>>,
     #[cfg(test)]
     reset_fault: Mutex<Option<tests::ResetFault>>,
     // Keep the path leased until all engine handles have been dropped.
@@ -434,6 +436,8 @@ impl Kernel {
             write_lock: Mutex::new(()),
             #[cfg(any(test, feature = "test-hooks"))]
             lose_ack_partition: Mutex::new(None),
+            #[cfg(any(test, feature = "test-hooks"))]
+            drop_commit_partition: Mutex::new(None),
             #[cfg(test)]
             reset_fault: Mutex::new(None),
         })))
@@ -492,6 +496,13 @@ impl Kernel {
             "partition belongs to another kernel"
         );
         *self.0.lose_ack_partition.lock() = Some(partition.raw.name().to_string());
+    }
+
+    /// Simulate a lost batch before any of its writes reach storage.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn drop_next_commit(&self, partition: &Partition) {
+        assert!(Arc::ptr_eq(&self.0, &partition.owner.kernel.0));
+        *self.0.drop_commit_partition.lock() = Some(partition.raw.name().to_string());
     }
 
     pub fn write_lock(&self) -> WriteGuard<'_> {
@@ -855,6 +866,17 @@ impl Batch {
         let eras = self.kernel.0.eras.read();
         eras.ensure_usable()?;
         self.check_eras(&eras)?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            let mut target = self.kernel.0.drop_commit_partition.lock();
+            if target
+                .as_ref()
+                .is_some_and(|name| self.written_partitions.contains(name))
+            {
+                *target = None;
+                return Err(KernelError::CommitUnknown);
+            }
+        }
         #[cfg(any(test, feature = "test-hooks"))]
         let mut armed = self.kernel.0.lose_ack_partition.lock();
         self.raw.commit().map_err(|_| KernelError::CommitUnknown)?;

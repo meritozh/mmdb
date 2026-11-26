@@ -3319,7 +3319,7 @@ fn create_session(store: &Store, owner: &str, name: &str, scope: Scope) {
 
 mod sessions {
     use super::*;
-    use mmdb::{RecordKind, SessionParent};
+    use mmdb::{RecordKind, SessionParent, TurnEndReason};
 
     fn new(name: &str) -> NewSession {
         NewSession {
@@ -3335,6 +3335,182 @@ mod sessions {
             session: session.into(),
             position,
         }
+    }
+
+    #[test]
+    fn a_fork_closes_the_cut_turn_while_the_source_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        let log = turn_log(&store, Actor::System);
+        log.create_session(OperationId::new(), new("source"), Scope::Personal)
+            .unwrap();
+        for (id, kind) in [
+            ("turn", EventKind::TurnStarted),
+            (
+                "call",
+                EventKind::ToolCall {
+                    call_id: "read".into(),
+                    tool_name: "read".into(),
+                    message_id: None,
+                },
+            ),
+            ("step", EventKind::StepStarted),
+            (
+                "start",
+                EventKind::AssistantStarted {
+                    message_id: "msg".into(),
+                },
+            ),
+            (
+                "fragment",
+                EventKind::AssistantFragment {
+                    message_id: "msg".into(),
+                    ordinal: 0,
+                },
+            ),
+        ] {
+            boundary(&log, "source", id, kind);
+        }
+        let before = log.session("source").unwrap();
+        let receipt = log
+            .fork_session(OperationId::new(), new("fork"), origin("source", 5))
+            .unwrap();
+        assert_eq!(log.session("source").unwrap(), before);
+        assert_eq!(receipt.sequence, Some(9));
+        let last = log.events("fork", 8, 1).unwrap().entries.pop().unwrap();
+        assert_eq!(
+            last.event.unwrap().kind,
+            EventKind::TurnEnded {
+                reason: TurnEndReason::Forked,
+                start_event_id: "turn".into()
+            }
+        );
+        let state = log.message_state("fork", "msg").unwrap().unwrap();
+        assert_eq!(
+            (state.started, state.next_fragment, state.terminal),
+            (4, 1, Some(MessageStatus::Interrupted))
+        );
+        let (call, result) = log.tool_pair("fork", "read").unwrap();
+        assert_eq!(result.unwrap().sources, vec![call.unwrap().pin]);
+        for (id, kind) in [
+            (
+                "finish",
+                EventKind::AssistantTerminal {
+                    message_id: "msg".into(),
+                    status: MessageStatus::Completed,
+                },
+            ),
+            (
+                "answer",
+                EventKind::ToolResult {
+                    call_id: "read".into(),
+                    outcome: ToolOutcome::Succeeded,
+                },
+            ),
+            (
+                "step-end",
+                EventKind::StepEnded {
+                    start_event_id: "step".into(),
+                },
+            ),
+            (
+                "end",
+                EventKind::TurnEnded {
+                    start_event_id: "turn".into(),
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+        ] {
+            boundary(&log, "source", id, kind);
+        }
+        assert!(log.session("source").unwrap().open_run.is_none());
+        assert_eq!(log.message_state("fork", "msg").unwrap().unwrap(), state);
+    }
+
+    #[test]
+    fn a_fork_never_sees_source_writes_after_the_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        let log = turn_log(&store, Actor::System);
+        log.create_session(OperationId::new(), new("source"), Scope::Personal)
+            .unwrap();
+        for (id, kind) in [
+            ("turn", EventKind::TurnStarted),
+            ("step", EventKind::StepStarted),
+            (
+                "start",
+                EventKind::AssistantStarted {
+                    message_id: "msg".into(),
+                },
+            ),
+            (
+                "late",
+                EventKind::AssistantFragment {
+                    message_id: "msg".into(),
+                    ordinal: 0,
+                },
+            ),
+            (
+                "call",
+                EventKind::ToolCall {
+                    call_id: "later".into(),
+                    tool_name: "tool".into(),
+                    message_id: None,
+                },
+            ),
+        ] {
+            boundary(&log, "source", id, kind);
+        }
+        log.fork_session(OperationId::new(), new("fork"), origin("source", 3))
+            .unwrap();
+        assert_eq!(
+            log.message_state("fork", "msg")
+                .unwrap()
+                .unwrap()
+                .next_fragment,
+            0
+        );
+        assert_eq!(log.tool_pair("fork", "later").unwrap(), (None, None));
+        boundary(&log, "fork", "late", EventKind::Notice);
+        assert!(log
+            .events("fork", 3, 10)
+            .unwrap()
+            .entries
+            .iter()
+            .all(|header| header.event.as_ref().unwrap().session == "fork"));
+    }
+
+    #[test]
+    fn create_and_fork_retries_return_the_original_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let (created, forked) = {
+            let store = Store::create(&path).unwrap();
+            let log = turn_log(&store, Actor::System);
+            let created = log
+                .create_session(OperationId::new(), new("source"), Scope::Personal)
+                .unwrap();
+            boundary(&log, "source", "turn", EventKind::TurnStarted);
+            let forked = log
+                .fork_session(OperationId::new(), new("fork"), origin("source", 1))
+                .unwrap();
+            assert_eq!(forked.sequence, Some(2));
+            boundary(&log, "fork", "suffix", EventKind::Notice);
+            (created, forked)
+        };
+        let store = Store::open(&path).unwrap();
+        let log = turn_log(&store, Actor::System);
+        assert_eq!(
+            log.create_session(OperationId::new(), new("source"), Scope::Personal)
+                .unwrap(),
+            created
+        );
+        assert_eq!(
+            log.fork_session(OperationId::new(), new("fork"), origin("source", 1))
+                .unwrap(),
+            forked
+        );
+        assert_eq!(log.position("fork").unwrap(), 3);
     }
 
     #[test]

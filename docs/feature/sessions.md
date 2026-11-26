@@ -2,7 +2,7 @@
 
 可信 harness 先创建带会话头的会话再写它的会话日志，按会话变更号从新到旧列出会话，并能从一个会话日志的某个位置 fork 出新会话；新会话的日志以这段前缀开头，与来源共享其中的事件。
 
-Status: decided
+Status: shipped
 
 ## Behavior
 
