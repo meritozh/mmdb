@@ -1,6 +1,7 @@
 //! Independent, read-only acceptance of a real harness-created context store.
 //! Usage: cargo run -p mmdb --example inspect_context_quality -- STORE REPORT
 use mmdb::context::*;
+use mmdb::session::SessionQuery;
 use mmdb::Actor;
 use mmdb::Store;
 use serde_json::json;
@@ -37,8 +38,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sessions = Vec::new();
     let mut after = None;
     loop {
-        let page = log.sessions(100, after.as_deref())?;
-        sessions.extend(page.sessions);
+        let page = log.sessions(SessionQuery {
+            kind: None,
+            parent: None,
+            before: after,
+            limit: 100,
+        })?;
+        sessions.extend(page.sessions.into_iter().map(|state| state.header.session));
         after = page.next;
         if after.is_none() {
             break;

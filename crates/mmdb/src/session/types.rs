@@ -4,6 +4,7 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageState {
+    pub started: u64,
     pub next_fragment: u64,
     pub terminal: Option<MessageStatus>,
     /// A withdrawn fragment also invalidates aggregate copies of the message.
@@ -85,13 +86,6 @@ pub struct LogSearch {
 pub(super) struct StoredEvent {
     pub digest: [u8; 32],
     pub receipt: WriteReceipt,
-}
-
-/// Owner-scoped session catalog for trusted harness recovery.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionPage {
-    pub sessions: Vec<String>,
-    pub next: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

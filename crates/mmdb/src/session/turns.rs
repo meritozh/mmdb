@@ -1,14 +1,17 @@
 //! Turn and step rules for one session. The log loads the state and persists
 //! the admitted change in the same batch as the event.
 
+use super::MessageState;
 use crate::{
     ContextError, ContextResult, EventKind, MessageStatus, ToolOutcome, TurnEndReason, TurnError,
     TurnStamp,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct OpenTurn {
+    pub start: u64,
     pub owner: String,
     pub session: String,
     pub number: u64,
@@ -298,4 +301,216 @@ pub(super) fn admit(state: &TurnState, write: Write<'_>) -> Result<Admitted, Tur
         }
     };
     Ok(Admitted { stamp, change })
+}
+
+pub(super) fn message_transition(
+    kind: &EventKind,
+    previous: Option<MessageState>,
+    stamp: Option<TurnStamp>,
+    position: u64,
+) -> ContextResult<MessageState> {
+    let state = match (kind, previous) {
+        (EventKind::AssistantStarted { .. }, None) => MessageState {
+            started: position,
+            next_fragment: 0,
+            terminal: None,
+            unavailable: false,
+            step: stamp
+                .and_then(|stamp| stamp.step)
+                .ok_or_else(|| ContextError::Corrupt("admitted message has no step".into()))?,
+        },
+        (EventKind::AssistantFragment { ordinal, .. }, Some(mut state))
+            if state.terminal.is_none() && *ordinal == state.next_fragment =>
+        {
+            state.next_fragment = state
+                .next_fragment
+                .checked_add(1)
+                .ok_or(ContextError::BudgetExceeded)?;
+            state
+        }
+        (EventKind::AssistantTerminal { status, .. }, Some(mut state))
+            if state.terminal.is_none() =>
+        {
+            state.terminal = Some(*status);
+            state
+        }
+        _ => {
+            return Err(ContextError::InvalidInput(
+                "assistant stream identity, fragment order or terminal state conflict".into(),
+            ))
+        }
+    };
+    Ok(state)
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct TurnHolder<'a> {
+    pub owner: &'a str,
+    pub session: &'a str,
+}
+
+pub(super) fn apply(
+    mut state: TurnState,
+    change: &Change,
+    holder: TurnHolder<'_>,
+    event_id: &str,
+    position: u64,
+) -> ContextResult<TurnState> {
+    let missing = || ContextError::Corrupt("turn change without open turn".into());
+    match change {
+        Change::Nothing => {}
+        Change::StartTurn { number, run } => {
+            state.numbers.turns = *number;
+            state.open = Some(OpenTurn {
+                start: position,
+                owner: holder.owner.into(),
+                session: holder.session.into(),
+                number: *number,
+                run: run.clone(),
+                start_event_id: event_id.into(),
+                owes: 0,
+                step: None,
+            });
+        }
+        Change::StartStep(number) => {
+            state.numbers.steps = *number;
+            state.open.as_mut().ok_or_else(missing)?.step = Some(OpenStep {
+                number: *number,
+                start_event_id: event_id.into(),
+                owes: 0,
+            });
+        }
+        Change::EndStep => state.open.as_mut().ok_or_else(missing)?.step = None,
+        Change::EndTurn(_) => state.open = None,
+        Change::Owe(item) => state.open.as_mut().ok_or_else(missing)?.owe(item),
+        Change::Settle(item) => {
+            if !state.open.as_mut().ok_or_else(missing)?.settle(item) {
+                return Err(ContextError::Corrupt("owed count underflow".into()));
+            }
+        }
+    }
+    Ok(state)
+}
+
+pub(super) struct Replayed<'a> {
+    pub position: u64,
+    pub event_id: &'a str,
+    pub kind: &'a EventKind,
+    pub stamp: Option<TurnStamp>,
+    pub run: Option<&'a str>,
+}
+
+pub(super) struct Replay {
+    pub turn: OpenTurn,
+    pub owed: Vec<Owed>,
+    pub open_messages: BTreeMap<String, MessageState>,
+}
+
+pub(super) fn replay<'a>(
+    holder: TurnHolder<'_>,
+    events: impl IntoIterator<Item = Replayed<'a>>,
+) -> ContextResult<Replay> {
+    let invalid = || ContextError::Corrupt("invalid event sequence in turn replay".into());
+    let mut state = TurnState {
+        open: None,
+        numbers: Numbers::default(),
+    };
+    let mut last_position = None::<u64>;
+    let mut first_step = true;
+    let mut messages = BTreeMap::<String, MessageState>::new();
+    let mut results = HashMap::<String, Owed>::new();
+    for event in events {
+        let stamp = event.stamp.ok_or_else(invalid)?;
+        if let Some(last) = last_position {
+            if last.checked_add(1) != Some(event.position) {
+                return Err(invalid());
+            }
+        } else {
+            if event.kind != &EventKind::TurnStarted || event.position == 0 {
+                return Err(invalid());
+            }
+            state.numbers.turns = stamp.number.checked_sub(1).ok_or_else(invalid)?;
+        }
+        last_position = Some(event.position);
+        if first_step && event.kind == &EventKind::StepStarted {
+            state.numbers.steps = stamp
+                .step
+                .and_then(|n| n.checked_sub(1))
+                .ok_or_else(invalid)?;
+            first_step = false;
+        }
+        let mut message_step = None;
+        let owed = match event.kind {
+            EventKind::ToolCall {
+                message_id: Some(id),
+                ..
+            } => {
+                message_step = messages.get(id).map(|m| m.step);
+                None
+            }
+            EventKind::ToolResult { call_id, .. } => results.remove(call_id),
+            EventKind::AssistantTerminal { message_id, .. } => {
+                messages.get(message_id).map(|m| Owed::Terminal {
+                    message_id: message_id.clone(),
+                    step: m.step,
+                })
+            }
+            _ => None,
+        };
+        let admitted = admit(
+            &state,
+            Write {
+                kind: event.kind,
+                run: event.run,
+                message_step,
+                owed,
+            },
+        )
+        .map_err(|_| invalid())?;
+        if admitted.stamp != Some(stamp) || matches!(admitted.change, Change::EndTurn(_)) {
+            return Err(invalid());
+        }
+        if let Change::Owe(item @ Owed::Result { call_id, .. }) = &admitted.change {
+            if results.insert(call_id.clone(), item.clone()).is_some() {
+                return Err(invalid());
+            }
+        }
+        if let Some(id) = assistant_message_id(event.kind) {
+            let updated =
+                message_transition(event.kind, messages.remove(id), event.stamp, event.position)
+                    .map_err(|_| invalid())?;
+            messages.insert(id.into(), updated);
+        }
+        state = apply(
+            state,
+            &admitted.change,
+            holder,
+            event.event_id,
+            event.position,
+        )?;
+    }
+    messages.retain(|_, m| m.terminal.is_none());
+    let mut owed: Vec<_> = messages
+        .iter()
+        .map(|(id, m)| Owed::Terminal {
+            message_id: id.clone(),
+            step: m.step,
+        })
+        .chain(results.into_values())
+        .collect();
+    owed.sort();
+    Ok(Replay {
+        turn: state.open.ok_or_else(invalid)?,
+        owed,
+        open_messages: messages,
+    })
+}
+
+pub(super) fn assistant_message_id(kind: &EventKind) -> Option<&str> {
+    match kind {
+        EventKind::AssistantStarted { message_id }
+        | EventKind::AssistantFragment { message_id, .. }
+        | EventKind::AssistantTerminal { message_id, .. } => Some(message_id),
+        _ => None,
+    }
 }

@@ -203,6 +203,10 @@ impl Scoped<'_> {
         &self.table(kind.module()).payloads
     }
     #[cfg(test)]
+    pub(crate) fn drop_next_commit(&self, partition: &Partition) {
+        self.records.kernel.drop_next_commit(partition);
+    }
+    #[cfg(test)]
     pub(crate) fn lose_next_commit_ack(&self) {
         self.records
             .kernel
@@ -298,7 +302,7 @@ impl Scoped<'_> {
             .as_ref()
             .try_into()
             .map_err(|_| ContextError::Corrupt("invalid head revision".into()))?;
-        self.header_locked(&RecordPin {
+        self.exact_header(&RecordPin {
             record: record.clone(),
             revision: u64::from_be_bytes(revision),
         })
@@ -311,6 +315,22 @@ impl Scoped<'_> {
                 "revision must be positive".into(),
             ));
         }
+        match self.exact_header(pin) {
+            Err(ContextError::NotFound(_)) => {
+                let head = self.head_locked(&pin.record)?;
+                if head.pin.revision > pin.revision {
+                    return Err(ContextError::RevisionConflict {
+                        expected: pin.revision,
+                        actual: head.pin.revision,
+                    });
+                }
+                Err(ContextError::NotFound(pin.record.clone()))
+            }
+            result => result,
+        }
+    }
+
+    fn exact_header(&self, pin: &RecordPin) -> ContextResult<RecordHeader> {
         let bytes = self
             .table(pin.record.kind.module())
             .headers
@@ -457,6 +477,11 @@ impl Scoped<'_> {
         let mut memo = BTreeMap::new();
         for source in sources {
             let header = self.header_locked(source)?;
+            if source.record.kind == RecordKind::Session {
+                return Err(ContextError::InvalidInput(
+                    "session headers cannot be sources".into(),
+                ));
+            }
             if source.record.kind == RecordKind::Type {
                 return Err(ContextError::InvalidInput(
                     "type definitions are not observation sources".into(),
@@ -517,6 +542,11 @@ impl Scoped<'_> {
         }
         for source in sources {
             let header = self.header_locked(source)?;
+            if source.record.kind == RecordKind::Session {
+                return Err(ContextError::InvalidInput(
+                    "session headers cannot be sources".into(),
+                ));
+            }
             if header.scope != *scope && header.scope != Scope::Personal {
                 return Err(ContextError::AccessDenied);
             }
@@ -539,9 +569,18 @@ impl Scoped<'_> {
         domain: &'static str,
         input: &T,
     ) -> ContextResult<[u8; 32]> {
+        self.digest_with_provenance(domain, self.provenance(), input)
+    }
+
+    pub(crate) fn digest_with_provenance<T: Serialize>(
+        &self,
+        domain: &'static str,
+        provenance: Provenance,
+        input: &T,
+    ) -> ContextResult<[u8; 32]> {
         let mut h = self.records.kernel.keyed_hasher("context-operation");
         h.update(domain.as_bytes());
-        h.update(&encode(&(&self.access.owner, self.provenance(), input))?);
+        h.update(&encode(&(&self.access.owner, provenance, input))?);
         Ok(*h.finalize().as_bytes())
     }
 
@@ -560,6 +599,15 @@ impl Scoped<'_> {
             .transpose()
     }
 
+    fn check_receipt_scope(&self, pin: &RecordPin) -> ContextResult<()> {
+        if pin.record.kind == RecordKind::Session {
+            self.head_locked(&pin.record)?;
+        } else {
+            self.header_locked(pin)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn operation_receipt(
         &self,
         operation: OperationId,
@@ -567,7 +615,7 @@ impl Scoped<'_> {
         let _guard = self.lock();
         let stored = self.stored_operation(operation)?;
         if let Some(stored) = &stored {
-            self.header_locked(&stored.receipt.pin)?;
+            self.check_receipt_scope(&stored.receipt.pin)?;
         }
         Ok(stored.map(|stored| stored.receipt))
     }
@@ -583,7 +631,7 @@ impl Scoped<'_> {
         if stored.digest != digest {
             return Err(ContextError::IdempotencyConflict);
         }
-        self.header_locked(&stored.receipt.pin)?;
+        self.check_receipt_scope(&stored.receipt.pin)?;
         Ok(Some(stored.receipt))
     }
 
@@ -618,6 +666,11 @@ impl Scoped<'_> {
         header: &RecordHeader,
     ) -> ContextResult<()> {
         let table = self.table(header.pin.record.kind.module());
+        if header.pin.record.kind == RecordKind::Session && header.pin.revision > 1 {
+            let mut previous = header.pin.clone();
+            previous.revision -= 1;
+            batch.remove(&table.headers, revision_key(&previous));
+        }
         batch.insert(&table.headers, revision_key(&header.pin), encode(header)?);
         batch.insert(
             &table.heads,

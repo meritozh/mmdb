@@ -167,6 +167,16 @@ fn main() -> Result<()> {
             .first()
             .ok_or("real task object lacks provenance")?
             .clone();
+        log.create_session(
+            OperationId::new(),
+            mmdb::session::NewSession {
+                session: "independent-lifecycle".into(),
+                kind: "chat".into(),
+                parent: None,
+                metadata: serde_json::Value::Null,
+            },
+            Scope::Personal,
+        )?;
         let anchor = log
             .append(
                 OperationId::new(),

@@ -9,6 +9,7 @@ const SESSION: &str = "chat";
 fn fixture() -> (tempfile::TempDir, Store) {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::create(directory.path().join("store")).unwrap();
+    create_session(&system(&store), SESSION, Scope::Personal);
     (directory, store)
 }
 
@@ -130,6 +131,7 @@ fn a_turn_left_open_by_an_exited_process_ends_interrupted_on_open() {
     const CHILD_ROOT: &str = "MMDB_TEST_INTERRUPTED_TURN_ROOT";
     if let Some(root) = std::env::var_os(CHILD_ROOT) {
         let store = Store::create(root).unwrap();
+        create_session(&system(&store), SESSION, Scope::Personal);
         let log = system(&store);
         open_step(&log);
         write(&log, "message", started("m"));
@@ -214,6 +216,7 @@ fn recovery_reads_no_source_of_an_owed_call() {
     };
     let log = store.session_log(access.clone()).unwrap();
     let personal = write(&log, "personal", EventKind::Notice);
+    create_session(&log, "workspace-chat", workspace.clone());
     let event = |id, kind| EventInput {
         session: "workspace-chat".into(),
         scope: workspace.clone(),
@@ -354,6 +357,7 @@ fn a_turn_needs_a_run_and_a_session_holds_one_open_turn() {
         EventKind::StepStarted,
         TurnError::StepOpen,
     );
+    create_session(&log, "another-session", Scope::Personal);
     let event = EventInput {
         session: "another-session".into(),
         ..input("turn", EventKind::TurnStarted)
@@ -502,6 +506,7 @@ fn withdrawn_turn_events_keep_numbers_and_turn_state() {
         ]
     );
 
+    create_session(&log, "purged-starts", Scope::Personal);
     let append = |id, kind| {
         let event = EventInput {
             session: "purged-starts".into(),
@@ -952,6 +957,7 @@ fn a_closing_result_fits_the_reserved_budget() {
         };
         source = log.append(OperationId::new(), event, &[][..]).unwrap().pin;
     }
+    create_session(&log, "workspace-chat", workspace.clone());
     let event = |id, kind| EventInput {
         session: "workspace-chat".into(),
         scope: workspace.clone(),
@@ -1001,6 +1007,7 @@ fn an_owed_call_gets_its_result_after_it_becomes_unreadable() {
         ..ContextAccess::new("owner", Actor::Operator)
     };
     let log = db.session_log(profile).unwrap();
+    create_session(&log, "private", Scope::Personal);
     let personal = EventInput {
         session: "private".into(),
         ..input("source", EventKind::Notice)
@@ -1010,6 +1017,7 @@ fn an_owed_call_gets_its_result_after_it_becomes_unreadable() {
         .unwrap()
         .pin;
     for mode in ["purge", "retract", "fragment"] {
+        create_session(&log, mode, workspace.clone());
         let event = |id: &str, kind| EventInput {
             session: mode.into(),
             scope: workspace.clone(),
@@ -1107,4 +1115,18 @@ fn turn_errors_follow_their_precedence() {
     write(&log, "step-end", end_step("step"));
     write(&log, "turn-end", completed("turn"));
     refused(&log, "late", call("c", Some("m")), TurnError::OutsideTurn);
+}
+
+fn create_session(log: &SessionLog<'_>, name: &str, scope: Scope) {
+    log.create_session(
+        OperationId::new(),
+        mmdb::session::NewSession {
+            session: name.into(),
+            kind: "chat".into(),
+            parent: None,
+            metadata: serde_json::Value::Null,
+        },
+        scope,
+    )
+    .unwrap();
 }

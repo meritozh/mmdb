@@ -80,15 +80,38 @@ impl SessionLog<'_> {
             bytes_examined: 0,
             events_examined: 0,
         };
-        for entry in self.parts.order.range(start.clone()..) {
-            let (key, reference) = entry?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
+        let view;
+        let entries: Box<dyn Iterator<Item = ContextResult<_>> + '_> =
+            if let Some(session) = &query.session {
+                view = self.view(session)?;
+                let after = if query.cursor.is_some() {
+                    let suffix = start[prefix.len()..]
+                        .try_into()
+                        .map_err(|_| ContextError::InvalidInput("invalid search cursor".into()))?;
+                    u64::from_be_bytes(suffix).saturating_sub(1)
+                } else {
+                    0
+                };
+                Box::new(view.entries_after(after).map(move |row| {
+                    let (position, entry) = row?;
+                    let mut key = prefix.clone();
+                    key.extend(position.to_be_bytes());
+                    Ok((key, entry))
+                }))
+            } else {
+                Box::new(super::view::scan(
+                    self.parts,
+                    &self.scoped.access().owner,
+                    prefix,
+                    start,
+                ))
+            };
+        for entry in entries {
+            let (key, entry) = entry?;
             let mut offset = query
                 .cursor
                 .as_ref()
-                .filter(|cursor| cursor.key.as_slice() == key.as_ref())
+                .filter(|cursor| cursor.key.as_slice() == key.as_slice())
                 .map_or(0, |cursor| cursor.offset);
             if result.events_examined == query.max_events || result.matches.len() == query.limit {
                 result.cursor = Some(LogSearchCursor {
@@ -99,7 +122,7 @@ impl SessionLog<'_> {
                 return Ok(result);
             }
             result.events_examined += 1;
-            let header = match self.scoped.head_locked(&decode(&reference)?) {
+            let header = match self.scoped.head_locked(&entry.record) {
                 Ok(header) => header,
                 Err(ContextError::AccessDenied) => continue,
                 Err(error) => return Err(error),

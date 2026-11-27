@@ -8,6 +8,15 @@ use std::io::{self, Read};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+fn catalog_query(limit: usize) -> SessionQuery {
+    SessionQuery {
+        limit,
+        before: None,
+        kind: None,
+        parent: None,
+    }
+}
+
 fn access(owner: &str) -> ContextAccess {
     ContextAccess::new(owner, Actor::System)
 }
@@ -128,6 +137,7 @@ fn independent_harnesses_share_types_history_and_relations_after_reopen() {
     let root = dir.path().join("context");
     let (paper, decision, link, type_pin, raw) = {
         let db = Store::create(&root).unwrap();
+        create_session(&db, "owner", "session-a", Scope::Personal);
         let research_log = db.session_log(access("owner")).unwrap();
         let research = db.context(access("owner")).unwrap();
         let raw = source(
@@ -207,6 +217,7 @@ fn independent_harnesses_share_types_history_and_relations_after_reopen() {
 fn type_versions_are_reused_and_old_instances_keep_their_schema() {
     let dir = tempfile::tempdir().unwrap();
     let db = Store::create(dir.path().join("context")).unwrap();
+    create_session(&db, "owner", "session-a", Scope::Personal);
     let log = db.session_log(access("owner")).unwrap();
     let context = db.context(access("owner")).unwrap();
     let raw = source(&log, "raw", "A bounded observation");
@@ -267,6 +278,7 @@ fn type_versions_are_reused_and_old_instances_keep_their_schema() {
 fn source_and_property_validation_reject_cross_owner_or_wrong_type() {
     let dir = tempfile::tempdir().unwrap();
     let db = Store::create(dir.path().join("context")).unwrap();
+    create_session(&db, "alice", "session-a", Scope::Personal);
     let alice_log = db.session_log(access("alice")).unwrap();
     let alice = db.context(access("alice")).unwrap();
     let bob_log = db.session_log(access("bob")).unwrap();
@@ -320,6 +332,7 @@ fn private_sources_do_not_become_public_through_objects_or_relations() {
     let all_log = db.session_log(permitted.clone()).unwrap();
     let all = db.context(permitted).unwrap();
     let mut raw_input = event_input("private", "raw");
+    create_session(&db, "owner", "private", private.clone());
     raw_input.scope = private.clone();
     let raw = all_log
         .append(OperationId::new(), raw_input, b"private fact".as_slice())
@@ -360,6 +373,7 @@ fn complete_large_history_is_searchable_across_chunks_and_query_pages() {
     bytes[tail_at..].copy_from_slice(tail);
     let pin = {
         let db = Store::create(&root).unwrap();
+        create_session(&db, "owner", "long", Scope::Personal);
         db.session_log(access("owner"))
             .unwrap()
             .append(
@@ -415,6 +429,7 @@ fn complete_large_history_is_searchable_across_chunks_and_query_pages() {
 fn append_retries_preserve_identity_and_order_even_after_later_events() {
     let dir = tempfile::tempdir().unwrap();
     let db = Store::create(dir.path().join("context")).unwrap();
+    create_session(&db, "owner", "session", Scope::Personal);
     let log = db.session_log(access("owner")).unwrap();
     let operation = OperationId::new();
     let mut input = event_input("session", "first");
@@ -456,6 +471,7 @@ fn append_retries_preserve_identity_and_order_even_after_later_events() {
 fn concurrent_appends_allocate_one_session_order() {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(Store::create(dir.path().join("context")).unwrap());
+    create_session(&db, "owner", "shared", Scope::Personal);
     let jobs: Vec<_> = (0..8)
         .map(|index| {
             let db = db.clone();
@@ -495,6 +511,7 @@ fn concurrent_appends_allocate_one_session_order() {
 fn tool_results_require_their_call_and_follow_its_purge_state() {
     let dir = tempfile::tempdir().unwrap();
     let db = Store::create(dir.path().join("context")).unwrap();
+    create_session(&db, "owner", "session", Scope::Personal);
     let log = turn_log(&db, Actor::Operator);
     boundary(&log, "session", "turn", EventKind::TurnStarted);
     let mut result = event_input("session", "result");
@@ -536,6 +553,7 @@ fn purged_sources_stay_unavailable_after_reopen_recovery_and_replay() {
     let operation = OperationId::new();
     let (raw, note, input) = {
         let db = Store::create(&root).unwrap();
+        create_session(&db, "owner", "session-a", Scope::Personal);
         let log = db.session_log(access("owner")).unwrap();
         let context = db.context(access("owner")).unwrap();
         let raw = source(&log, "raw", "sensitive observation");
@@ -577,6 +595,7 @@ fn purged_sources_stay_unavailable_after_reopen_recovery_and_replay() {
 fn correction_replaces_postings_and_retains_explicit_history() {
     let dir = tempfile::tempdir().unwrap();
     let db = Store::create(dir.path().join("context")).unwrap();
+    create_session(&db, "owner", "session-a", Scope::Personal);
     let log = db.session_log(access("owner")).unwrap();
     let context = db.context(access("owner")).unwrap();
     let raw = source(&log, "raw", "A correction source");
@@ -626,6 +645,7 @@ fn correction_replaces_postings_and_retains_explicit_history() {
 fn revisions_cannot_introduce_self_dependent_source_chains() {
     let dir = tempfile::tempdir().unwrap();
     let db = Store::create(dir.path().join("context")).unwrap();
+    create_session(&db, "owner", "session-a", Scope::Personal);
     let log = db.session_log(access("owner")).unwrap();
     let store = db.context(access("owner")).unwrap();
     let raw = source(&log, "raw", "observation");
@@ -672,6 +692,7 @@ fn revisions_cannot_introduce_self_dependent_source_chains() {
 fn relationship_cycles_are_bounded_and_inactive_endpoints_are_excluded() {
     let dir = tempfile::tempdir().unwrap();
     let db = Store::create(dir.path().join("context")).unwrap();
+    create_session(&db, "owner", "session-a", Scope::Personal);
     let log = db.session_log(access("owner")).unwrap();
     let context = db.context(access("owner")).unwrap();
     let raw = source(&log, "raw", "source");
@@ -717,6 +738,7 @@ fn relationship_cycles_are_bounded_and_inactive_endpoints_are_excluded() {
 fn relation_pages_apply_direction_scope_time_and_type_filters_without_stalling() {
     let dir = tempfile::tempdir().unwrap();
     let db = Store::create(dir.path().join("context")).unwrap();
+    create_session(&db, "owner", "session-a", Scope::Personal);
     let private = Scope::Session(ulid::Ulid::new());
     let mut permitted = access("owner");
     permitted.scopes.push(private.clone());
@@ -847,6 +869,7 @@ fn whole_store_reset_quarantines_the_directory_and_starts_new_eras() {
     let root = dir.path().canonicalize().unwrap().join("context");
     let (old, old_type, memory_plan) = {
         let db = Store::create(&root).unwrap();
+        create_session(&db, "owner", "session-a", Scope::Personal);
         let old = source(
             &db.session_log(access("owner")).unwrap(),
             "old",
@@ -915,6 +938,7 @@ fn whole_store_reset_quarantines_the_directory_and_starts_new_eras() {
 fn chinese_terms_find_curated_context_without_embeddings() {
     let dir = tempfile::tempdir().unwrap();
     let db = Store::create(dir.path().join("context")).unwrap();
+    create_session(&db, "owner", "session-a", Scope::Personal);
     let log = db.session_log(access("owner")).unwrap();
     let context = db.context(access("owner")).unwrap();
     let raw = source(&log, "raw", "项目需要考虑交易日窗口。");
@@ -960,6 +984,7 @@ fn incomplete_uploads_never_advance_history_and_can_be_cleaned() {
     let operation = OperationId::new();
     {
         let db = Store::create(&root).unwrap();
+        create_session(&db, "owner", "session", Scope::Personal);
         let log = db.session_log(access("owner")).unwrap();
         assert!(matches!(
             log.append(
@@ -1020,6 +1045,7 @@ fn history_crash_child() {
         }
     }
     let db = Store::create(root).unwrap();
+    create_session(&db, "owner", "session", Scope::Personal);
     db.session_log(access("owner"))
         .unwrap()
         .append(
@@ -1072,6 +1098,8 @@ fn format_and_store_identity_prevent_accidental_adoption() {
         "mmdb-store-dev11",
         "mmdb-store-v1",
         "mmdb-store-v2",
+        "mmdb-store-v3",
+        "mmdb-store-v4",
     ] {
         let legacy = dir.path().join(legacy_format);
         std::fs::create_dir(&legacy).unwrap();
@@ -1086,6 +1114,7 @@ fn format_and_store_identity_prevent_accidental_adoption() {
         ));
     }
     let first = Store::create(dir.path().join("first")).unwrap();
+    create_session(&first, "owner", "session-a", Scope::Personal);
     let log = first.session_log(access("owner")).unwrap();
     let context = first.context(access("owner")).unwrap();
     let pin = source(&log, "raw", "one era");
@@ -1114,6 +1143,7 @@ fn format_and_store_identity_prevent_accidental_adoption() {
 fn source_validation_reserves_the_new_root_depth_and_aggregate_budget() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Store::create(tmp.path().join("context")).unwrap();
+    create_session(&db, "owner", "session-a", Scope::Personal);
     let log = db.session_log(access("owner")).unwrap();
     let store = db.context(access("owner")).unwrap();
     let root = source(&log, "source", "evidence");
@@ -1151,6 +1181,7 @@ fn source_validation_reserves_the_new_root_depth_and_aggregate_budget() {
 fn action_discovery_and_preparation_share_the_same_target_scope() {
     let d = tempfile::tempdir().unwrap();
     let db = Store::create(d.path().join("db")).unwrap();
+    create_session(&db, "owner", "session-a", Scope::Personal);
     let a = Scope::Session(ulid::Ulid::new());
     let b = Scope::Session(ulid::Ulid::new());
     let mut access = access("owner");
@@ -1207,6 +1238,7 @@ fn action_discovery_and_preparation_share_the_same_target_scope() {
 fn action_contract_enforces_authority_versions_conditions_and_one_preparation() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Arc::new(Store::create(tmp.path().join("context")).unwrap());
+    create_session(&db, "owner", "session-a", Scope::Personal);
     let log = db.session_log(access("owner")).unwrap();
     let store = db.context(access("owner")).unwrap();
     let evidence = source(&log, "source", "milestone instruction");
@@ -1367,9 +1399,11 @@ fn action_contract_enforces_authority_versions_conditions_and_one_preparation() 
 }
 
 #[test]
-fn copied_history_tracks_source_availability_and_session_catalog_pages() {
+fn copied_history_tracks_source_availability() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Store::create(tmp.path().join("context")).unwrap();
+    create_session(&db, "owner", "model-session", Scope::Personal);
+    create_session(&db, "owner", "session-a", Scope::Personal);
     let log = db.session_log(access("owner")).unwrap();
     let store = db.context(access("owner")).unwrap();
     let original = source(&log, "source", "withdrawable-secret");
@@ -1396,46 +1430,13 @@ fn copied_history_tracks_source_availability_and_session_catalog_pages() {
         store.validate_current(&[copy.pin], None),
         Err(ContextError::Unavailable(_))
     ));
-    for index in 0..7 {
-        log.append(
-            OperationId::new(),
-            event_input(&format!("session-{index}"), "input"),
-            b"original".as_slice(),
-        )
-        .unwrap();
-    }
-    let mut sessions = BTreeSet::new();
-    let mut after = None;
-    loop {
-        let page = log.sessions(2, after.as_deref()).unwrap();
-        for session in page.sessions {
-            assert!(sessions.insert(session));
-        }
-        match page.next {
-            Some(next) => after = Some(next),
-            None => break,
-        }
-    }
-    assert_eq!(sessions.len(), 9);
-    assert!(db
-        .session_log(access("another-owner"))
-        .unwrap()
-        .sessions(2, None)
-        .unwrap()
-        .sessions
-        .is_empty());
-    assert!(matches!(
-        db.session_log(ContextAccess::new("owner", Actor::Assistant))
-            .unwrap()
-            .sessions(2, None),
-        Err(ContextError::AccessDenied)
-    ));
 }
 
 #[test]
 fn current_validation_rejects_changed_dependencies_without_breaking_historical_reads() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Store::create(tmp.path().join("context")).unwrap();
+    create_session(&db, "owner", "session-a", Scope::Personal);
     let log = db.session_log(access("owner")).unwrap();
     let store = db.context(access("owner")).unwrap();
     let root = source(&log, "original", "original instruction");
@@ -1476,6 +1477,7 @@ fn checkpoint_parent_and_epoch_are_compared_atomically_and_survive_reopen() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("context");
     let db = Store::create(&path).unwrap();
+    create_session(&db, "owner", "session-a", Scope::Personal);
     let log = db.session_log(access("owner")).unwrap();
     let store = db.context(access("owner")).unwrap();
     let anchor = source(&log, "event", "original");
@@ -1539,6 +1541,7 @@ fn live_revision_keeps_checkpoint_derived_originals_and_pairs_the_completed_tool
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("context");
     let db = Store::create(&path).unwrap();
+    create_session(&db, "owner", "session-a", Scope::Personal);
     let log = turn_log(&db, Actor::System);
     let store = db.context(access("owner")).unwrap();
     let raw = source(&log, "original", "SQLite source text");
@@ -1684,6 +1687,7 @@ fn live_revision_keeps_checkpoint_derived_originals_and_pairs_the_completed_tool
 fn checkpoint_history_redaction_remains_conservative_for_unlisted_summary_input() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Store::create(tmp.path().join("context")).unwrap();
+    create_session(&db, "owner", "session-a", Scope::Personal);
     let log = db.session_log(access("owner")).unwrap();
     let store = db.context(access("owner")).unwrap();
     let omitted = source(
@@ -1745,6 +1749,7 @@ fn session_and_child_run_checkpoints_keep_independent_cas_chains_across_reopen()
 
     let (base, first) = {
         let db = Store::create(&path).unwrap();
+        create_session(&db, "owner", "session-a", Scope::Personal);
         let log = db.session_log(access("owner")).unwrap();
         let store = db.context(access("owner")).unwrap();
         let anchor = source(&log, "anchor", "committed parent history");
@@ -1901,6 +1906,8 @@ fn session_and_child_run_checkpoints_keep_independent_cas_chains_across_reopen()
 fn log_copies_stay_readable_after_their_sources_change() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Store::create(tmp.path().join("context")).unwrap();
+    create_session(&db, "owner", "session-a", Scope::Personal);
+    create_session(&db, "owner", "snapshot-session", Scope::Personal);
     let log = db.session_log(access("owner")).unwrap();
     let store = db.context(access("owner")).unwrap();
     let raw = source(&log, "evidence", "original observation");
@@ -2023,6 +2030,8 @@ fn history_copy_chain(log: &SessionLog<'_>, max_depth: u64) -> Vec<RecordPin> {
 fn history_copy_reserves_new_root_depth_before_committing_an_unreadable_record() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Store::create(tmp.path().join("context")).unwrap();
+    create_session(&db, "owner", "session-a", Scope::Personal);
+    create_session(&db, "owner", "depth-session", Scope::Personal);
     let log = db.session_log(access("owner")).unwrap();
     let chain = history_copy_chain(&log, 32);
     assert_eq!(
@@ -2071,6 +2080,9 @@ fn history_copy_reserves_new_root_depth_before_committing_an_unreadable_record()
 fn a_tool_call_reserves_room_for_its_result() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Store::create(tmp.path().join("context")).unwrap();
+    create_session(&db, "owner", "session-a", Scope::Personal);
+    create_session(&db, "owner", "depth-session", Scope::Personal);
+    create_session(&db, "owner", "tool-session", Scope::Personal);
     let log = turn_log(&db, Actor::System);
     boundary(&log, "tool-session", "turn", EventKind::TurnStarted);
     let chain = history_copy_chain(&log, 31);
@@ -2112,6 +2124,7 @@ fn a_tool_call_reserves_room_for_its_result() {
 fn tool_results_stay_readable_after_their_call_source_is_purged() {
     let temp = tempfile::tempdir().unwrap();
     let db = Store::create(temp.path().join("context")).unwrap();
+    create_session(&db, "owner", "session-a", Scope::Personal);
     let log = turn_log(&db, Actor::System);
     boundary(&log, "session-a", "turn", EventKind::TurnStarted);
     let store = db.context(access("owner")).unwrap();
@@ -2183,6 +2196,8 @@ fn tool_results_stay_readable_after_their_call_source_is_purged() {
 fn history_copy_shares_the_aggregate_source_budget_including_its_new_root() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Store::create(tmp.path().join("context")).unwrap();
+    create_session(&db, "owner", "budget-session", Scope::Personal);
+    create_session(&db, "owner", "session-a", Scope::Personal);
     let log = db.session_log(access("owner")).unwrap();
     let raw = source(&log, "root", "original evidence");
     let mut wide = event_input("budget-session", "wide");
@@ -2228,6 +2243,7 @@ fn history_copy_shares_the_aggregate_source_budget_including_its_new_root() {
 fn a_log_copy_needs_the_scopes_of_its_sources() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Store::create(tmp.path().join("context")).unwrap();
+    create_session(&db, "owner", "session-a", Scope::Personal);
     let workspace = Scope::Workspace(ulid::Ulid::new());
     let mut authorized = access("owner");
     authorized.scopes.push(workspace.clone());
@@ -2235,6 +2251,7 @@ fn a_log_copy_needs_the_scopes_of_its_sources() {
     let store = db.context(authorized).unwrap();
     let raw = source(&log, "raw", "personal detail");
     let mut input = event_input("work", "copy");
+    create_session(&db, "owner", "work", workspace.clone());
     input.scope = workspace.clone();
     input.sources = vec![raw];
     let copy = log
@@ -2287,6 +2304,7 @@ fn a_log_copy_needs_the_scopes_of_its_sources() {
 fn purging_a_log_event_hides_what_was_derived_from_it() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Store::create(tmp.path().join("context")).unwrap();
+    create_session(&db, "owner", "session-a", Scope::Personal);
     let log = db
         .session_log(ContextAccess::new("owner", Actor::Operator))
         .unwrap();
@@ -2351,6 +2369,7 @@ fn purging_a_log_event_hides_what_was_derived_from_it() {
 fn a_withdrawn_fragment_hides_its_whole_message() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Store::create(tmp.path().join("context")).unwrap();
+    create_session(&db, "owner", "session-a", Scope::Personal);
     let log = turn_log(&db, Actor::Operator);
     boundary(&log, "session-a", "turn", EventKind::TurnStarted);
     boundary(&log, "session-a", "step", EventKind::StepStarted);
@@ -2426,7 +2445,7 @@ fn a_legacy_directory_resets_into_an_empty_store() {
     let store = Store::open(&root).unwrap();
     let log = store.session_log(access("owner")).unwrap();
     let context = store.context(access("owner")).unwrap();
-    assert!(log.sessions(10, None).unwrap().sessions.is_empty());
+    assert!(log.sessions(catalog_query(10)).unwrap().sessions.is_empty());
     assert!(context
         .query_current_valid(None, None, 10)
         .unwrap()
@@ -2461,6 +2480,7 @@ fn session_log_and_context_reject_the_same_invalid_access() {
 fn access_bound_to_a_session_appends_only_to_it() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::create(dir.path().join("store")).unwrap();
+    create_session(&store, "owner", "bound", Scope::Personal);
     let mut profile = access("owner");
     profile.session = Some("bound".into());
     let log = store.session_log(profile).unwrap();
@@ -2488,6 +2508,7 @@ fn log_permissions_follow_the_actor() {
         Actor::Operator,
     ] {
         let owner = format!("{actor:?}");
+        create_session(&store, &owner, "s", Scope::Personal);
         let log = store
             .session_log(ContextAccess::new(&owner, actor))
             .unwrap();
@@ -2497,13 +2518,15 @@ fn log_permissions_follow_the_actor() {
         } else {
             message.unwrap();
         }
-        let sessions = log.sessions(5, None);
+        let sessions = log.sessions(catalog_query(5));
         if matches!(actor, Actor::System | Actor::Operator) {
-            assert_eq!(sessions.unwrap().sessions, ["s"]);
+            let page = sessions.unwrap();
+            assert_eq!(page.sessions, [log.session("s").unwrap()]);
         } else {
             assert!(matches!(sessions, Err(ContextError::AccessDenied)));
         }
         let writer = store.session_log(access(&owner)).unwrap();
+        create_session(&store, &owner, "session-a", Scope::Personal);
         let first = source(&writer, "retract", "first");
         let second = source(&writer, "purge", "second");
         for result in [
@@ -2534,6 +2557,7 @@ fn log_query() -> LogQuery {
 fn log_reads_and_searches_refuse_budgets_over_their_limits() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::create(dir.path().join("store")).unwrap();
+    create_session(&store, "owner", "session-a", Scope::Personal);
     let log = store.session_log(access("owner")).unwrap();
     let pin = source(&log, "event", "hit");
     assert_eq!(
@@ -2572,6 +2596,9 @@ fn log_reads_and_searches_refuse_budgets_over_their_limits() {
 fn search_walks_sessions_in_key_order_and_events_in_sequence() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::create(dir.path().join("store")).unwrap();
+    create_session(&store, "owner", "aa", Scope::Personal);
+    create_session(&store, "owner", "bb", Scope::Personal);
+    create_session(&store, "owner", "z", Scope::Personal);
     let log = store.session_log(access("owner")).unwrap();
     for session in ["bb", "z", "aa", "z", "bb", "aa"] {
         let seq = log.position(session).unwrap() + 1;
@@ -2619,6 +2646,7 @@ fn search_walks_sessions_in_key_order_and_events_in_sequence() {
 fn recall_reaches_through_log_events_but_returns_memory_records() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::create(dir.path().join("store")).unwrap();
+    create_session(&store, "owner", "session-a", Scope::Personal);
     let log = store.session_log(access("owner")).unwrap();
     let context = store.context(access("owner")).unwrap();
     let event = source(&log, "event", "raw");
@@ -2684,6 +2712,7 @@ fn recall_reaches_through_log_events_but_returns_memory_records() {
 fn one_operation_id_names_one_write_across_the_log_and_context() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::create(dir.path().join("store")).unwrap();
+    create_session(&store, "owner", "s", Scope::Personal);
     let log = store.session_log(access("owner")).unwrap();
     let context = store.context(access("owner")).unwrap();
     let id = OperationId::new();
@@ -2709,6 +2738,7 @@ fn one_operation_id_names_one_write_across_the_log_and_context() {
 fn record_handles_reject_another_kind_before_checking_access() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::create(dir.path().join("store")).unwrap();
+    create_session(&store, "owner", "session-a", Scope::Personal);
     let log = store.session_log(access("owner")).unwrap();
     let context = store.context(access("owner")).unwrap();
     let event = source(&log, "event", "text");
@@ -2871,6 +2901,7 @@ fn memory_reset_keeps_the_session_log_and_hides_old_memory() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("store");
     let mut db = Store::create(&root).unwrap();
+    create_session(&db, "owner", "session-a", Scope::Personal);
     let native_query = RecallQuery {
         text: "native evidence".into(),
         scopes: vec![Scope::Personal],
@@ -3036,6 +3067,7 @@ fn memory_reset_keeps_the_session_log_and_hides_old_memory() {
 fn log_events_that_copied_reset_memory_stay_readable_and_current() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = Store::create(dir.path().join("store")).unwrap();
+    create_session(&db, "owner", "session-a", Scope::Personal);
     let ctx = db.context(access("owner")).unwrap();
     let log = db.session_log(access("owner")).unwrap();
     let anchor = source(&log, "raw", "raw");
@@ -3092,6 +3124,7 @@ fn checkpoints_saved_before_a_memory_reset_cannot_resume() {
     let mut db = Store::create(dir.path().join("store")).unwrap();
     let mut checkpoints = Vec::new();
     for owner in ["first", "second"] {
+        create_session(&db, owner, "session-a", Scope::Personal);
         let log = db.session_log(access(owner)).unwrap();
         source(&log, "original", "original");
         let cp = log
@@ -3148,6 +3181,7 @@ fn checkpoints_saved_before_a_memory_reset_cannot_resume() {
 fn a_checkpoint_generated_before_a_memory_reset_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = Store::create(dir.path().join("store")).unwrap();
+    create_session(&db, "owner", "session-a", Scope::Personal);
     let log = db.session_log(access("owner")).unwrap();
     source(&log, "event", "before");
     let epoch = db
@@ -3175,6 +3209,7 @@ fn a_log_retry_after_a_memory_reset_returns_the_original_receipt() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("store");
     let mut db = Store::create(&root).unwrap();
+    create_session(&db, "owner", "session-a", Scope::Personal);
     let ctx = db.context(access("owner")).unwrap();
     let log = db.session_log(access("owner")).unwrap();
     let memory_op = OperationId::new();
@@ -3221,6 +3256,7 @@ fn a_log_retry_after_a_memory_reset_returns_the_original_receipt() {
 fn reset_purged_and_foreign_refs_fail_differently() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = Store::create(dir.path().join("store")).unwrap();
+    create_session(&db, "owner", "session-a", Scope::Personal);
     let old = db
         .context(access("owner"))
         .unwrap()
@@ -3260,4 +3296,1018 @@ fn reset_purged_and_foreign_refs_fail_differently() {
         foreign.context(access("owner")).unwrap().read(&old),
         Err(ContextError::AccessDenied)
     ));
+}
+
+fn create_session(store: &Store, owner: &str, name: &str, scope: Scope) {
+    let mut access = ContextAccess::new(owner, Actor::System);
+    access.scopes = vec![scope.clone()];
+    store
+        .session_log(access)
+        .unwrap()
+        .create_session(
+            OperationId::new(),
+            mmdb::session::NewSession {
+                session: name.into(),
+                kind: "chat".into(),
+                parent: None,
+                metadata: serde_json::Value::Null,
+            },
+            scope,
+        )
+        .unwrap();
+}
+
+mod sessions {
+    use super::*;
+    use mmdb::{RecordKind, SessionParent, TurnEndReason};
+
+    fn new(name: &str) -> NewSession {
+        NewSession {
+            session: name.into(),
+            kind: "chat".into(),
+            parent: None,
+            metadata: json!({"title":"Inbox"}),
+        }
+    }
+
+    fn origin(session: &str, position: u64) -> mmdb::SessionOrigin {
+        mmdb::SessionOrigin {
+            session: session.into(),
+            position,
+        }
+    }
+
+    #[test]
+    fn a_fork_closes_the_cut_turn_while_the_source_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        let log = turn_log(&store, Actor::System);
+        log.create_session(OperationId::new(), new("source"), Scope::Personal)
+            .unwrap();
+        for (id, kind) in [
+            ("turn", EventKind::TurnStarted),
+            (
+                "call",
+                EventKind::ToolCall {
+                    call_id: "read".into(),
+                    tool_name: "read".into(),
+                    message_id: None,
+                },
+            ),
+            ("step", EventKind::StepStarted),
+            (
+                "start",
+                EventKind::AssistantStarted {
+                    message_id: "msg".into(),
+                },
+            ),
+            (
+                "fragment",
+                EventKind::AssistantFragment {
+                    message_id: "msg".into(),
+                    ordinal: 0,
+                },
+            ),
+        ] {
+            boundary(&log, "source", id, kind);
+        }
+        let before = log.session("source").unwrap();
+        let receipt = log
+            .fork_session(OperationId::new(), new("fork"), origin("source", 5))
+            .unwrap();
+        assert_eq!(log.session("source").unwrap(), before);
+        assert_eq!(receipt.sequence, Some(9));
+        let last = log.events("fork", 8, 1).unwrap().entries.pop().unwrap();
+        assert_eq!(
+            last.event.unwrap().kind,
+            EventKind::TurnEnded {
+                reason: TurnEndReason::Forked,
+                start_event_id: "turn".into()
+            }
+        );
+        let state = log.message_state("fork", "msg").unwrap().unwrap();
+        assert_eq!(
+            (state.started, state.next_fragment, state.terminal),
+            (4, 1, Some(MessageStatus::Interrupted))
+        );
+        let (call, result) = log.tool_pair("fork", "read").unwrap();
+        assert_eq!(result.unwrap().sources, vec![call.unwrap().pin]);
+        for (id, kind) in [
+            (
+                "finish",
+                EventKind::AssistantTerminal {
+                    message_id: "msg".into(),
+                    status: MessageStatus::Completed,
+                },
+            ),
+            (
+                "answer",
+                EventKind::ToolResult {
+                    call_id: "read".into(),
+                    outcome: ToolOutcome::Succeeded,
+                },
+            ),
+            (
+                "step-end",
+                EventKind::StepEnded {
+                    start_event_id: "step".into(),
+                },
+            ),
+            (
+                "end",
+                EventKind::TurnEnded {
+                    start_event_id: "turn".into(),
+                    reason: TurnEndReason::Completed,
+                },
+            ),
+        ] {
+            boundary(&log, "source", id, kind);
+        }
+        assert!(log.session("source").unwrap().open_run.is_none());
+        assert_eq!(log.message_state("fork", "msg").unwrap().unwrap(), state);
+    }
+
+    #[test]
+    fn a_fork_never_sees_source_writes_after_the_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        let log = turn_log(&store, Actor::System);
+        log.create_session(OperationId::new(), new("source"), Scope::Personal)
+            .unwrap();
+        for (id, kind) in [
+            ("turn", EventKind::TurnStarted),
+            ("step", EventKind::StepStarted),
+            (
+                "start",
+                EventKind::AssistantStarted {
+                    message_id: "msg".into(),
+                },
+            ),
+            (
+                "late",
+                EventKind::AssistantFragment {
+                    message_id: "msg".into(),
+                    ordinal: 0,
+                },
+            ),
+            (
+                "call",
+                EventKind::ToolCall {
+                    call_id: "later".into(),
+                    tool_name: "tool".into(),
+                    message_id: None,
+                },
+            ),
+        ] {
+            boundary(&log, "source", id, kind);
+        }
+        log.fork_session(OperationId::new(), new("fork"), origin("source", 3))
+            .unwrap();
+        assert_eq!(
+            log.message_state("fork", "msg")
+                .unwrap()
+                .unwrap()
+                .next_fragment,
+            0
+        );
+        assert_eq!(log.tool_pair("fork", "later").unwrap(), (None, None));
+        boundary(&log, "fork", "late", EventKind::Notice);
+        assert!(log
+            .events("fork", 3, 10)
+            .unwrap()
+            .entries
+            .iter()
+            .all(|header| header.event.as_ref().unwrap().session == "fork"));
+    }
+
+    #[test]
+    fn create_and_fork_retries_return_the_original_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let (created, forked) = {
+            let store = Store::create(&path).unwrap();
+            let log = turn_log(&store, Actor::System);
+            let created = log
+                .create_session(OperationId::new(), new("source"), Scope::Personal)
+                .unwrap();
+            boundary(&log, "source", "turn", EventKind::TurnStarted);
+            let forked = log
+                .fork_session(OperationId::new(), new("fork"), origin("source", 1))
+                .unwrap();
+            assert_eq!(forked.sequence, Some(2));
+            boundary(&log, "fork", "suffix", EventKind::Notice);
+            (created, forked)
+        };
+        let store = Store::open(&path).unwrap();
+        let log = turn_log(&store, Actor::System);
+        assert_eq!(
+            log.create_session(OperationId::new(), new("source"), Scope::Personal)
+                .unwrap(),
+            created
+        );
+        assert_eq!(
+            log.fork_session(OperationId::new(), new("fork"), origin("source", 1))
+                .unwrap(),
+            forked
+        );
+        assert_eq!(log.position("fork").unwrap(), 3);
+    }
+
+    #[test]
+    fn a_fork_reads_the_source_prefix_then_its_own_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        let log = store.session_log(access("owner")).unwrap();
+        log.create_session(OperationId::new(), new("source"), Scope::Personal)
+            .unwrap();
+        let prefix = log
+            .append(
+                OperationId::new(),
+                event_input("source", "a"),
+                &b"needle"[..],
+            )
+            .unwrap();
+        log.append(
+            OperationId::new(),
+            event_input("source", "b"),
+            &b"needle"[..],
+        )
+        .unwrap();
+        let before = log.session("source").unwrap();
+        let mut child = new("fork");
+        child.parent = Some(SessionParent {
+            session: "source".into(),
+            run: "parent-run".into(),
+        });
+        let receipt = log
+            .fork_session(OperationId::new(), child.clone(), origin("source", 1))
+            .unwrap();
+        assert_eq!(receipt.sequence, Some(1));
+        assert_eq!(log.session("source").unwrap(), before);
+        assert_eq!(log.session("fork").unwrap().header.parent, child.parent);
+        assert_eq!(
+            log.append(OperationId::new(), event_input("fork", "a"), &b"needle"[..])
+                .unwrap(),
+            prefix
+        );
+        assert!(matches!(
+            log.append(
+                OperationId::new(),
+                event_input("fork", "a"),
+                &b"changed"[..]
+            ),
+            Err(ContextError::IdempotencyConflict)
+        ));
+        let suffix = log
+            .append(OperationId::new(), event_input("fork", "b"), &b"needle"[..])
+            .unwrap();
+        assert_eq!(suffix.sequence, Some(2));
+        let query = LogQuery {
+            session: Some("fork".into()),
+            text: "needle".into(),
+            max_events: 1,
+            max_bytes: 128,
+            limit: 1,
+            cursor: None,
+        };
+        let first = log.search(query.clone()).unwrap();
+        assert_eq!(first.matches[0].header.pin, prefix.pin);
+        let next = log
+            .search(LogQuery {
+                cursor: first.cursor,
+                ..query
+            })
+            .unwrap();
+        assert_eq!(next.matches[0].header.pin, suffix.pin);
+        assert_eq!(
+            log.events("fork", 0, 10)
+                .unwrap()
+                .entries
+                .into_iter()
+                .map(|h| h.pin)
+                .collect::<Vec<_>>(),
+            vec![prefix.pin, suffix.pin]
+        );
+        assert_eq!(
+            log.fork_session(OperationId::new(), child, origin("source", 1))
+                .unwrap(),
+            receipt
+        );
+    }
+
+    #[test]
+    fn a_fork_starts_without_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        let log = store.session_log(access("owner")).unwrap();
+        log.create_session(OperationId::new(), new("source"), Scope::Personal)
+            .unwrap();
+        let event = log
+            .append(OperationId::new(), event_input("source", "first"), &[][..])
+            .unwrap();
+        let checkpoint = |session: &str| CheckpointInput {
+            session: session.into(),
+            run: "run".into(),
+            scope: CheckpointScope::Session,
+            sequence: 1,
+            expected_previous: None,
+            expected_availability_epoch: store
+                .context(access("owner"))
+                .unwrap()
+                .availability_epoch()
+                .unwrap(),
+            sources: vec![],
+            payload: json!("summary"),
+        };
+        log.save_checkpoint(OperationId::new(), checkpoint("source"))
+            .unwrap();
+        log.fork_session(OperationId::new(), new("fork"), origin("source", 1))
+            .unwrap();
+        assert!(log.latest_checkpoint("fork").unwrap().is_none());
+        let receipt = log
+            .save_checkpoint(OperationId::new(), checkpoint("fork"))
+            .unwrap();
+        assert_eq!(
+            log.inspect_header(&receipt.pin).unwrap().sources,
+            vec![event.pin]
+        );
+    }
+
+    #[test]
+    fn purging_a_prefix_event_hides_it_in_every_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        let log = store
+            .session_log(ContextAccess::new("owner", Actor::Operator))
+            .unwrap();
+        log.create_session(OperationId::new(), new("source"), Scope::Personal)
+            .unwrap();
+        let event = log
+            .append(
+                OperationId::new(),
+                event_input("source", "first"),
+                &b"needle"[..],
+            )
+            .unwrap();
+        for name in ["first-fork", "second-fork"] {
+            log.fork_session(OperationId::new(), new(name), origin("source", 1))
+                .unwrap();
+        }
+        log.purge(OperationId::new(), event.pin).unwrap();
+        for name in ["source", "first-fork", "second-fork"] {
+            assert_eq!(
+                log.events(name, 0, 1).unwrap().entries[0].state,
+                RecordState::Purged
+            );
+            assert!(log
+                .search(LogQuery {
+                    session: Some(name.into()),
+                    text: "needle".into(),
+                    max_events: 10,
+                    max_bytes: 100,
+                    limit: 10,
+                    cursor: None
+                })
+                .unwrap()
+                .matches
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn fork_chains_stop_at_64_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        let log = store.session_log(access("owner")).unwrap();
+        log.create_session(OperationId::new(), new("0"), Scope::Personal)
+            .unwrap();
+        for depth in 1..=64 {
+            let source = (depth - 1).to_string();
+            log.append(
+                OperationId::new(),
+                event_input(&source, &format!("event-{source}")),
+                &[][..],
+            )
+            .unwrap();
+            let child = new(&depth.to_string());
+            let result = log.fork_session(OperationId::new(), child, origin(&source, depth));
+            if depth == 64 {
+                assert!(matches!(result, Err(ContextError::ForkTooDeep)));
+                assert!(log
+                    .fork_session(OperationId::new(), new("flattened"), origin(&source, 1))
+                    .is_ok());
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn update_replaces_metadata_by_expected_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        let log = store.session_log(access("owner")).unwrap();
+        let creation = OperationId::new();
+        let original = log
+            .create_session(creation, new("s"), Scope::Personal)
+            .unwrap();
+        let before = log.session("s").unwrap();
+        let op = OperationId::new();
+        let metadata = json!({"label":"updated"});
+        for actor in [Actor::User, Actor::Assistant] {
+            let restricted = store
+                .session_log(ContextAccess::new("owner", actor))
+                .unwrap();
+            assert!(matches!(
+                restricted.update_session(op, before.pin.clone(), metadata.clone()),
+                Err(ContextError::AccessDenied)
+            ));
+        }
+        let updated = log
+            .update_session(op, before.pin.clone(), metadata.clone())
+            .unwrap();
+        assert_eq!(updated.sequence, Some(0));
+        let after = log.session("s").unwrap();
+        assert_eq!(after.pin, updated.pin);
+        assert_eq!(after.pin.revision, 2);
+        let mut expected_header = before.header;
+        expected_header.metadata = metadata.clone();
+        assert_eq!(after.header, expected_header);
+        assert!(after.change > before.change);
+        assert!(matches!(
+            log.inspect_header(&before.pin),
+            Err(ContextError::RevisionConflict {
+                expected: 1,
+                actual: 2
+            })
+        ));
+        assert!(matches!(
+            log.update_session(OperationId::new(), before.pin.clone(), json!({})),
+            Err(ContextError::RevisionConflict {
+                expected: 1,
+                actual: 2
+            })
+        ));
+        assert_eq!(log.session("s").unwrap(), after);
+        log.update_session(OperationId::new(), updated.pin.clone(), json!({}))
+            .unwrap();
+        assert_eq!(
+            log.update_session(op, before.pin, metadata).unwrap(),
+            updated
+        );
+        assert_eq!(
+            log.create_session(creation, new("s"), Scope::Personal)
+                .unwrap(),
+            original
+        );
+        assert_eq!(log.operation_receipt(op).unwrap(), Some(updated));
+    }
+
+    #[test]
+    fn filtered_pages_stop_after_4096_index_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Store::create(dir.path().join("store")).unwrap();
+        let log = db.session_log(access("owner")).unwrap();
+        log.create_session(OperationId::new(), new("match"), Scope::Personal)
+            .unwrap();
+        for index in 0..4096 {
+            let input = NewSession {
+                kind: "worker".into(),
+                ..new(&format!("child-{index}"))
+            };
+            log.create_session(OperationId::new(), input, Scope::Personal)
+                .unwrap();
+        }
+        let mut query = SessionQuery {
+            kind: Some("chat".into()),
+            ..catalog_query(100)
+        };
+        let first = log.sessions(query.clone()).unwrap();
+        assert!(first.sessions.is_empty());
+        assert_eq!(first.next, Some(log.session("child-0").unwrap().change));
+        query.before = first.next;
+        let last = log.sessions(query).unwrap();
+        assert_eq!(last.sessions, [log.session("match").unwrap()]);
+        assert_eq!(last.next, None);
+
+        // Exclude the newest row so exactly 4,096 remain. The oldest
+        // row fills the page and exhausts its scan budget simultaneously.
+        let exact = log
+            .sessions(SessionQuery {
+                kind: Some("chat".into()),
+                before: Some(log.session("child-4095").unwrap().change),
+                ..catalog_query(1)
+            })
+            .unwrap();
+        assert_eq!(exact.sessions, last.sessions);
+        assert_eq!(exact.next, Some(exact.sessions[0].change));
+        let end = log
+            .sessions(SessionQuery {
+                before: exact.next,
+                ..catalog_query(1)
+            })
+            .unwrap();
+        assert!(end.sessions.is_empty());
+        assert_eq!(end.next, None);
+    }
+
+    #[test]
+    fn sessions_list_newest_change_first_with_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Store::create(dir.path().join("store")).unwrap();
+        let workspace = Scope::Workspace(ulid::Ulid::new());
+        let mut profile = access("owner");
+        profile.scopes.push(workspace.clone());
+        let writer = db.session_log(profile).unwrap();
+        for (name, kind, parent, scope) in [
+            ("root", "chat", None, Scope::Personal),
+            ("first", "worker", Some("root"), Scope::Personal),
+            ("second", "worker", Some("root"), Scope::Personal),
+            ("hidden", "worker", Some("root"), workspace),
+            ("other", "chat", Some("root"), Scope::Personal),
+            ("orphan", "worker", None, Scope::Personal),
+        ] {
+            let input = NewSession {
+                kind: kind.into(),
+                parent: parent.map(|name| SessionParent {
+                    session: name.into(),
+                    run: "r".into(),
+                }),
+                ..new(name)
+            };
+            writer
+                .create_session(OperationId::new(), input, scope)
+                .unwrap();
+        }
+        let log = db.session_log(access("owner")).unwrap();
+        let mut query = SessionQuery {
+            kind: Some("worker".into()),
+            parent: Some("root".into()),
+            ..catalog_query(1)
+        };
+        let page = log.sessions(query.clone()).unwrap();
+        assert_eq!(page.sessions, [log.session("second").unwrap()]);
+        assert_eq!(page.next, Some(page.sessions[0].change));
+        query.before = page.next;
+        query.limit = 2;
+        let page = log.sessions(query).unwrap();
+        assert_eq!(page.sessions, [log.session("first").unwrap()]);
+        assert_eq!(page.next, None);
+        assert!(db
+            .session_log(access("another-owner"))
+            .unwrap()
+            .sessions(catalog_query(1))
+            .unwrap()
+            .sessions
+            .is_empty());
+        for limit in [0, 101] {
+            assert!(matches!(
+                log.sessions(catalog_query(limit)),
+                Err(ContextError::InvalidInput(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn incremental_sync_stops_at_the_last_seen_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Store::create(dir.path().join("store")).unwrap();
+        let log = db.session_log(access("owner")).unwrap();
+        for name in ["older", "unchanged"] {
+            log.create_session(OperationId::new(), new(name), Scope::Personal)
+                .unwrap();
+        }
+        let seen = log.sessions(catalog_query(1)).unwrap().sessions[0].change;
+        log.append(OperationId::new(), event_input("older", "event"), &b"x"[..])
+            .unwrap();
+        log.create_session(OperationId::new(), new("new"), Scope::Personal)
+            .unwrap();
+        let states = log.sessions(catalog_query(10)).unwrap().sessions;
+        assert_eq!(states.len(), 3);
+        let changed: Vec<_> = states
+            .iter()
+            .take_while(|s| s.change > seen)
+            .map(|s| s.header.session.as_str())
+            .collect();
+        assert_eq!(changed, ["new", "older"]);
+    }
+
+    #[test]
+    fn a_created_session_keeps_its_header_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        let log = store.session_log(access("owner")).unwrap();
+        let input = new("chat");
+        let receipt = log
+            .create_session(OperationId::new(), input.clone(), Scope::Personal)
+            .unwrap();
+        assert_eq!(receipt.sequence, Some(0));
+        assert_eq!(receipt.pin.record.kind, RecordKind::Session);
+        let state = log.session("chat").unwrap();
+        assert_eq!(state.pin, receipt.pin);
+        assert_eq!(state.scope, Scope::Personal);
+        assert_eq!(state.header.session, input.session);
+        assert_eq!(state.header.kind, input.kind);
+        assert_eq!(state.header.metadata, input.metadata);
+        assert_eq!(state.header.origin, None);
+        assert_eq!(state.position, 0);
+        assert!(state.change > 0);
+        let record = log.inspect_header(&state.pin).unwrap();
+        assert!(record.sources.is_empty());
+        assert_eq!(record.session, Some(state.header));
+    }
+
+    #[test]
+    fn appending_to_a_session_without_a_header_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        let log = store.session_log(access("owner")).unwrap();
+        let op = OperationId::new();
+        assert!(
+            matches!(log.append(op,event_input("unknown","first"),&[][..]),Err(ContextError::UnknownSession(s)) if s=="unknown")
+        );
+        assert!(log.operation_receipt(op).unwrap().is_none());
+        assert!(matches!(
+            log.session("unknown"),
+            Err(ContextError::UnknownSession(_))
+        ));
+    }
+
+    #[test]
+    fn a_child_session_may_use_another_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        let workspace = Scope::Workspace(ulid::Ulid::new());
+        let mut profile = access("owner");
+        profile.scopes.push(workspace.clone());
+        let log = store.session_log(profile).unwrap();
+        log.create_session(OperationId::new(), new("parent"), workspace.clone())
+            .unwrap();
+        let child = NewSession {
+            parent: Some(SessionParent {
+                session: "parent".into(),
+                run: String::new(),
+            }),
+            ..new("child")
+        };
+        let limited = store.session_log(access("owner")).unwrap();
+        assert!(matches!(
+            limited.create_session(OperationId::new(), child.clone(), Scope::Personal),
+            Err(ContextError::AccessDenied)
+        ));
+        let missing = store.session_log(access("other")).unwrap();
+        assert!(matches!(
+            missing.create_session(OperationId::new(), child.clone(), Scope::Personal),
+            Err(ContextError::UnknownSession(_))
+        ));
+        log.create_session(OperationId::new(), child.clone(), Scope::Personal)
+            .unwrap();
+        let state = limited.session("child").unwrap();
+        assert_eq!(state.scope, Scope::Personal);
+        assert_eq!(state.header.parent, child.parent);
+    }
+
+    #[test]
+    fn session_headers_cannot_be_retracted_or_purged() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        let log = store
+            .session_log(ContextAccess::new("owner", Actor::Operator))
+            .unwrap();
+        let receipt = log
+            .create_session(OperationId::new(), new("s"), Scope::Personal)
+            .unwrap();
+        assert!(matches!(
+            log.retract(OperationId::new(), receipt.pin.clone()),
+            Err(ContextError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            log.purge(OperationId::new(), receipt.pin.clone()),
+            Err(ContextError::InvalidInput(_))
+        ));
+        assert_eq!(log.session("s").unwrap().pin, receipt.pin);
+    }
+
+    #[test]
+    fn session_headers_are_not_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        let log = store.session_log(access("owner")).unwrap();
+        let ctx = store.context(access("owner")).unwrap();
+        let header = log
+            .create_session(OperationId::new(), new("session-a"), Scope::Personal)
+            .unwrap()
+            .pin;
+        let raw = source(&log, "anchor", "evidence");
+        let ty = ctx
+            .define_type(OperationId::new(), definition("note"))
+            .unwrap()
+            .pin;
+        let a = ctx
+            .save_object(OperationId::new(), object(&ty, &raw, "a"))
+            .unwrap()
+            .pin;
+        let b = ctx
+            .save_object(OperationId::new(), object(&ty, &raw, "b"))
+            .unwrap()
+            .pin;
+        let rel = relation_type(&ctx, &ty);
+        assert!(matches!(
+            ctx.save_object(OperationId::new(), object(&ty, &header, "invalid")),
+            Err(ContextError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            ctx.save_relation(OperationId::new(), relation(&rel, &a, &b, &header)),
+            Err(ContextError::InvalidInput(_))
+        ));
+        let check = CheckpointInput {
+            sources: vec![header.clone()],
+            ..checkpoint_input(
+                CheckpointScope::Session,
+                1,
+                ctx.availability_epoch().unwrap(),
+            )
+        };
+        assert!(matches!(
+            log.save_checkpoint(OperationId::new(), check),
+            Err(ContextError::InvalidInput(_))
+        ));
+        let event = EventInput {
+            sources: vec![header],
+            ..event_input("session-a", "copy")
+        };
+        assert!(matches!(
+            log.append(OperationId::new(), event, &[][..]),
+            Err(ContextError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn session_headers_survive_memory_reset_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let mut store = Store::create(&path).unwrap();
+        let log = store.session_log(access("owner")).unwrap();
+        let op = OperationId::new();
+        let receipt = log.create_session(op, new("s"), Scope::Personal).unwrap();
+        log.append(OperationId::new(), event_input("s", "first"), &[][..])
+            .unwrap();
+        let state = log.session("s").unwrap();
+        assert_eq!(state.position, 1);
+        reset_memory(&mut store);
+        drop(store);
+        let store = Store::open(path).unwrap();
+        let log = store.session_log(access("owner")).unwrap();
+        assert_eq!(log.session("s").unwrap(), state);
+        for retry in [op, OperationId::new()] {
+            assert_eq!(
+                log.create_session(retry, new("s"), Scope::Personal)
+                    .unwrap(),
+                receipt
+            );
+            assert_eq!(log.operation_receipt(retry).unwrap(), Some(receipt.clone()));
+        }
+    }
+    #[test]
+    fn refused_forks_leave_the_catalog_unchanged_on_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        let workspace = Scope::Workspace(ulid::Ulid::new());
+        let mut full = access("owner");
+        full.scopes.push(workspace.clone());
+        let observer = store.session_log(full.clone()).unwrap();
+        observer
+            .create_session(OperationId::new(), new("source"), workspace.clone())
+            .unwrap();
+        observer
+            .append(
+                OperationId::new(),
+                EventInput {
+                    scope: workspace,
+                    ..event_input("source", "first")
+                },
+                &[][..],
+            )
+            .unwrap();
+        let bound = ContextAccess {
+            session: Some("source".into()),
+            ..full.clone()
+        };
+        let before = observer.sessions(catalog_query(10)).unwrap();
+        for (profile, position) in [
+            (bound, 1),
+            (access("owner"), 1),
+            (full.clone(), 0),
+            (full, 2),
+        ] {
+            let log = store.session_log(profile).unwrap();
+            let op = OperationId::new();
+            for _ in 0..2 {
+                let error = log
+                    .fork_session(op, new("fork"), origin("source", position))
+                    .unwrap_err();
+                match position {
+                    0 => assert!(matches!(error, ContextError::InvalidInput(_))),
+                    2 => assert!(matches!(
+                        error,
+                        ContextError::PositionConflict {
+                            expected: 2,
+                            actual: 1
+                        }
+                    )),
+                    _ => assert!(matches!(error, ContextError::AccessDenied)),
+                }
+                assert!(matches!(
+                    observer.session("fork"),
+                    Err(ContextError::UnknownSession(_))
+                ));
+                assert_eq!(observer.sessions(catalog_query(10)).unwrap(), before);
+                assert!(observer.operation_receipt(op).unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn a_fork_preserves_previously_retracted_and_purged_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        let log = turn_log(&store, Actor::Operator);
+        log.create_session(OperationId::new(), new("source"), Scope::Personal)
+            .unwrap();
+        for name in ["withdrawn", "purged"] {
+            let event = log
+                .append(
+                    OperationId::new(),
+                    event_input("source", name),
+                    &b"content"[..],
+                )
+                .unwrap();
+            if name == "withdrawn" {
+                log.retract(OperationId::new(), event.pin).unwrap();
+            } else {
+                log.purge(OperationId::new(), event.pin).unwrap();
+            }
+        }
+        log.fork_session(OperationId::new(), new("fork"), origin("source", 2))
+            .unwrap();
+        let entries = log.events("fork", 0, 2).unwrap().entries;
+        assert_eq!(
+            entries.iter().map(|e| &e.state).collect::<Vec<_>>(),
+            [&RecordState::Retracted, &RecordState::Purged]
+        );
+        assert_eq!(entries, log.events("source", 0, 2).unwrap().entries);
+    }
+
+    #[test]
+    fn reopening_interrupts_open_turns_in_forks_and_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let store = Store::create(&path).unwrap();
+        let log = turn_log(&store, Actor::System);
+        log.create_session(OperationId::new(), new("source"), Scope::Personal)
+            .unwrap();
+        boundary(&log, "source", "prefix", EventKind::Notice);
+        log.fork_session(OperationId::new(), new("fork"), origin("source", 1))
+            .unwrap();
+        let child = NewSession {
+            parent: Some(SessionParent {
+                session: "source".into(),
+                run: "run".into(),
+            }),
+            ..new("child")
+        };
+        log.create_session(OperationId::new(), child, Scope::Personal)
+            .unwrap();
+        let open = ["fork", "child"].map(|name| {
+            boundary(&log, name, "start", EventKind::TurnStarted);
+            let state = log.session(name).unwrap();
+            assert_eq!(state.open_run.as_deref(), Some("run"));
+            state
+        });
+        drop(store);
+        let store = Store::open(path).unwrap();
+        let log = turn_log(&store, Actor::System);
+        for before in open {
+            let name = &before.header.session;
+            let after = log.session(name).unwrap();
+            assert_eq!(after.open_run, None);
+            assert_eq!(after.position, before.position + 1);
+            assert!(after.change > before.change);
+            let end = log
+                .events(name, before.position, 1)
+                .unwrap()
+                .entries
+                .pop()
+                .unwrap();
+            assert_eq!(
+                end.event.unwrap().kind,
+                EventKind::TurnEnded {
+                    reason: TurnEndReason::Interrupted,
+                    start_event_id: "start".into()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn only_system_or_operator_manage_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        for actor in [Actor::User, Actor::Assistant] {
+            let log = store
+                .session_log(ContextAccess::new("owner", actor))
+                .unwrap();
+            assert!(matches!(
+                log.create_session(OperationId::new(), new("s"), Scope::Personal),
+                Err(ContextError::AccessDenied)
+            ));
+        }
+        let log = store.session_log(access("owner")).unwrap();
+        for invalid in [
+            new(""),
+            new("a\nb"),
+            new(&"x".repeat(257)),
+            NewSession {
+                kind: String::new(),
+                ..new("s")
+            },
+            NewSession {
+                metadata: json!("x".repeat(4095)),
+                ..new("s")
+            },
+        ] {
+            assert!(matches!(
+                log.create_session(OperationId::new(), invalid, Scope::Personal),
+                Err(ContextError::InvalidInput(_))
+            ));
+        }
+        let op = OperationId::new();
+        log.create_session(op, new("s"), Scope::Personal).unwrap();
+        assert!(matches!(
+            log.create_session(op, new("t"), Scope::Personal),
+            Err(ContextError::IdempotencyConflict)
+        ));
+        assert!(matches!(
+            log.create_session(
+                OperationId::new(),
+                NewSession {
+                    kind: "sub".into(),
+                    ..new("s")
+                },
+                Scope::Personal
+            ),
+            Err(ContextError::IdempotencyConflict)
+        ));
+    }
+
+    #[test]
+    fn a_bound_access_creates_or_forks_only_its_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        let profile = ContextAccess {
+            session: Some("bound".into()),
+            ..access("owner")
+        };
+        let log = store.session_log(profile).unwrap();
+        assert!(matches!(
+            log.create_session(OperationId::new(), new("elsewhere"), Scope::Personal),
+            Err(ContextError::AccessDenied)
+        ));
+        log.create_session(OperationId::new(), new("bound"), Scope::Personal)
+            .unwrap();
+    }
+
+    #[test]
+    fn session_state_reports_position_turns_open_run_and_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let store = Store::create(&path).unwrap();
+        let log = turn_log(&store, Actor::Operator);
+        log.create_session(OperationId::new(), new("s"), Scope::Personal)
+            .unwrap();
+        let first = log.session("s").unwrap();
+        assert_eq!((first.position, first.turns, first.open_run), (0, 0, None));
+        boundary(&log, "s", "start", EventKind::TurnStarted);
+        let opened = log.session("s").unwrap();
+        assert_eq!(
+            (opened.position, opened.turns, opened.open_run.as_deref()),
+            (1, 1, Some("run"))
+        );
+        assert!(opened.change > first.change);
+        drop(store);
+        let store = Store::open(path).unwrap();
+        let log = turn_log(&store, Actor::Operator);
+        let closed = log.session("s").unwrap();
+        assert_eq!(
+            (closed.position, closed.turns, closed.open_run),
+            (2, 1, None)
+        );
+        assert!(closed.change > opened.change);
+        let pin = log.events("s", 0, 1).unwrap().entries.remove(0).pin;
+        let withdrawn = log.retract(OperationId::new(), pin).unwrap();
+        let change = log.session("s").unwrap().change;
+        assert!(change > closed.change);
+        log.purge(OperationId::new(), withdrawn.pin).unwrap();
+        assert!(log.session("s").unwrap().change > change);
+    }
 }

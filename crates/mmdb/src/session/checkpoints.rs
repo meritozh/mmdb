@@ -101,6 +101,7 @@ impl SessionLog<'_> {
         let now = super::super::now_ms();
         let mut batch = self.scoped.batch();
         let header = RecordHeader {
+            session: None,
             pin: pin.clone(),
             scope: anchor.scope,
             state: RecordState::Active,

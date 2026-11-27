@@ -41,7 +41,7 @@ scope and tool permissions.
 the same catalog as custom types. Complete raw events stream into checksummed
 chunks. `SessionLog::search` uses bounded, resumable substring scans. Objects use
 lexical postings and explicit relation paths. One process holds the store lease
-at a time. The format is `mmdb-store-v3` on Fjall 3. Opening a Fjall 2 directory reports an
+at a time. The format is `mmdb-store-v5` on Fjall 3. Opening a Fjall 2 directory reports an
 incompatible format. Choose a new directory, or use a confirmed whole-store
 reset on a managed root to quarantine the original directory and start empty.
 The original MMDB version can open that quarantine.

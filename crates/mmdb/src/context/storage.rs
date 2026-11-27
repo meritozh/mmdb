@@ -44,7 +44,7 @@ impl ContextStore<'_> {
             RecordKind::ActionExecution => {
                 RecordBody::ActionExecution(decode(&self.scoped.small_payload_locked(&header)?)?)
             }
-            RecordKind::Event | RecordKind::Checkpoint => {
+            RecordKind::Session | RecordKind::Event | RecordKind::Checkpoint => {
                 return Err(ContextError::InvalidInput(
                     "expected a memory record".into(),
                 ));

@@ -13,6 +13,7 @@ fn current_sources_guard_keeps_retraction_after_the_protected_commit() {
 
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(Store::create(dir.path().join("context")).unwrap());
+    create_session(&db, "owner", "session", Scope::Personal);
     let access = ContextAccess::new("owner", Actor::User);
     let context = db.context(access.clone()).unwrap();
     let log = db.session_log(access.clone()).unwrap();
@@ -72,6 +73,7 @@ fn current_sources_guard_keeps_retraction_after_the_protected_commit() {
 fn current_sources_guard_rejects_stale_and_out_of_scope_sources_without_writing() {
     let dir = tempfile::tempdir().unwrap();
     let db = Store::create(dir.path().join("context")).unwrap();
+    create_session(&db, "owner", "session", Scope::Personal);
     let access = ContextAccess::new("owner", Actor::User);
     let context = db.context(access.clone()).unwrap();
     let log = db.session_log(access).unwrap();
@@ -115,6 +117,7 @@ fn committed_history_survives_a_lost_acknowledgement_without_duplication() {
     };
     let expected = {
         let db = Store::create(&root).unwrap();
+        create_session(&db, "owner", "continuous-session", Scope::Personal);
         let store = db.session_log(profile(Actor::Assistant)).unwrap();
         let system = db.session_log(profile(Actor::System)).unwrap();
         for (id, kind) in [
@@ -181,6 +184,7 @@ fn committed_history_survives_a_lost_acknowledgement_without_duplication() {
 fn a_cancel_with_a_lost_acknowledgement_published_all_its_closing_events() {
     let dir = tempfile::tempdir().unwrap();
     let db = Store::create(dir.path().join("context")).unwrap();
+    create_session(&db, "owner", "session", Scope::Personal);
     let log = db
         .session_log(ContextAccess {
             run: Some("run".into()),
@@ -270,6 +274,7 @@ fn a_cancel_with_a_lost_acknowledgement_published_all_its_closing_events() {
 fn checksum_failure_is_reported_instead_of_returning_modified_source_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let db = Store::create(dir.path().join("context")).unwrap();
+    create_session(&db, "owner", "session", Scope::Personal);
     let store = db
         .session_log(ContextAccess::new("owner", Actor::System))
         .unwrap();
@@ -317,6 +322,7 @@ fn assistant_cannot_retract_instruction_records_but_may_retract_others() {
     let root = dir.path().join("context");
 
     let owner = Store::create(&root).unwrap();
+    create_session(&owner, "owner", "s", Scope::Personal);
     let user = owner
         .context(ContextAccess::new("owner", Actor::User))
         .unwrap();
@@ -460,6 +466,9 @@ fn fresh_store() -> (
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("context");
     let db = Box::leak(Box::new(Store::create(&root).unwrap()));
+    create_session(&db, "owner", "entity-session", Scope::Personal);
+    create_session(&db, "owner", "s", Scope::Personal);
+    create_session(&db, "owner", "session", Scope::Personal);
     let access = ContextAccess::new("owner", Actor::User);
     let context = db.context(access.clone()).unwrap();
     let log = db.session_log(access).unwrap();
@@ -808,7 +817,10 @@ fn entity_writes_refuse_an_operation_id_a_session_event_holds() {
         store.merge_entities(operation, &other, &primary),
         Err(ContextError::IdempotencyConflict)
     ));
-    assert_eq!(log.operation_receipt(operation).unwrap(), Some(receipt.clone()));
+    assert_eq!(
+        log.operation_receipt(operation).unwrap(),
+        Some(receipt.clone())
+    );
     assert_eq!(
         log.append(operation, input, b"hello".as_slice()).unwrap(),
         receipt
@@ -1132,6 +1144,7 @@ fn a_memory_purge_commits_its_head_epoch_and_receipt_together() {
     let operation = OperationId::new();
     let (object, epoch) = {
         let store = Store::create(&path).unwrap();
+        create_session(&store, "owner", "session", Scope::Personal);
         let context = store.context(access.clone()).unwrap();
         let source = event_source(
             &store.session_log(access.clone()).unwrap(),
@@ -1201,6 +1214,7 @@ fn a_streaming_append_blocks_memory_writes_until_it_ends() {
 
     let dir = tempfile::tempdir().unwrap();
     let store = Store::create(dir.path().join("store")).unwrap();
+    create_session(&store, "owner", "s", Scope::Personal);
     let (entered_tx, entered_rx) = mpsc::channel();
     let (resume_tx, resume_rx) = mpsc::channel();
     let (started_tx, started_rx) = mpsc::channel();
@@ -1251,4 +1265,23 @@ fn a_streaming_append_blocks_memory_writes_until_it_ends() {
             .unwrap()
             .is_ok());
     });
+}
+
+fn create_session(store: &Store, owner: &str, name: &str, scope: Scope) {
+    let mut access = ContextAccess::new(owner, Actor::System);
+    access.scopes = vec![scope.clone()];
+    store
+        .session_log(access)
+        .unwrap()
+        .create_session(
+            OperationId::new(),
+            crate::session::NewSession {
+                session: name.into(),
+                kind: "chat".into(),
+                parent: None,
+                metadata: serde_json::Value::Null,
+            },
+            scope,
+        )
+        .unwrap();
 }

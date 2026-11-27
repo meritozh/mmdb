@@ -13,6 +13,7 @@ pub enum RecordKind {
     Checkpoint,
     Action,
     ActionExecution,
+    Session,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -178,6 +179,8 @@ pub struct PayloadDescriptor {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordHeader {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionHeader>,
     pub pin: RecordPin,
     pub scope: Scope,
     pub state: RecordState,
@@ -257,4 +260,29 @@ pub(super) struct StagedUpload {
     pub pin: RecordPin,
     pub operation: OperationId,
     pub purge: bool,
+}
+
+/// The session section of a session header record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionHeader {
+    pub session: String,
+    /// Harness-defined name; MMDB never interprets it.
+    pub kind: String,
+    pub parent: Option<SessionParent>,
+    pub origin: Option<SessionOrigin>,
+    pub created_at_ms: i64,
+    /// Harness-defined JSON, at most 4 KiB encoded; MMDB never interprets it.
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionParent {
+    pub session: String,
+    pub run: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionOrigin {
+    pub session: String,
+    pub position: u64,
 }
