@@ -1,0 +1,407 @@
+# 对话缓存: implement spec
+
+Feature: `docs/feature/conversation-cache.md` @ `1eff1d2ab8ebde59000e36b2b98744c73cab4c6a`
+
+This spec is open until the feature ships, and `/go-work` carries it out. Do not edit it while working it; only `to-implement-spec` changes it. Before work starts or resumes, check that the hash above still matches `git hash-object docs/feature/conversation-cache.md`; if it does not, the feature changed, so stop and rerun `to-implement-spec`. Each step is one commit whose message ends with the trailer `Spec-Step: conversation-cache#<n>`. The commit that lands the last step sets the feature doc's Status to `shipped` and moves this file to `docs/spec/archived/<YYYY-MM-DD>-conversation-cache.md` with `git mv`, dated that day. Nothing reads an archived spec again.
+
+会话模块新增两份由日志写入路径维护的索引：每个会话各来源 scope 首次出现的位置，以及每次撤回或清除让哪个位置以前的内容不可读。新模块 `session::coverage` 独占这两份索引，回答「位置 1..N 需要哪些 scope」「epoch E 之后有没有撤回到达 1..N」。新模块 `session::caches` 把对话缓存存成不是记录的行和分块载荷，用 `coverage` 判定读取权限与过期，并由 `recover_payloads` 回收被替换、删除、中断和过期的载荷。分块载荷的格式从 `records` 的记录载荷里抽成一处，两边共用。
+
+## Behavior map
+
+| Feature doc line | Owner | Test |
+| --- | --- | --- |
+| Who: 保存和删除需要 System 或 Operator | `session::caches` | `only_system_or_operator_save_or_remove_caches` |
+| Who: 保存、查找、列出和读取需要能读到覆盖的每个事件 | `session::caches` 比对 `session::coverage::scopes_through` | `reading_a_cache_needs_every_covered_source_scope`、`saving_needs_every_covered_source_scope` |
+| Who: access 绑定 session 时只能操作这个会话的缓存 | `session::caches` | `a_session_bound_access_reaches_only_its_session_caches` |
+| Entry: 五个方法与 `availability_epoch` | `session::caches` | `a_cache_and_the_log_tail_restore_the_conversation_after_reopen` |
+| Does: 每个派生名只保留最新一份，不论位置先后 | `session::caches` | `each_derivation_keeps_only_its_latest_cache` |
+| Does: N 可以落在 fork 继承的前缀里；fork 不带缓存 | `session::caches` 经 `View::spans` | `a_cache_may_end_inside_a_forked_prefix_and_forks_start_without_caches` |
+| Does: 查找与列出，每项字段与是否过期 | `session::caches` | `listing_pages_caches_by_derivation` |
+| Does: 读取按版本和偏移翻页；恢复为缓存加日志尾部 | `session::caches` 经 `records::chunks` | `a_cache_and_the_log_tail_restore_the_conversation_after_reopen`、`a_cache_payload_spans_many_chunks_and_pages` |
+| Does: 过期——撤回或清除覆盖的事件 | `session::history::withdraw_event` 记录，`session::coverage::withdrawn_since` 判定 | `withdrawing_a_covered_event_makes_the_cache_stale` |
+| Does: 过期——N 之后的片段或工具调用使 N 以前开始的消息不可读 | 同上 | `withdrawing_a_later_part_of_a_covered_message_makes_the_cache_stale` |
+| Does: 过期——来源会话里撤回 fork 共享的前缀 | 同上 | `withdrawing_a_shared_prefix_event_makes_fork_caches_stale` |
+| Does: 仍然有效——N 之后的撤回、其他修订、重置记忆、重开收尾 | `session::coverage` | `later_withdrawals_and_other_changes_keep_the_cache_current` |
+| Does: 删除；没有缓存时什么也不做 | `session::caches` | `removing_a_cache_and_removing_nothing` |
+| Fails: 保存的各项拒绝，什么也不写 | `session::caches` | `saving_refuses_bad_input_and_writes_nothing`、`saving_refuses_a_derivation_that_raced_a_covered_withdrawal` |
+| Fails: 不带操作 ID，重复保存只是再替换一次 | `session::caches` | `repeating_a_save_replaces_the_cache_again` |
+| Fails: 保存中断，原缓存不变，`recover_payloads` 清理 | `session::caches` | `an_interrupted_save_keeps_the_previous_cache`（单元测试） |
+| Fails: 读取已过期报已过期；被替换或删除报已被取代 | `session::caches` | `reading_reports_stale_and_replaced_caches` |
+| Fails: 缺 scope 时查找和读取拒绝访问，列表不返回 | `session::caches` | `reading_a_cache_needs_every_covered_source_scope` |
+| Fails: 这个 feature 之前的存储打开时被拒绝 | `store`（`STORE_FORMAT_ID`） | `format_and_store_identity_prevent_accidental_adoption`（扩展） |
+| Limits: 名称 1–256 字节；32 KiB 分块、单页 1 MiB；列表每页 1–100 份 | `session::caches`、`records::chunks` | `cache_names_and_pages_are_bounded`、`a_cache_payload_spans_many_chunks_and_pages` |
+| Limits: 不设大小和数量上限 | `session::caches` | `a_cache_payload_spans_many_chunks_and_pages` |
+| Keeps: 重置记忆不影响 | 会话模块的分区 | `caches_survive_a_memory_reset` |
+| Keeps: 过期、替换、删除的载荷由 `recover_payloads` 回收；过期的仍列为过期 | `session::caches` | `recovery_reclaims_replaced_removed_and_stale_payloads`（单元测试） |
+| Keeps: 不是记录，不进搜索 | `session::caches`（不建记录头，不写 order） | `cache_contents_are_not_search_hits` |
+| Keeps: 不推进会话变更号 | `session::caches`（不调 `Changes::put_head`） | `saving_or_removing_a_cache_keeps_the_session_change_number` |
+| Not this: fork 时复制缓存 | `session::fork`（不碰缓存分区） | `a_cache_may_end_inside_a_forked_prefix_and_forks_start_without_caches` |
+
+公开接口的测试放在新文件 `crates/mmdb/tests/conversation_cache.rs`；需要看分区内容或丢弃提交的测试是 `session/caches.rs` 和 `session/coverage.rs` 里的单元测试。
+
+Replaces: none.
+
+## Modules
+
+### `records::chunks` (new, extracted from `records/payload.rs`)
+
+```rust
+/// Where one payload's chunks live: a large-value partition and a key prefix
+/// that no other payload shares. Chunk keys are `prefix ‖ chunk_index_be`.
+pub(crate) struct ChunkSpace<'a> {
+    pub partition: &'a Partition,
+    pub prefix: Vec<u8>,
+}
+
+/// Length and keyed digest of a complete payload.
+pub(crate) struct ChunkedPayload {
+    pub bytes: u64,
+    pub digest: [u8; 32],
+}
+
+pub(crate) struct RemovedChunks {
+    pub removed: usize,
+    /// No chunk of the space remains.
+    pub complete: bool,
+}
+
+impl Scoped<'_> {
+    /// Streams `payload` in 32 KiB chunks. With `space`, each chunk is committed
+    /// in its own batch; without it the payload is only measured and hashed.
+    pub(crate) fn write_chunks<R: Read>(
+        &self,
+        space: Option<&ChunkSpace<'_>>,
+        payload: R,
+    ) -> ContextResult<ChunkedPayload>;
+
+    /// Writes a small payload's chunks into `batch`.
+    pub(crate) fn put_chunks(
+        &self,
+        batch: &mut Batch,
+        space: &ChunkSpace<'_>,
+        bytes: &[u8],
+    ) -> ChunkedPayload;
+
+    /// Bytes `offset..offset + limit` of a `total`-byte payload.
+    pub(crate) fn read_chunks(
+        &self,
+        space: &ChunkSpace<'_>,
+        total: u64,
+        offset: u64,
+        limit: usize,
+    ) -> ContextResult<PayloadPage>;
+
+    /// Removes up to `max` chunks of `space` in `batch`.
+    pub(crate) fn remove_chunks(
+        &self,
+        batch: &mut Batch,
+        space: &ChunkSpace<'_>,
+        max: usize,
+    ) -> ContextResult<RemovedChunks>;
+}
+```
+
+- Invariants: 每个块存成 `digest ‖ bytes`，块摘要用 `context-content` 域；`write_chunks` 的整份摘要用 `context-history-payload` 域，`put_chunks` 的整份摘要用 `context-content` 域，与现在的记录载荷逐字节相同，不改格式。
+- Ordering: `write_chunks` 之前由调用方登记清理项，之后由调用方在一个批次里发布指向这块空间的行并撤掉清理项；`write_chunks` 自己不登记也不发布。
+- Errors: `read_chunks` 的 `limit` 不在 1..=1 MiB 或 `offset > total` 时 `InvalidInput`；缺块、块长度不对、摘要不符时 `Corrupt`；读入流出错时 `Io`；长度溢出时 `BudgetExceeded`。
+- Performance: `write_chunks` 每 32 KiB 提交一次，内存只占一个块；`read_chunks` 只读覆盖所求范围的块。
+
+Behind the seam: 块的编码、块大小、两种摘要域、块键的序号编码。`records/payload.rs` 的 `put_payload`、`stream_payload`、`payload_slice_locked` 和 `recover_payloads` 改为以 `ChunkSpace { partition: payloads, prefix: revision_key(pin) }`（清除时 `record_key`）调用这四个函数，自己只保留 `StagedUpload` 的登记、发布和核对。
+
+Call site（`records/payload.rs`）:
+
+```rust
+let space = ChunkSpace { partition: &self.table(module).payloads, prefix: revision_key(pin) };
+let page = self.read_chunks(&space, header.payload.bytes, offset, limit)?;
+```
+
+### `records::lifecycle` (changed)
+
+```rust
+impl Scoped<'_> {
+    pub(crate) fn commit_state_change(
+        &self,
+        operation: OperationId,
+        expected: RecordPin,
+        state: RecordState,
+        redacts: bool,
+        /// Receives the previous header, the new header and the availability
+        /// epoch this change advanced to.
+        update_indexes: impl FnOnce(&mut Batch, &RecordHeader, &RecordHeader, u64) -> ContextResult<()>,
+    ) -> ContextResult<WriteReceipt>;
+}
+```
+
+- Invariants: 传给闭包的 epoch 就是同一批次写入的有效可用性 epoch（本 owner 的计数加记忆重置次数），提交后 `availability_epoch_locked` 返回它；每次状态变更恰好推进一次。
+- `state_change` 改为返回 `(RecordHeader, RecordHeader, u64)`；`context::records` 的调用方忽略 epoch。
+
+### `session::view::View` (changed)
+
+```rust
+/// The positions `after + 1..=through` one session holds in a view.
+pub(super) struct Span<'a> {
+    pub holder: &'a str,
+    pub after: u64,
+    pub through: u64,
+}
+
+impl View<'_> {
+    /// Spans covering positions 1..=position, oldest first, clipped to `position`.
+    pub fn spans(&self, position: u64) -> impl Iterator<Item = Span<'_>> + '_;
+}
+```
+
+- Invariants: 各段首尾相接、不重叠，最后一段的 `through` 等于 `position`（`position` 为 0 时没有段）；`holder` 与 `View::holder` 对同一位置给出的会话一致。`entries_after` 改用 `spans` 计算各段的范围。
+
+### `session::coverage` (new)
+
+```rust
+/// What positions 1..=N of a session log depend on: the scopes needed to read
+/// them and the withdrawals that reached them. Owns the source-scope and
+/// withdrawal indexes; no other module reads or writes their keys.
+pub(super) struct Coverage<'a> {
+    parts: &'a SessionParts,
+    owner: &'a str,
+}
+
+impl<'a> Coverage<'a> {
+    pub fn new(parts: &'a SessionParts, owner: &'a str) -> Self;
+
+    /// Called for every event written to `session` at `position`, inside its batch.
+    pub fn record_scopes(
+        &self,
+        batch: &mut Batch,
+        session: &str,
+        position: u64,
+        scopes: &[Scope],
+    ) -> ContextResult<()>;
+
+    /// Called once per retraction or purge of an event, inside its batch:
+    /// the withdrawal stamped `epoch` made `holder`'s events from `position` on unreadable.
+    pub fn record_withdrawal(&self, batch: &mut Batch, holder: &str, epoch: u64, position: u64);
+
+    /// Scopes, beyond the session's own, that reading positions 1..=position of `view` needs.
+    pub fn scopes_through(&self, view: &View<'_>, position: u64) -> ContextResult<Vec<Scope>>;
+
+    /// Whether a withdrawal stamped after `epoch` reached a position in 1..=position of `view`.
+    pub fn withdrawn_since(&self, view: &View<'_>, position: u64, epoch: u64) -> ContextResult<bool>;
+}
+```
+
+- Invariants: 来源 scope 索引对每个（会话, scope）只记第一次出现的位置，之后同 scope 的事件不再写；撤回索引对每个（holder, epoch）一行。`scopes_through` 不含会话自己的 scope，按 `Scope` 的顺序去重排列。被撤回事件带来的 scope 仍然计入，只会更严，不会放宽。
+- Ordering: `record_scopes` 和 `record_withdrawal` 必须与写事件或改状态在同一批次提交。
+- Errors: 存储错误照传；键或值解不开时 `Corrupt`。
+- Performance: `scopes_through` 对视图的每一段做一次前缀扫描，行数是该会话出现过的来源 scope 数；`withdrawn_since` 对每一段从 `epoch + 1` 起做一次范围扫描，行数是该会话在那之后的撤回次数。两者都与日志长度无关，段数不超过 64。
+
+Behind the seam: scope 的键编码（`session_key ‖ segment(encode(scope))`）、撤回键（`session_key(holder) ‖ epoch_be`）、沿 `View::spans` 逐段剪裁到 N、`epoch` 为 `u64::MAX` 时的边界。
+
+写入方（`session::history`，changed）:
+
+- `put_event` 写完事件头后调用 `record_scopes(batch, session, sequence, &header.source_scopes)`；追加、`put_turn_end` 补齐和 fork 截断收尾都经过它，所以每个事件都会登记。
+- `withdraw_event(batch, event, epoch)` 多收一个 epoch，对每一种事件都调用一次 `record_withdrawal`：事件属于一条 assistant 消息（assistant 事件，或带 `message_id` 的工具调用）时，记在 `view.holder(message.started)` 与 `message.started`；否则记在 `event.session` 与 `event.sequence`。现有标记工具调用 purged 和消息 unavailable 的行为不变。`SessionLog::change_state` 把 `commit_state_change` 交给闭包的 epoch 传进来。
+
+Call site（`session::caches` 判定过期）:
+
+```rust
+let view = self.view(session)?;
+let coverage = Coverage::new(self.parts, owner);
+let stale = row.reclaimed || coverage.withdrawn_since(&view, row.position, row.epoch)?;
+```
+
+### `session::caches` (new)
+
+```rust
+// Re-exported from `mmdb::session`.
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationCacheInput {
+    pub session: String,
+    /// Harness-defined derivation name; MMDB never interprets it.
+    pub derivation: String,
+    /// Last session log position the conversation was derived from.
+    pub position: u64,
+    pub media_type: String,
+    /// `SessionLog::availability_epoch` read before the harness started reading
+    /// the log, or the cache, it derived this conversation from.
+    pub expected_availability_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationCache {
+    pub session: String,
+    pub derivation: String,
+    /// New on every save. Pass the whole value to `read_conversation_cache`.
+    pub version: Ulid,
+    pub position: u64,
+    pub media_type: String,
+    pub bytes: u64,
+    pub digest: [u8; 32],
+    pub saved_at_ms: i64,
+    pub provenance: Provenance,
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationCachePage {
+    pub caches: Vec<ConversationCache>,
+    /// Pass as `after` to continue; set while rows may remain.
+    pub next: Option<String>,
+}
+
+impl SessionLog<'_> {
+    /// The current availability epoch; read it before deriving a conversation.
+    pub fn availability_epoch(&self) -> ContextResult<u64>;
+
+    pub fn save_conversation_cache<R: Read>(
+        &self,
+        input: ConversationCacheInput,
+        payload: R,
+    ) -> ContextResult<ConversationCache>;
+
+    pub fn conversation_cache(
+        &self,
+        session: &str,
+        derivation: &str,
+    ) -> ContextResult<Option<ConversationCache>>;
+
+    /// Caches of one session in derivation-name order, after `after`.
+    pub fn conversation_caches(
+        &self,
+        session: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> ContextResult<ConversationCachePage>;
+
+    pub fn read_conversation_cache(
+        &self,
+        cache: &ConversationCache,
+        offset: u64,
+        limit: usize,
+    ) -> ContextResult<PayloadPage>;
+
+    /// Returns whether a cache was removed.
+    pub fn remove_conversation_cache(&self, session: &str, derivation: &str) -> ContextResult<bool>;
+}
+
+// records::error — two new variants.
+pub enum ContextError {
+    // …
+    /// An event the cache covers was retracted or purged after its derivation started.
+    ConversationCacheStale,
+    /// The cache was replaced or removed since it was looked up.
+    ConversationCacheReplaced,
+}
+```
+
+- Invariants: 一个（owner, 会话, 派生名）最多一行；`version` 每次保存重新生成，块空间以它为前缀，所以被替换的旧载荷与新载荷不共享任何键。返回给调用方的值里没有 pin，缓存没有记录头，不写 order、events 或 changes 分区，所以不进搜索、不能作为来源、不推进会话变更号。
+- Ordering:
+  - 派生前读 `availability_epoch`，在读缓存或日志之前。恢复后继续在内存里追加对话的 harness，之后每次保存都用恢复时读到的 epoch，或更晚、但早于它读到的最后一个事件的 epoch。
+  - 读一份缓存先用 `conversation_cache` 或 `conversation_caches` 取得 `ConversationCache`，再按 `next_offset` 翻页读，读完再从 `position + 1` 起用 `events` 读日志尾部。
+- Errors:
+  - `save_conversation_cache`：actor 不是 System 或 Operator、access 绑定了别的会话、读者不可访问会话 scope、保存者缺 `scopes_through` 里的某个 scope 时 `AccessDenied`；会话没有会话头时 `UnknownSession`；派生名或媒体类型不合法、`position` 为 0、`expected_availability_epoch` 大于当前值时 `InvalidInput`；`position` 超过会话当前位置时 `PositionConflict { expected: position, actual }`；`withdrawn_since(view, position, expected)` 为真时 `AvailabilityConflict { expected, actual }`。这些检查都在写任何东西之前。读入流出错时 `Io`，已写的块由清理项回收。最后的发布提交失败时报存储错误，harness 再保存一次。
+  - `conversation_cache`：access 绑定了别的会话、读者不可访问会话 scope、或缺 `CacheRow.scopes` 里的某个 scope 时 `AccessDenied`；会话没有会话头时 `UnknownSession`；派生名不合法时 `InvalidInput`；没有这个派生名时 `Ok(None)`。任何 actor 都可以查找。
+  - `conversation_caches`：会话绑定、会话 scope 和 `UnknownSession` 同 `conversation_cache`；`limit` 不在 1..=100 或 `after` 不合法时 `InvalidInput`；读者缺 scope 的缓存跳过不报。
+  - `read_conversation_cache`：行不存在或 `version` 不符时 `ConversationCacheReplaced`；过期时 `ConversationCacheStale`；缺 scope 时 `AccessDenied`；范围不合法时 `InvalidInput`。
+  - `remove_conversation_cache`：actor、会话绑定和会话 scope 的 `AccessDenied`；`UnknownSession`；没有这一行时 `Ok(false)`。
+- Configuration: none.
+- Performance: 保存在写锁下流式写入载荷，每 32 KiB 一次提交，加一次 `scopes_through` 和一次 `withdrawn_since`；查找和每次翻页读取各做一次 `withdrawn_since`；列表每行一次，每页最多扫描 4,096 行。
+
+Behind the seam:
+
+- 行与键：`caches` 分区键为 `session_key(owner, session) ‖ segment(derivation)`，值为 `CacheRow { version, position, media_type, bytes, digest, saved_at_ms, provenance, epoch, scopes, reclaimed }`，其中 `epoch` 是保存时给出的 `expected_availability_epoch`，`scopes` 是 `scopes_through(view, position)`，`reclaimed` 在回收过期载荷时置位。块空间为 `cache_chunks` 分区的 `owner_key(owner) ‖ version`。`cache_pending` 分区键为 `owner_key(owner) ‖ version`，值为 `PendingCache { session, derivation }`。
+- 保存顺序：锁住写锁；完成全部校验；单独提交一个 `cache_pending` 清理项；`write_chunks` 写入载荷；最后一个批次写新行，删掉新版本的清理项，原行存在且未回收时为原版本登记清理项。中途退出只留下清理项和孤立的块。
+- 读取权限：会话 scope 和 `CacheRow.scopes` 都在 access 的 scope 里。
+- 过期：`reclaimed`，或 `withdrawn_since(view, position, epoch)`。
+- 删除：一个批次删行，未回收时为它的版本登记清理项。
+
+Call site（harness 恢复后在轮次结束时保存）:
+
+```rust
+const DERIVATION: &str = "miumiu/anthropic-messages/v1";
+let log = store.session_log(access)?;
+let epoch = log.availability_epoch()?;
+let (mut conversation, mut after) = match log.conversation_cache("chat", DERIVATION)? {
+    Some(cache) if !cache.stale => {
+        let mut bytes = Vec::with_capacity(cache.bytes as usize);
+        let mut offset = Some(0);
+        while let Some(at) = offset {
+            let page = log.read_conversation_cache(&cache, at, 1 << 20)?;
+            bytes.extend(page.bytes);
+            offset = page.next_offset;
+        }
+        (Conversation::decode(&bytes)?, cache.position)
+    }
+    _ => (Conversation::default(), 0),
+};
+loop {
+    let page = log.events("chat", after, 100)?;
+    for header in &page.entries {
+        conversation.apply(&log, header)?;
+        after = header.event.as_ref().map_or(after, |event| event.sequence);
+    }
+    if page.next_sequence.is_none() {
+        break;
+    }
+}
+// … run the turn, appending events and applying them …
+log.save_conversation_cache(
+    ConversationCacheInput {
+        session: "chat".into(),
+        derivation: DERIVATION.into(),
+        position: log.position("chat")?,
+        media_type: "application/json".into(),
+        expected_availability_epoch: epoch,
+    },
+    conversation.encode()?.as_slice(),
+)?;
+```
+
+### `session::SessionLog::recover_payloads` (changed)
+
+```rust
+impl SessionLog<'_> {
+    /// Cleans abandoned uploads, purged payloads and the payloads of replaced,
+    /// removed, interrupted or stale conversation caches; never live data.
+    pub fn recover_payloads(&self, max_chunks: usize, max_uploads: usize) -> ContextResult<RecoveryReport>;
+}
+```
+
+- Ordering: 先做现有的记录清理；剩余预算再处理本 owner 的 `cache_pending`：每一项先核对它不是一行未回收缓存的当前版本（否则 `Corrupt`），再用 `remove_chunks` 删块，删完才删清理项并计一次 `uploads_removed`；预算还有余时，从 `cache_sweep` 记下的位置起扫描本 owner 的缓存行，每次最多 4,096 行，把过期且未回收的行置 `reclaimed` 并登记清理项，扫到末尾时删掉游标。
+- Invariants: 预算校验沿用 1..=4,096 块、1..=100 项。任何一步因预算停下、扫描没到末尾或这次登记了新的清理项时 `more` 为真，所以反复调用到 `more` 为假，就回收完所有已知的缓存载荷。
+- Performance: 每次调用最多删 `max_chunks` 个块，最多检查 4,096 个缓存行。
+
+## Data
+
+- Stored:
+  - `session_source_scopes_v1`（Inline）：键 `session_key(owner, session) ‖ segment(encode(scope))`，值是首次出现的位置（u64 BE）。唯一写入方 `Coverage::record_scopes`。
+  - `session_withdrawals_v1`（Inline）：键 `session_key(owner, holder) ‖ epoch_be`，值是不可读的起始位置（u64 BE）。唯一写入方 `Coverage::record_withdrawal`。
+  - `session_caches_v1`（Inline）：`CacheRow`，见上。唯一写入方 `session::caches`。
+  - `session_cache_chunks_v1`（LargeValues）：键 `owner_key(owner) ‖ version ‖ chunk_be`，值 `digest ‖ bytes`。写入方 `session::caches` 经 `records::chunks`。
+  - `session_cache_pending_v1`（Inline）：`PendingCache`，见上。唯一写入方 `session::caches`。
+  - `session_cache_sweep_v1`（Inline）：键 `owner_key(owner)`，值是上次检查到的 `session_caches_v1` 键。唯一写入方 `session::caches`。
+- Existing records: reset（status `startup`）。旧存储没有来源 scope 和撤回索引，缓存的读取权限和过期都会算错，所以 `STORE_FORMAT_ID` 从 `mmdb-store-v5` 改为 `mmdb-store-v6`，旧目录打开时被拒绝，需要整库重置，不做迁移。
+
+## Dependencies
+
+| Dependency | Category | Production adapter | Test adapter |
+| --- | --- | --- | --- |
+| Fjall，经 `mmdb-kernel` | local-substitutable | 存储目录 | `tempfile` 临时目录里的真实存储；崩溃用 `drop_next_commit` 丢弃发布提交 |
+
+没有新 seam。
+
+## Steps
+
+1. 把分块载荷的写、读、删抽成 `records::chunks`，记录载荷改为经它读写，磁盘格式不变。After: none. Check: `cargo test --workspace --locked`
+2. `commit_state_change` 把这次状态变更推进到的可用性 epoch 交给索引闭包，`state_change` 一并返回它。After: none. Check: `cargo test --workspace --locked`
+3. 新增 `session::coverage` 及来源 scope 与撤回两份索引：`put_event` 登记来源 scope，`withdraw_event` 按消息起点登记撤回，`View::spans` 给出视图各段；`STORE_FORMAT_ID` 改为 `mmdb-store-v6`，同步 `native_memory` 的格式断言、`format_and_store_identity_prevent_accidental_adoption` 的旧格式列表和 README 的格式说明。单元测试覆盖跨 fork 的 `scopes_through`、消息扩散、共享前缀和 N 之后的撤回。After: 2. Check: `cargo test --workspace --locked`
+4. 新增 `session::caches`：`availability_epoch`，对话缓存的保存、查找、列出、读取和删除，`module_partitions!` 支持声明大值分区，`ContextError` 的两个新变体，`mmdb::session` 导出新类型；新建 `tests/conversation_cache.rs`，覆盖 Behavior map 中除回收以外的各行，以及 `an_interrupted_save_keeps_the_previous_cache`。After: 1, 3. Check: `cargo test --workspace --locked`
+5. `recover_payloads` 回收被替换、删除、中断和过期的缓存载荷，扫描游标存进 `session_cache_sweep_v1`；单元测试 `recovery_reclaims_replaced_removed_and_stale_payloads`，以及清理项指向当前版本时报 `Corrupt`。After: 4. Check: `cargo test --workspace --locked`
+6. `examples/context_harness.rs` 的第一个 harness 保存对话缓存、再追加事件，重开后的第二个 harness 用缓存加日志尾部还原对话；README 的 Harness Context 一节说明对话缓存；feature doc 的 Status 改为 `shipped`，本文件 `git mv` 到 `docs/spec/archived/<YYYY-MM-DD>-conversation-cache.md`。After: 5. Check: `cargo test --workspace --locked && cargo run --locked -p mmdb --example context_harness`
+
+## Not this
+
+- 不建 fork 的反向索引，也不在撤回或清除的批次里寻找受影响的缓存；过期在读取时判定，回收靠扫描。
+- 读取路径不写任何东西，包括不替过期缓存置 `reclaimed`。
+- 对话缓存不进 `records` 的记录头、操作回执或可用性检查；`records` 只为它提供分块。
+- 不改变日志事件、检查点和记忆的可读性规则。
+- 不为同一派生名保留旧版本，也不提供按版本恢复。
