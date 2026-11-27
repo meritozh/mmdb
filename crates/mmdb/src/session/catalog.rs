@@ -212,7 +212,11 @@ impl SessionLog<'_> {
                     sessions.push(self.session_state(&row.session, head)?);
                 }
             }
-            if sessions.len() == query.limit || scanned + 1 == 4096 {
+            if scanned + 1 == 4096 {
+                next = Some(change);
+                break;
+            }
+            if sessions.len() == query.limit {
                 if self
                     .parts
                     .changes

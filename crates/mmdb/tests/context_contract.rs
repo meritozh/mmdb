@@ -3789,6 +3789,26 @@ mod sessions {
         let last = log.sessions(query).unwrap();
         assert_eq!(last.sessions, [log.session("match").unwrap()]);
         assert_eq!(last.next, None);
+
+        // Exclude the newest row so exactly 4,096 remain. The oldest
+        // row fills the page and exhausts its scan budget simultaneously.
+        let exact = log
+            .sessions(SessionQuery {
+                kind: Some("chat".into()),
+                before: Some(log.session("child-4095").unwrap().change),
+                ..catalog_query(1)
+            })
+            .unwrap();
+        assert_eq!(exact.sessions, last.sessions);
+        assert_eq!(exact.next, Some(exact.sessions[0].change));
+        let end = log
+            .sessions(SessionQuery {
+                before: exact.next,
+                ..catalog_query(1)
+            })
+            .unwrap();
+        assert!(end.sessions.is_empty());
+        assert_eq!(end.next, None);
     }
 
     #[test]
