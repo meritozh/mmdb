@@ -143,6 +143,34 @@ mod tests {
     }
 
     #[test]
+    fn owner_search_rejects_invalid_order_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        let log = source(&store);
+        let mut key = session_key("owner", "source");
+        key.extend(1u64.to_be_bytes());
+        let mut entry = log.view("source").unwrap().entry(1).unwrap().unwrap();
+        for (owner, kind) in [("owner", RecordKind::Session), ("other", RecordKind::Event)] {
+            entry.record.owner = owner.into();
+            entry.record.kind = kind;
+            let mut batch = log.scoped.batch();
+            batch.insert(&log.parts.order, &key, encode(&entry).unwrap());
+            batch.commit().unwrap();
+            assert!(matches!(
+                log.search(LogQuery {
+                    text: "x".into(),
+                    session: None,
+                    cursor: None,
+                    limit: 1,
+                    max_events: 1,
+                    max_bytes: 10,
+                }),
+                Err(ContextError::Corrupt(_))
+            ));
+        }
+    }
+
+    #[test]
     fn forking_reads_only_the_cut_turn() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::create(dir.path().join("store")).unwrap();

@@ -99,7 +99,12 @@ impl SessionLog<'_> {
                     Ok((key, entry))
                 }))
             } else {
-                Box::new(super::view::scan(self.parts, prefix, start))
+                Box::new(super::view::scan(
+                    self.parts,
+                    &self.scoped.access().owner,
+                    prefix,
+                    start,
+                ))
             };
         for entry in entries {
             let (key, entry) = entry?;

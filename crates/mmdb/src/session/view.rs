@@ -11,6 +11,16 @@ pub(super) struct OrderEntry {
     pub open_turn: Option<u64>,
 }
 
+impl OrderEntry {
+    fn decode(owner: &str, bytes: &[u8]) -> ContextResult<Self> {
+        let entry: Self = decode(bytes)?;
+        if entry.record.owner != owner || entry.record.kind != RecordKind::Event {
+            return Err(ContextError::Corrupt("invalid session order record".into()));
+        }
+        Ok(entry)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub(super) struct ResultIndex {
     pub record: ContextRef,
@@ -159,20 +169,13 @@ impl<'a> View<'a> {
     pub fn result(&self, id: &str) -> ContextResult<Option<Found<ResultIndex>>> {
         self.lookup(&self.parts.results, id, |r: &ResultIndex| r.sequence)
     }
-    fn validate(&self, entry: OrderEntry) -> ContextResult<OrderEntry> {
-        if entry.record.owner != self.owner || entry.record.kind != RecordKind::Event {
-            return Err(ContextError::Corrupt("invalid session order record".into()));
-        }
-        Ok(entry)
-    }
-
     pub fn entry(&self, position: u64) -> ContextResult<Option<OrderEntry>> {
         let mut key = session_key(self.owner, self.holder(position));
         key.extend_from_slice(&position.to_be_bytes());
         self.parts
             .order
             .get(key)?
-            .map(|bytes| self.validate(decode(&bytes)?))
+            .map(|bytes| OrderEntry::decode(self.owner, &bytes))
             .transpose()
     }
 
@@ -203,17 +206,21 @@ impl<'a> View<'a> {
                         let suffix = key[len..]
                             .try_into()
                             .map_err(|_| ContextError::Corrupt("invalid order key".into()))?;
-                        Ok((u64::from_be_bytes(suffix), self.validate(decode(&bytes)?)?))
+                        Ok((
+                            u64::from_be_bytes(suffix),
+                            OrderEntry::decode(self.owner, &bytes)?,
+                        ))
                     })
             })
     }
 }
 
-pub(super) fn scan(
-    parts: &SessionParts,
+pub(super) fn scan<'a>(
+    parts: &'a SessionParts,
+    owner: &'a str,
     prefix: Vec<u8>,
     start: Vec<u8>,
-) -> impl Iterator<Item = ContextResult<(Vec<u8>, OrderEntry)>> + '_ {
+) -> impl Iterator<Item = ContextResult<(Vec<u8>, OrderEntry)>> + 'a {
     parts
         .order
         .range(start..)
@@ -221,8 +228,8 @@ pub(super) fn scan(
             row.as_ref()
                 .map_or(true, |(key, _)| key.starts_with(&prefix))
         })
-        .map(|row| {
+        .map(move |row| {
             let (key, bytes) = row?;
-            Ok((key.to_vec(), decode(&bytes)?))
+            Ok((key.to_vec(), OrderEntry::decode(owner, &bytes)?))
         })
 }
