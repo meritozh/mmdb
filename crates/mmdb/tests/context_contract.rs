@@ -4049,6 +4049,147 @@ mod sessions {
         }
     }
     #[test]
+    fn refused_forks_leave_the_catalog_unchanged_on_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        let workspace = Scope::Workspace(ulid::Ulid::new());
+        let mut full = access("owner");
+        full.scopes.push(workspace.clone());
+        let observer = store.session_log(full.clone()).unwrap();
+        observer
+            .create_session(OperationId::new(), new("source"), workspace.clone())
+            .unwrap();
+        observer
+            .append(
+                OperationId::new(),
+                EventInput {
+                    scope: workspace,
+                    ..event_input("source", "first")
+                },
+                &[][..],
+            )
+            .unwrap();
+        let bound = ContextAccess {
+            session: Some("source".into()),
+            ..full.clone()
+        };
+        let before = observer.sessions(catalog_query(10)).unwrap();
+        for (profile, position) in [
+            (bound, 1),
+            (access("owner"), 1),
+            (full.clone(), 0),
+            (full, 2),
+        ] {
+            let log = store.session_log(profile).unwrap();
+            let op = OperationId::new();
+            for _ in 0..2 {
+                let error = log
+                    .fork_session(op, new("fork"), origin("source", position))
+                    .unwrap_err();
+                match position {
+                    0 => assert!(matches!(error, ContextError::InvalidInput(_))),
+                    2 => assert!(matches!(
+                        error,
+                        ContextError::PositionConflict {
+                            expected: 2,
+                            actual: 1
+                        }
+                    )),
+                    _ => assert!(matches!(error, ContextError::AccessDenied)),
+                }
+                assert!(matches!(
+                    observer.session("fork"),
+                    Err(ContextError::UnknownSession(_))
+                ));
+                assert_eq!(observer.sessions(catalog_query(10)).unwrap(), before);
+                assert!(observer.operation_receipt(op).unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn a_fork_preserves_previously_retracted_and_purged_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("store")).unwrap();
+        let log = turn_log(&store, Actor::Operator);
+        log.create_session(OperationId::new(), new("source"), Scope::Personal)
+            .unwrap();
+        for name in ["withdrawn", "purged"] {
+            let event = log
+                .append(
+                    OperationId::new(),
+                    event_input("source", name),
+                    &b"content"[..],
+                )
+                .unwrap();
+            if name == "withdrawn" {
+                log.retract(OperationId::new(), event.pin).unwrap();
+            } else {
+                log.purge(OperationId::new(), event.pin).unwrap();
+            }
+        }
+        log.fork_session(OperationId::new(), new("fork"), origin("source", 2))
+            .unwrap();
+        let entries = log.events("fork", 0, 2).unwrap().entries;
+        assert_eq!(
+            entries.iter().map(|e| &e.state).collect::<Vec<_>>(),
+            [&RecordState::Retracted, &RecordState::Purged]
+        );
+        assert_eq!(entries, log.events("source", 0, 2).unwrap().entries);
+    }
+
+    #[test]
+    fn reopening_interrupts_open_turns_in_forks_and_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let store = Store::create(&path).unwrap();
+        let log = turn_log(&store, Actor::System);
+        log.create_session(OperationId::new(), new("source"), Scope::Personal)
+            .unwrap();
+        boundary(&log, "source", "prefix", EventKind::Notice);
+        log.fork_session(OperationId::new(), new("fork"), origin("source", 1))
+            .unwrap();
+        let child = NewSession {
+            parent: Some(SessionParent {
+                session: "source".into(),
+                run: "run".into(),
+            }),
+            ..new("child")
+        };
+        log.create_session(OperationId::new(), child, Scope::Personal)
+            .unwrap();
+        let open = ["fork", "child"].map(|name| {
+            boundary(&log, name, "start", EventKind::TurnStarted);
+            let state = log.session(name).unwrap();
+            assert_eq!(state.open_run.as_deref(), Some("run"));
+            state
+        });
+        drop(store);
+        let store = Store::open(path).unwrap();
+        let log = turn_log(&store, Actor::System);
+        for before in open {
+            let name = &before.header.session;
+            let after = log.session(name).unwrap();
+            assert_eq!(after.open_run, None);
+            assert_eq!(after.position, before.position + 1);
+            assert!(after.change > before.change);
+            let end = log
+                .events(name, before.position, 1)
+                .unwrap()
+                .entries
+                .pop()
+                .unwrap();
+            assert_eq!(
+                end.event.unwrap().kind,
+                EventKind::TurnEnded {
+                    reason: TurnEndReason::Interrupted,
+                    start_event_id: "start".into()
+                }
+            );
+        }
+    }
+
+    #[test]
     fn only_system_or_operator_manage_sessions() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::create(dir.path().join("store")).unwrap();
