@@ -392,33 +392,44 @@ fn withdrawing_a_shared_prefix_event_makes_fork_caches_stale() {
 
 #[test]
 fn withdrawing_a_later_part_of_a_covered_message_makes_the_cache_stale() {
-    let f = Fixture::new();
-    let l = f.log();
-    for (id, k) in [
-        ("turn", EventKind::TurnStarted),
-        ("step", EventKind::StepStarted),
+    for (derivation, later_part) in [
         (
-            "start",
-            EventKind::AssistantStarted {
+            "fragment",
+            EventKind::AssistantFragment {
                 message_id: "m".into(),
+                ordinal: 0,
+            },
+        ),
+        (
+            "tool",
+            EventKind::ToolCall {
+                call_id: "call".into(),
+                tool_name: "lookup".into(),
+                message_id: Some("m".into()),
             },
         ),
     ] {
-        event(&l, "chat", id, k, vec![]);
+        let f = Fixture::new();
+        let l = f.log();
+        for (id, k) in [
+            ("turn", EventKind::TurnStarted),
+            ("step", EventKind::StepStarted),
+            (
+                "start",
+                EventKind::AssistantStarted {
+                    message_id: "m".into(),
+                },
+            ),
+        ] {
+            event(&l, "chat", id, k, vec![]);
+        }
+        f.save(derivation, 4);
+        let part = event(&l, "chat", "part", later_part, vec![]);
+        let cache = || l.conversation_cache("chat", derivation).unwrap().unwrap();
+        assert!(!cache().stale);
+        l.retract(OperationId::new(), part).unwrap();
+        assert!(cache().stale, "{derivation}");
     }
-    f.save("x", 4);
-    let part = event(
-        &l,
-        "chat",
-        "part",
-        EventKind::AssistantFragment {
-            message_id: "m".into(),
-            ordinal: 0,
-        },
-        vec![],
-    );
-    l.retract(OperationId::new(), part).unwrap();
-    assert!(l.conversation_cache("chat", "x").unwrap().unwrap().stale);
 }
 
 #[test]
@@ -487,6 +498,8 @@ fn saving_refuses_bad_input_and_writes_nothing() {
         .unwrap()
         .caches
         .is_empty());
+    let report = l.recover_payloads(32, 32).unwrap();
+    assert_eq!((report.chunks_removed, report.uploads_removed), (0, 0));
 }
 
 #[test]
