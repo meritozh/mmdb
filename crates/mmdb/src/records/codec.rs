@@ -51,6 +51,7 @@ pub(crate) fn revision_key(pin: &RecordPin) -> Vec<u8> {
     key
 }
 
+#[cfg(test)]
 pub(crate) fn payload_key(pin: &RecordPin, chunk: u64) -> Vec<u8> {
     let mut key = revision_key(pin);
     key.extend_from_slice(&chunk.to_be_bytes());
