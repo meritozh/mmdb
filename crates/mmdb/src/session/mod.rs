@@ -1,5 +1,7 @@
 //! Continuous, owner-scoped session events and recovery checkpoints.
 
+mod caches;
+pub use caches::{ConversationCache, ConversationCacheInput, ConversationCachePage};
 mod catalog;
 pub use catalog::{NewSession, SessionPage, SessionQuery, SessionState};
 mod checkpoints;
@@ -21,6 +23,9 @@ pub use types::*;
 const CALLS: &str = "session_tool_calls_v1";
 const MESSAGES: &str = "session_messages_v1";
 module_partitions!(SessionParts, SESSION_PARTITIONS, {
+    caches => "session_caches_v1",
+    cache_chunks => "session_cache_chunks_v1"; LargeValues,
+    cache_pending => "session_cache_pending_v1",
     source_scopes => "session_source_scopes_v1",
     withdrawals => "session_withdrawals_v1",
     lineage => "session_lineage_v1",
