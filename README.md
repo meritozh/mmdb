@@ -29,6 +29,13 @@ pending messages, tool calls and step. Both modules share the store lease, write
 lock and durable batches. An assistant can save validated
 context directly, with provenance and an explicit inference label.
 
+A system or operator harness can save a conversation cache for a named
+derivation at a session log position. Read the availability epoch before
+building the conversation and pass it when saving. On reopen, read the
+current cache in pages and replay events after its position. If the cache
+is missing or stale, replay from the beginning. Withdrawing covered content
+makes a cache stale.
+
 Create a fresh root with `mmdb::Store::create(path)` and reopen it with
 `mmdb::Store::open(path)`. Use `store.memory()` for native memory or
 `store.context(access)` for a `ContextStore`. Use `store.session_log(access)`

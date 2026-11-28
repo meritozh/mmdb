@@ -2,7 +2,7 @@
 
 可信 harness 把从会话日志派生出的对话按派生名存成对话缓存，绑定到日志位置 N；之后读这份缓存，再读 N 之后的事件，就能还原对话。缓存覆盖的事件变得不可读时，缓存过期。
 
-Status: decided
+Status: shipped
 
 ## Behavior
 

@@ -1,10 +1,37 @@
 //! A deterministic pair of harnesses sharing a context store across reopen.
 use mmdb::context::*;
-use mmdb::session::EventInput;
+use mmdb::session::{ConversationCacheInput, EventInput, SessionLog};
 use mmdb::Store;
 use mmdb::{Actor, OperationId, Scope, TemporalFacts};
 use serde_json::json;
 use std::collections::BTreeMap;
+
+const SESSION: &str = "trading-session";
+const DERIVATION: &str = "harness/text-messages/v1";
+
+fn apply_tail(
+    log: &SessionLog<'_>,
+    messages: &mut Vec<String>,
+    mut position: u64,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    loop {
+        let page = log.events(SESSION, position, 100)?;
+        for entry in page.entries {
+            let mut bytes = Vec::new();
+            let mut offset = Some(0);
+            while let Some(at) = offset {
+                let part = log.read_payload(&entry.pin, at, 4096)?;
+                bytes.extend(part.bytes);
+                offset = part.next_offset;
+            }
+            messages.push(String::from_utf8(bytes)?);
+            position = entry.event.ok_or("missing event position")?.sequence;
+        }
+        if page.next_sequence.is_none() {
+            return Ok(position);
+        }
+    }
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let temporary = tempfile::tempdir()?;
@@ -51,6 +78,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 session: "research-session".into(),
                 position: log.position("research-session")?,
             },
+        )?;
+        let epoch = log.availability_epoch()?;
+        let mut messages = Vec::new();
+        let position = apply_tail(&log, &mut messages, 0)?;
+        log.save_conversation_cache(
+            ConversationCacheInput {
+                session: SESSION.into(),
+                derivation: DERIVATION.into(),
+                position,
+                media_type: "application/json".into(),
+                expected_availability_epoch: epoch,
+            },
+            serde_json::to_vec(&messages)?.as_slice(),
+        )?;
+        log.append(
+            OperationId::new(),
+            EventInput {
+                sources: Vec::new(),
+                session: SESSION.into(),
+                event_id: "user-message-2".into(),
+                scope: Scope::Personal,
+                kind: EventKind::UserMessage,
+                media_type: "text/plain".into(),
+                occurred_at_ms: 2,
+                expected_sequence: Some(position),
+            },
+            b"Review the allocation.".as_slice(),
         )?;
         let listed = log.sessions(mmdb::session::SessionQuery {
             kind: Some("analysis".into()),
@@ -135,6 +189,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     access.session = Some("trading-session".into());
     let log = db.session_log(access.clone())?;
     let context = db.context(access)?;
+    let _epoch = log.availability_epoch()?;
+    let cache = log
+        .conversation_cache(SESSION, DERIVATION)?
+        .ok_or("missing conversation cache")?;
+    assert!(!cache.stale);
+    let mut bytes = Vec::new();
+    let mut offset = Some(0);
+    while let Some(at) = offset {
+        let page = log.read_conversation_cache(&cache, at, 4096)?;
+        bytes.extend(page.bytes);
+        offset = page.next_offset;
+    }
+    let mut messages = serde_json::from_slice(&bytes)?;
+    apply_tail(&log, &mut messages, cache.position)?;
+    assert_eq!(
+        messages,
+        [
+            "A capacity constraint affects the next trading decision.",
+            "Review the allocation."
+        ]
+    );
     let (_, definition) = context
         .find_type(&Scope::Personal, "research.observation")?
         .ok_or("shared type was not found")?;
