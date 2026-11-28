@@ -176,6 +176,7 @@ impl<'a> Coverage<'a> {
     pub fn new(parts: &'a SessionParts, owner: &'a str) -> Self;
 
     /// Called for every event written to `session` at `position`, inside its batch.
+    /// Several events of one batch may carry the same scope.
     pub fn record_scopes(
         &self,
         batch: &mut Batch,
@@ -200,12 +201,19 @@ impl<'a> Coverage<'a> {
 }
 ```
 
-- Invariants: 来源 scope 索引对每个（会话, scope）只记第一次出现的位置，之后同 scope 的事件不再写；撤回索引对每个（holder, epoch）一行，另对每个 owner 一行记最近一次撤回的 epoch。可用性 epoch 每次状态变更都推进，所以后写入的撤回 epoch 总是更大，`record_withdrawal` 直接覆盖这一行，不用先读。`scopes_through` 不含会话自己的 scope，按 `Scope` 的顺序去重排列。被撤回事件带来的 scope 仍然计入，只会更严，不会放宽。
+- Invariants:
+  - 来源 scope 索引的每一行是（会话, scope, 位置），一个（会话, scope）最小的位置就是它第一次出现的位置。`record_scopes` 只看已提交的行：这个（会话, scope）已有行时不写，没有时为这个位置写一行。
+  - 批次读不到自己未提交的写入，所以同一批次里几个事件带来同一个新 scope 时（例如轮次收尾或 fork 截断收尾补齐的几份工具结果），每个事件各写一行，最早的一行仍在。之后的批次能看到已提交的行，不再写。
+  - 撤回索引对每个（holder, epoch）一行，另对每个 owner 一行记最近一次撤回的 epoch。一次状态变更的批次只撤回一个事件，所以一个批次不会两次写同一个（holder, epoch）。可用性 epoch 每次状态变更都推进，所以后写入的撤回 epoch 总是更大，`record_withdrawal` 直接覆盖 owner 行，不用先读。
+  - `scopes_through` 不含会话自己的 scope，按 `Scope` 的顺序去重排列。被撤回事件带来的 scope 仍然计入，只会更严，不会放宽。
 - Ordering: `record_scopes` 和 `record_withdrawal` 必须与写事件或改状态在同一批次提交。
 - Errors: 存储错误照传；键或值解不开时 `Corrupt`。
-- Performance: `scopes_through` 对视图的每一段做一次前缀扫描，行数是该会话出现过的来源 scope 数；`withdrawn_since` 对每一段从 `epoch + 1` 起做一次范围扫描，行数是该会话在那之后的撤回次数。两者都与日志长度无关，段数不超过 64。`last_withdrawal` 读一行。
+- Performance:
+  - `scopes_through` 对视图的每一段做一次前缀扫描。扫过的行数是这个会话出现过的来源 scope 数，加上首次带来某个 scope 的批次里同一 scope 多写的行，每个批次最多多出它写入的事件数。
+  - `withdrawn_since` 对每一段从 `epoch + 1` 起做一次范围扫描，扫过的行数是这个会话在那之后的撤回次数。
+  - 两者都与日志长度无关，段数不超过 64。`last_withdrawal` 读一行。
 
-Behind the seam: scope 的键编码（`session_key ‖ segment(encode(scope))`）、撤回键（`session_key(holder) ‖ epoch_be`）和 owner 行的键（`owner_key(owner)`，比任何撤回键都短，不落进按会话的前缀扫描）、沿 `View::spans` 逐段剪裁到 N、`epoch` 为 `u64::MAX` 时的边界。
+Behind the seam: scope 的键编码（`session_key ‖ segment(encode(scope)) ‖ position_be`），一个 scope 的行按位置排在一起，每段取第一行与该段的 `through` 比较；撤回键（`session_key(holder) ‖ epoch_be`）和 owner 行的键（`owner_key(owner)`，比任何撤回键都短，不落进按会话的前缀扫描）；沿 `View::spans` 逐段剪裁到 N；`epoch` 为 `u64::MAX` 时的边界。
 
 写入方（`session::history`，changed）:
 
@@ -402,7 +410,7 @@ impl SessionLog<'_> {
 ## Data
 
 - Stored:
-  - `session_source_scopes_v1`（Inline）：键 `session_key(owner, session) ‖ segment(encode(scope))`，值是首次出现的位置（u64 BE）。唯一写入方 `Coverage::record_scopes`。
+  - `session_source_scopes_v1`（Inline）：键 `session_key(owner, session) ‖ segment(encode(scope)) ‖ position_be`，值为空。一个（会话, scope）的行在首次出现的那个批次里写入，可能不止一行，键序第一行是首次出现的位置。唯一写入方 `Coverage::record_scopes`。
   - `session_withdrawals_v1`（Inline）：键 `session_key(owner, holder) ‖ epoch_be`，值是不可读的起始位置（u64 BE）；另有每个 owner 一行，键 `owner_key(owner)`，值是最近一次撤回的 epoch（u64 BE）。唯一写入方 `Coverage::record_withdrawal`。
   - `session_caches_v1`（Inline）：键 `session_key(owner, session) ‖ derivation 的 UTF-8 字节`，值 `CacheRow`，见上。唯一写入方 `session::caches`。
   - `session_cache_chunks_v1`（LargeValues）：键 `owner_key(owner) ‖ version ‖ chunk_be`，值 `digest ‖ bytes`。写入方 `session::caches` 经 `records::chunks`。
@@ -422,7 +430,7 @@ impl SessionLog<'_> {
 
 1. 把分块载荷的写、读、删抽成 `records::chunks`，记录载荷改为经它读写，磁盘格式不变。After: none. Check: `cargo test --workspace --locked`
 2. `commit_state_change` 把这次状态变更推进到的可用性 epoch 交给索引闭包，`state_change` 一并返回它。After: none. Check: `cargo test --workspace --locked`
-3. 新增 `session::coverage` 及来源 scope 与撤回两份索引：`put_event` 登记来源 scope，`withdraw_event` 按消息起点登记撤回并更新本 owner 最近一次撤回的 epoch（`last_withdrawal`），`View::spans` 给出视图各段；`STORE_FORMAT_ID` 改为 `mmdb-store-v6`，同步 `native_memory` 的格式断言、`format_and_store_identity_prevent_accidental_adoption` 的旧格式列表和 README 的格式说明。单元测试覆盖跨 fork 的 `scopes_through`、消息扩散、共享前缀、N 之后的撤回和 `last_withdrawal`。After: 2. Check: `cargo test --workspace --locked`
+3. 新增 `session::coverage` 及来源 scope 与撤回两份索引：`put_event` 登记来源 scope，`withdraw_event` 按消息起点登记撤回并更新本 owner 最近一次撤回的 epoch（`last_withdrawal`），`View::spans` 给出视图各段；`STORE_FORMAT_ID` 改为 `mmdb-store-v6`，同步 `native_memory` 的格式断言、`format_and_store_identity_prevent_accidental_adoption` 的旧格式列表和 README 的格式说明。单元测试覆盖跨 fork 的 `scopes_through`、消息扩散、共享前缀、N 之后的撤回和 `last_withdrawal`。另有一个单元测试：在同一批次里直接调用 `record_scopes`，在位置 p 和 p+1 两次登记同一个新 scope，提交后 `scopes_through(view, p)` 含这个 scope。After: 2. Check: `cargo test --workspace --locked`
 4. 新增 `session::caches`：`availability_epoch`，对话缓存的保存、查找、列出、读取和删除，`module_partitions!` 支持声明大值分区，`ContextError` 的两个新变体，`mmdb::session` 导出新类型；新建 `tests/conversation_cache.rs`，覆盖 Behavior map 中除回收以外的各行，以及 `an_interrupted_save_keeps_the_previous_cache`。其中：
    - `saving_refuses_a_derivation_that_raced_a_covered_withdrawal`：读 epoch E，读事件 A，清除 A，再读事件 B，用 E 保存，报 `AvailabilityConflict`。
    - `a_cache_behind_the_log_restores_the_rest_from_the_tail`：另一写者追加事件 11 之后，以位置 10 保存；恢复时从尾部恰好读到 11 一次。
