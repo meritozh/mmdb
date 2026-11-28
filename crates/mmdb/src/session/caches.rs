@@ -319,6 +319,133 @@ impl SessionLog<'_> {
         Ok(true)
     }
 }
+#[derive(Default, Serialize, Deserialize)]
+struct CacheSweep {
+    cursor: Option<Vec<u8>>,
+    epoch: u64,
+}
+
+impl SessionLog<'_> {
+    pub(super) fn recover_caches(
+        &self,
+        mut report: RecoveryReport,
+        max_chunks: usize,
+        max_uploads: usize,
+    ) -> ContextResult<RecoveryReport> {
+        let _guard = self.scoped.lock();
+        let owner = owner_key(&self.scoped.access().owner);
+        for entry in self.parts.cache_pending.prefix(&owner) {
+            if report.chunks_removed == max_chunks || report.uploads_removed == max_uploads {
+                report.more = true;
+                return Ok(report);
+            }
+            let (key, value) = entry?;
+            let pending: PendingCache = decode(&value)?;
+            let row = self.cache_row(&self.cache_key(&pending.session, &pending.derivation)?)?;
+            if key.len() != owner.len() + 16
+                || row.is_some_and(|r| !r.reclaimed && key[owner.len()..] == r.version.to_bytes())
+            {
+                return Err(ContextError::Corrupt("invalid cache cleanup entry".into()));
+            }
+            let mut batch = self.scoped.batch();
+            let chunks = self.scoped.remove_chunks(
+                &mut batch,
+                &ChunkSpace {
+                    partition: &self.parts.cache_chunks,
+                    prefix: key.to_vec(),
+                },
+                max_chunks - report.chunks_removed,
+            )?;
+            report.chunks_removed += chunks.removed;
+            if chunks.complete {
+                batch.remove(&self.parts.cache_pending, key);
+                report.uploads_removed += 1;
+            }
+            batch.commit()?;
+            if !chunks.complete {
+                report.more = true;
+                return Ok(report);
+            }
+        }
+        let latest = self.coverage().last_withdrawal()?;
+        let mut sweep: CacheSweep = self
+            .parts
+            .cache_sweep
+            .get(&owner)?
+            .map(|v| decode(&v))
+            .transpose()?
+            .unwrap_or_default();
+        if sweep.cursor.is_none() {
+            if latest <= sweep.epoch {
+                return Ok(report);
+            }
+            sweep.epoch = latest;
+        }
+        if report.chunks_removed == max_chunks || report.uploads_removed == max_uploads {
+            report.more |= self
+                .parts
+                .caches
+                .prefix_keys(&owner)
+                .next()
+                .transpose()?
+                .is_some();
+            return Ok(report);
+        }
+        let start = sweep
+            .cursor
+            .take()
+            .map(Bound::Excluded)
+            .unwrap_or_else(|| Bound::Included(owner.clone()));
+        let mut batch = self.scoped.batch();
+        let mut entries = self.parts.caches.range((start, Bound::Unbounded));
+        for i in 0..=4096 {
+            let Some(entry) = entries.next() else {
+                sweep.cursor = None;
+                break;
+            };
+            let (key, value) = entry?;
+            if !key.starts_with(&owner) {
+                sweep.cursor = None;
+                break;
+            }
+            if i == 4096 {
+                report.more = true;
+                break;
+            }
+            sweep.cursor = Some(key.to_vec());
+            let mut row: CacheRow = decode(&value)?;
+            if row.reclaimed {
+                continue;
+            }
+            let invalid = || ContextError::Corrupt("invalid cache key".into());
+            let (size, suffix) = key[owner.len()..]
+                .split_first_chunk::<4>()
+                .ok_or_else(invalid)?;
+            let (session, derivation) = suffix
+                .split_at_checked(u32::from_be_bytes(*size) as usize)
+                .ok_or_else(invalid)?;
+            let session = std::str::from_utf8(session).map_err(|_| invalid())?;
+            if row.stale(&self.coverage(), &self.view(session)?)? {
+                let derivation = std::str::from_utf8(derivation).map_err(|_| invalid())?;
+                row.reclaimed = true;
+                batch.insert(&self.parts.caches, &key, encode(&row)?);
+                batch.insert(
+                    &self.parts.cache_pending,
+                    self.cache_space(row.version).prefix,
+                    encode(&PendingCache {
+                        session: session.into(),
+                        derivation: derivation.into(),
+                    })?,
+                );
+                report.more = true;
+            }
+        }
+        batch.insert(&self.parts.cache_sweep, owner, encode(&sweep)?);
+        batch.commit()?;
+        report.more |= latest > sweep.epoch;
+        Ok(report)
+    }
+}
 fn cache_label(value: &str) -> ContextResult<()> {
     if value.is_empty()
         || value.len() > MAX_CONTEXT_NAME_BYTES
@@ -342,6 +469,35 @@ mod tests {
         let log = store
             .session_log(ContextAccess::new("owner", Actor::System))
             .unwrap();
+        let input = initialize(&log);
+        let old = log
+            .save_conversation_cache(input.clone(), &b"old"[..])
+            .unwrap();
+        log.scoped.drop_next_commit(&log.parts.caches);
+        assert!(matches!(
+            log.save_conversation_cache(input, &b"new"[..]),
+            Err(ContextError::Storage(_))
+        ));
+        assert_eq!(
+            log.conversation_cache("chat", "test").unwrap(),
+            Some(old.clone())
+        );
+        assert_eq!(
+            log.read_conversation_cache(&old, 0, 3).unwrap().bytes,
+            b"old"
+        );
+        let pending = log
+            .parts
+            .cache_pending
+            .prefix_keys(owner_key("owner"))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_ne!(pending[0].as_ref(), log.cache_space(old.version).prefix);
+        assert_eq!(log.parts.cache_chunks.prefix_keys(&pending[0]).count(), 1);
+    }
+
+    fn initialize(log: &SessionLog<'_>) -> ConversationCacheInput {
         log.create_session(
             OperationId::new(),
             NewSession {
@@ -368,37 +524,157 @@ mod tests {
             &[][..],
         )
         .unwrap();
-        let input = ConversationCacheInput {
+        ConversationCacheInput {
             session: "chat".into(),
             derivation: "test".into(),
             position: 1,
             media_type: "text/plain".into(),
             expected_availability_epoch: 0,
-        };
-        let old = log
-            .save_conversation_cache(input.clone(), &b"old"[..])
+        }
+    }
+
+    fn filler_rows(log: &SessionLog<'_>, session: &str, count: usize) {
+        let mut row = log
+            .cache_row(&log.cache_key("chat", "test").unwrap())
+            .unwrap()
             .unwrap();
-        log.scoped.drop_next_commit(&log.parts.caches);
+        let mut batch = log.scoped.batch();
+        for n in 0..count {
+            row.version = Ulid::new();
+            batch.insert(
+                &log.parts.caches,
+                log.cache_key(session, &format!("{n:04}")).unwrap(),
+                encode(&row).unwrap(),
+            );
+        }
+        batch.commit().unwrap();
+    }
+
+    fn withdraw(log: &SessionLog<'_>, session: &str, epoch: u64) {
+        let mut batch = log.scoped.batch();
+        log.coverage()
+            .record_withdrawal(&mut batch, session, epoch, 1);
+        batch.commit().unwrap();
+    }
+
+    #[test]
+    fn recovery_reclaims_replaced_removed_and_stale_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("db")).unwrap();
+        let log = store
+            .session_log(ContextAccess::new("owner", Actor::System))
+            .unwrap();
+        let input = initialize(&log);
+        let save = || {
+            log.save_conversation_cache(input.clone(), &b"payload"[..])
+                .unwrap()
+        };
+        let removed = save();
+        log.remove_conversation_cache("chat", "test").unwrap();
+        assert_eq!(log.recover_payloads(32, 32).unwrap().chunks_removed, 1);
+        assert_eq!(
+            log.parts
+                .cache_chunks
+                .prefix_keys(log.cache_space(removed.version).prefix)
+                .count(),
+            0
+        );
+        let old = save();
+        let stale = save();
+        filler_rows(&log, "aaaa", 4095);
+        withdraw(&log, "chat", 1);
+        let report = log.recover_payloads(32, 32).unwrap();
+        assert_eq!(
+            (report.chunks_removed, report.uploads_removed, report.more),
+            (1, 1, true)
+        );
+        assert_eq!(
+            log.parts
+                .cache_chunks
+                .prefix_keys(log.cache_space(old.version).prefix)
+                .count(),
+            0
+        );
+        assert!(
+            log.cache_row(&log.cache_key("chat", "test").unwrap())
+                .unwrap()
+                .unwrap()
+                .reclaimed
+        );
+        let report = log.recover_payloads(32, 32).unwrap();
+        assert_eq!((report.chunks_removed, report.more), (1, false));
+        assert_eq!(
+            log.parts
+                .cache_chunks
+                .prefix_keys(log.cache_space(stale.version).prefix)
+                .count(),
+            0
+        );
+        assert!(log.conversation_caches("chat", None, 1).unwrap().caches[0].stale);
+        log.remove_conversation_cache("chat", "test").unwrap();
+    }
+
+    #[test]
+    fn recovery_rescans_caches_withdrawn_during_a_sweep_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let version = {
+            let store = Store::create(&path).unwrap();
+            let log = store
+                .session_log(ContextAccess::new("owner", Actor::System))
+                .unwrap();
+            let input = initialize(&log);
+            let cache = log.save_conversation_cache(input, &b"A"[..]).unwrap();
+            filler_rows(&log, "fill", 4096);
+            withdraw(&log, "other", 1);
+            assert!(log.recover_payloads(32, 32).unwrap().more);
+            withdraw(&log, "chat", 2);
+            assert!(log.recover_payloads(32, 32).unwrap().more);
+            cache.version
+        };
+        let store = Store::open(&path).unwrap();
+        let log = store
+            .session_log(ContextAccess::new("owner", Actor::System))
+            .unwrap();
+        assert!(log.recover_payloads(32, 32).unwrap().more);
+        let report = log.recover_payloads(32, 32).unwrap();
+        assert_eq!((report.more, report.chunks_removed), (false, 1));
+        assert_eq!(
+            log.parts
+                .cache_chunks
+                .prefix_keys(log.cache_space(version).prefix)
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_a_pending_current_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("db")).unwrap();
+        let log = store
+            .session_log(ContextAccess::new("owner", Actor::System))
+            .unwrap();
+        let input = initialize(&log);
+        let cache = log.save_conversation_cache(input, &b"A"[..]).unwrap();
+        let mut batch = log.scoped.batch();
+        batch.insert(
+            &log.parts.cache_pending,
+            log.cache_space(cache.version).prefix,
+            encode(&PendingCache {
+                session: "chat".into(),
+                derivation: "test".into(),
+            })
+            .unwrap(),
+        );
+        batch.commit().unwrap();
         assert!(matches!(
-            log.save_conversation_cache(input, &b"new"[..]),
-            Err(ContextError::Storage(_))
+            log.recover_payloads(32, 32),
+            Err(ContextError::Corrupt(_))
         ));
         assert_eq!(
-            log.conversation_cache("chat", "test").unwrap(),
-            Some(old.clone())
+            log.read_conversation_cache(&cache, 0, 1).unwrap().bytes,
+            b"A"
         );
-        assert_eq!(
-            log.read_conversation_cache(&old, 0, 3).unwrap().bytes,
-            b"old"
-        );
-        let pending = log
-            .parts
-            .cache_pending
-            .prefix_keys(owner_key("owner"))
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_ne!(pending[0].as_ref(), log.cache_space(old.version).prefix);
-        assert_eq!(log.parts.cache_chunks.prefix_keys(&pending[0]).count(), 1);
     }
 }

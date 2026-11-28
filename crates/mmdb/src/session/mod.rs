@@ -25,6 +25,7 @@ const MESSAGES: &str = "session_messages_v1";
 module_partitions!(SessionParts, SESSION_PARTITIONS, {
     caches => "session_caches_v1",
     cache_chunks => "session_cache_chunks_v1"; LargeValues,
+    cache_sweep => "session_cache_sweep_v1",
     cache_pending => "session_cache_pending_v1",
     source_scopes => "session_source_scopes_v1",
     withdrawals => "session_withdrawals_v1",
@@ -141,14 +142,16 @@ impl SessionLog<'_> {
         )
     }
 
-    /// Cleans abandoned uploads and purged payloads, never live committed data.
+    /// Cleans abandoned uploads, purged payloads, and obsolete cache payloads.
     /// The chunk and upload counts bound work even for very large originals.
     pub fn recover_payloads(
         &self,
         max_chunks: usize,
         max_uploads: usize,
     ) -> ContextResult<RecoveryReport> {
-        self.scoped
-            .recover_payloads(StoreModule::Session, max_chunks, max_uploads)
+        let report = self
+            .scoped
+            .recover_payloads(StoreModule::Session, max_chunks, max_uploads)?;
+        self.recover_caches(report, max_chunks, max_uploads)
     }
 }
