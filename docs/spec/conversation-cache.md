@@ -11,28 +11,36 @@ This spec is open until the feature ships, and `/go-work` carries it out. Do not
 | Feature doc line | Owner | Test |
 | --- | --- | --- |
 | Who: 保存和删除需要 System 或 Operator | `session::caches` | `only_system_or_operator_save_or_remove_caches` |
-| Who: 保存、查找、列出和读取需要能读到覆盖的每个事件 | `session::caches` 比对 `session::coverage::scopes_through` | `reading_a_cache_needs_every_covered_source_scope`、`saving_needs_every_covered_source_scope` |
+| Who: 保存需要能读到覆盖的每个事件 | `session::caches` 比对 `session::coverage::scopes_through` | `saving_needs_every_covered_source_scope` |
+| Who: 查找、列出和读取需要能读到覆盖的每个事件 | `session::caches` 比对 `CacheRow.scopes` | `reading_a_cache_needs_every_covered_source_scope` |
 | Who: access 绑定 session 时只能操作这个会话的缓存 | `session::caches` | `a_session_bound_access_reaches_only_its_session_caches` |
 | Entry: 五个方法与 `availability_epoch` | `session::caches` | `a_cache_and_the_log_tail_restore_the_conversation_after_reopen` |
 | Does: 每个派生名只保留最新一份，不论位置先后 | `session::caches` | `each_derivation_keeps_only_its_latest_cache` |
 | Does: N 可以落在 fork 继承的前缀里；fork 不带缓存 | `session::caches` 经 `View::spans` | `a_cache_may_end_inside_a_forked_prefix_and_forks_start_without_caches` |
 | Does: 查找与列出，每项字段与是否过期 | `session::caches` | `listing_pages_caches_in_derivation_name_order` |
-| Does: 读取按版本和偏移翻页；恢复为缓存加日志尾部 | `session::caches` 经 `records::chunks` | `a_cache_and_the_log_tail_restore_the_conversation_after_reopen`、`a_cache_behind_the_log_restores_the_rest_from_the_tail`、`a_cache_payload_spans_many_chunks_and_pages` |
+| Does: 按版本和偏移翻页读取 | `session::caches` 经 `records::chunks` | `a_cache_payload_spans_many_chunks_and_pages` |
+| Does: 读这份缓存，再读 N 之后的事件，就能还原对话 | `session::caches` | `a_cache_and_the_log_tail_restore_the_conversation_after_reopen` |
+| Does: 读完缓存再从 N+1 起翻页读会话日志 | `session::caches` | `a_cache_behind_the_log_restores_the_rest_from_the_tail` |
 | Does: 过期——撤回或清除覆盖的事件 | `session::history::withdraw_event` 记录，`session::coverage::withdrawn_since` 判定 | `withdrawing_a_covered_event_makes_the_cache_stale` |
 | Does: 过期——N 之后的片段或工具调用使 N 以前开始的消息不可读 | 同上 | `withdrawing_a_later_part_of_a_covered_message_makes_the_cache_stale` |
 | Does: 过期——来源会话里撤回 fork 共享的前缀 | 同上 | `withdrawing_a_shared_prefix_event_makes_fork_caches_stale` |
 | Does: 仍然有效——N 之后的撤回、其他修订、重置记忆、重开收尾 | `session::coverage` | `later_withdrawals_and_other_changes_keep_the_cache_current` |
 | Does: 删除；没有缓存时什么也不做 | `session::caches` | `removing_a_cache_and_removing_nothing` |
-| Fails: 保存的各项拒绝，什么也不写 | `session::caches` | `saving_refuses_bad_input_and_writes_nothing`、`saving_refuses_a_derivation_that_raced_a_covered_withdrawal` |
+| Fails: 保存被拒绝时什么也不写 | `session::caches` | `saving_refuses_bad_input_and_writes_nothing` |
+| Fails: 给定 epoch 之后 N 及以前有事件被撤回或清除，拒绝保存 | `session::caches` 经 `session::coverage::withdrawn_since` | `saving_refuses_a_derivation_that_raced_a_covered_withdrawal` |
 | Fails: 不带操作 ID，重复保存只是再替换一次 | `session::caches` | `repeating_a_save_replaces_the_cache_again` |
 | Fails: 保存中断，原缓存不变，`recover_payloads` 清理 | `session::caches` | `an_interrupted_save_keeps_the_previous_cache`（单元测试） |
 | Fails: 读取已过期报已过期；被替换或删除报已被取代 | `session::caches` | `reading_reports_stale_and_replaced_caches` |
-| Fails: 缺 scope 时查找和读取拒绝访问，列表不返回 | `session::caches` | `reading_a_cache_needs_every_covered_source_scope`、`listing_skips_unreadable_caches_without_naming_them` |
+| Fails: 缺 scope 时查找和读取被拒绝访问 | `session::caches` | `reading_a_cache_needs_every_covered_source_scope` |
+| Fails: 缺 scope 时列表不返回这份缓存 | `session::caches` | `listing_skips_unreadable_caches_without_naming_them` |
 | Fails: 这个 feature 之前的存储打开时被拒绝 | `store`（`STORE_FORMAT_ID`） | `format_and_store_identity_prevent_accidental_adoption`（扩展） |
-| Limits: 名称 1–256 字节；32 KiB 分块、单页 1 MiB；列表每页 1–100 份 | `session::caches`、`records::chunks` | `cache_names_and_pages_are_bounded`、`a_cache_payload_spans_many_chunks_and_pages` |
+| Limits: 名称 1–256 字节；列表每页 1–100 份 | `session::caches` | `cache_names_and_pages_are_bounded` |
+| Limits: 32 KiB 分块、单次读取最多 1 MiB | `records::chunks` | `a_cache_payload_spans_many_chunks_and_pages` |
 | Limits: 不设大小和数量上限 | `session::caches` | `a_cache_payload_spans_many_chunks_and_pages` |
 | Keeps: 重置记忆不影响 | 会话模块的分区 | `caches_survive_a_memory_reset` |
-| Keeps: 过期、替换、删除的载荷由 `recover_payloads` 回收；过期的仍列为过期 | `session::caches` | `recovery_reclaims_replaced_removed_and_stale_payloads`、`recovery_rescans_caches_withdrawn_during_a_sweep_after_reopen`（单元测试） |
+| Keeps: 过期缓存的磁盘空间由 `recover_payloads` 有界回收 | `session::caches` | `recovery_rescans_caches_withdrawn_during_a_sweep_after_reopen`（单元测试） |
+| Keeps: 被替换或删除的缓存载荷同样由 `recover_payloads` 回收 | `session::caches` | `recovery_reclaims_replaced_removed_and_stale_payloads`（单元测试） |
+| Keeps: 被替换或删除前，列表里仍显示为过期 | `session::caches` | `recovery_reclaims_replaced_removed_and_stale_payloads`（单元测试） |
 | Keeps: 不是记录，不进搜索 | `session::caches`（不建记录头，不写 order） | `cache_contents_are_not_search_hits` |
 | Keeps: 不推进会话变更号 | `session::caches`（不调 `Changes::put_head`） | `saving_or_removing_a_cache_keeps_the_session_change_number` |
 | Not this: fork 时复制缓存 | `session::fork`（不碰缓存分区） | `a_cache_may_end_inside_a_forked_prefix_and_forks_start_without_caches` |
@@ -249,7 +257,7 @@ pub struct ConversationCache {
 pub struct ConversationCachePage {
     pub caches: Vec<ConversationCache>,
     /// The derivation of the last cache in `caches`; pass as `after` to continue.
-    /// Set when the page is full and rows remain after it.
+    /// Set when the page is full and another cache the reader can read follows it.
     pub next: Option<String>,
 }
 
@@ -311,7 +319,7 @@ pub enum ContextError {
   - `read_conversation_cache`：行不存在或 `version` 不符时 `ConversationCacheReplaced`；过期时 `ConversationCacheStale`；缺 scope 时 `AccessDenied`；范围不合法时 `InvalidInput`。
   - `remove_conversation_cache`：actor、会话绑定和会话 scope 的 `AccessDenied`；`UnknownSession`；没有这一行时 `Ok(false)`。
 - Configuration: none.
-- Performance: 保存在写锁下流式写入载荷，每 32 KiB 一次提交，加一次 `scopes_through` 和一次 `withdrawn_since`；查找和每次翻页读取各做一次 `withdrawn_since`。列表一页一直扫到凑满 `limit` 份可读缓存或到达末尾，不设扫描上限，最多扫过这个会话的全部缓存行：每份返回的缓存做一次 `withdrawn_since`，读者缺 scope 的行只解码并比较 `CacheRow.scopes` 就跳过。
+- Performance: 保存在写锁下流式写入载荷，每 32 KiB 一次提交，加一次 `scopes_through` 和一次 `withdrawn_since`；查找和每次翻页读取各做一次 `withdrawn_since`。列表一页一直扫到凑满 `limit` 份可读缓存或到达末尾，不设扫描上限，最多扫过这个会话的全部缓存行：每份返回的缓存做一次 `withdrawn_since`，读者缺 scope 的行只解码并比较 `CacheRow.scopes` 就跳过。页满之后继续这样跳过读者缺 scope 的行，直到遇到下一份可读缓存或到达末尾，以决定 `next`，所以不会留下一个空的末页。
 
 Behind the seam:
 
@@ -389,7 +397,7 @@ impl SessionLog<'_> {
   - 任何一步因预算停下、扫描没到末尾、本轮开始后又有撤回、或这次登记了新的清理项时，`more` 为真。
   - `more` 为假时，这次调用开始前提交的撤回、替换、删除和中断留下的缓存载荷都已回收，与清除的记录载荷相同。过期只来自撤回：一轮扫到末尾而其间没有新的撤回，就检查过本轮开始时已过期的每一行；本轮中保存的行在保存时未过期，本轮中被替换或删除的行由保存或删除自己登记清理项。
   - 一轮扫完、`last_withdrawal` 已更大时重开存储，下一次调用仍会开始新一轮，因为 epoch 一直留在 `cache_sweep` 行里，直到下一轮开始。
-- Performance: 每次调用最多删 `max_chunks` 个块，最多检查 4,096 个缓存行；上一轮扫完之后没有新的撤回时，不检查缓存行。
+- Performance: 每次调用最多删 `max_chunks` 个块；核对清理项时每项读一行缓存，最多 `max_uploads` 项；扫描最多检查 4,096 个缓存行，上一轮扫完之后没有新的撤回时不扫描。
 
 ## Data
 
@@ -419,10 +427,10 @@ impl SessionLog<'_> {
    - `saving_refuses_a_derivation_that_raced_a_covered_withdrawal`：读 epoch E，读事件 A，清除 A，再读事件 B，用 E 保存，报 `AvailabilityConflict`。
    - `a_cache_behind_the_log_restores_the_rest_from_the_tail`：另一写者追加事件 11 之后，以位置 10 保存；恢复时从尾部恰好读到 11 一次。
    - `listing_pages_caches_in_derivation_name_order`：派生名 `aa` 与 `z`，每页一份，第一页是 `aa`。
-   - `listing_skips_unreadable_caches_without_naming_them`：可读与不可读的缓存相间，每页凑满可读的，`next` 从不是不可读缓存的派生名。
+   - `listing_skips_unreadable_caches_without_naming_them`：可读与不可读的缓存相间，每页凑满可读的，`next` 从不是不可读缓存的派生名；每页 1 份，`aa` 可读、之后只有不可读的 `z` 时，这一页是 `aa`，`next` 为空。
 
    After: 1, 3. Check: `cargo test --workspace --locked`
-5. `recover_payloads` 回收被替换、删除、中断和过期的缓存载荷，扫描游标和本轮的撤回 epoch 存进 `session_cache_sweep_v1`；单元测试 `recovery_reclaims_replaced_removed_and_stale_payloads`、`recovery_rescans_caches_withdrawn_during_a_sweep_after_reopen`（一轮越过缓存 A 之后清除 A 覆盖的事件，在扫到末尾后重开存储，再回收时从头扫描，A 的块删完才返回 `more = false`），以及清理项指向当前版本时报 `Corrupt`。After: 4. Check: `cargo test --workspace --locked`
+5. `recover_payloads` 回收被替换、删除、中断和过期的缓存载荷，扫描游标和本轮的撤回 epoch 存进 `session_cache_sweep_v1`；单元测试 `recovery_reclaims_replaced_removed_and_stale_payloads`（其中一项待清理的替换加 4,096 行待扫、只有最后一行过期：预算足够的一次调用清掉替换，并把最后一行置 `reclaimed`；被回收的过期缓存在替换或删除前仍列为过期）、`recovery_rescans_caches_withdrawn_during_a_sweep_after_reopen`（一轮越过缓存 A 之后清除 A 覆盖的事件，在扫到末尾后重开存储，再回收时从头扫描，A 的块删完才返回 `more = false`），以及清理项指向当前版本时报 `Corrupt`。After: 4. Check: `cargo test --workspace --locked`
 6. `examples/context_harness.rs` 的第一个 harness 保存对话缓存、再追加事件，重开后的第二个 harness 用缓存加日志尾部还原对话；README 的 Harness Context 一节说明对话缓存；feature doc 的 Status 改为 `shipped`，本文件 `git mv` 到 `docs/spec/archived/<YYYY-MM-DD>-conversation-cache.md`。After: 5. Check: `cargo test --workspace --locked && cargo run --locked -p mmdb --example context_harness`
 
 ## Not this
