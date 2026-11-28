@@ -19,6 +19,11 @@ pub(crate) fn segment(key: &mut Vec<u8>, value: &[u8]) {
     key.extend_from_slice(value);
 }
 
+pub(crate) fn split_segment(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    let (size, suffix) = bytes.split_first_chunk::<4>()?;
+    suffix.split_at_checked(u32::from_be_bytes(*size) as usize)
+}
+
 pub(crate) fn owner_key(owner: &str) -> Vec<u8> {
     let mut key = Vec::new();
     segment(&mut key, owner.as_bytes());

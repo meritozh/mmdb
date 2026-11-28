@@ -1,7 +1,7 @@
 use super::{catalog::SessionHead, coverage::Coverage, view::View, *};
 use crate::records::{
     chunks::ChunkSpace,
-    codec::{decode, encode, validate_name},
+    codec::{decode, encode, split_segment, validate_name},
 };
 use serde::{Deserialize, Serialize};
 use std::{io::Read, ops::Bound};
@@ -418,12 +418,7 @@ impl SessionLog<'_> {
                 continue;
             }
             let invalid = || ContextError::Corrupt("invalid cache key".into());
-            let (size, suffix) = key[owner.len()..]
-                .split_first_chunk::<4>()
-                .ok_or_else(invalid)?;
-            let (session, derivation) = suffix
-                .split_at_checked(u32::from_be_bytes(*size) as usize)
-                .ok_or_else(invalid)?;
+            let (session, derivation) = split_segment(&key[owner.len()..]).ok_or_else(invalid)?;
             let session = std::str::from_utf8(session).map_err(|_| invalid())?;
             if row.stale(&self.coverage(), &self.view(session)?)? {
                 let derivation = std::str::from_utf8(derivation).map_err(|_| invalid())?;

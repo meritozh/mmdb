@@ -1,7 +1,7 @@
 use super::{
     owner_key, segment, session_key, view::View, ContextError, ContextResult, Scope, SessionParts,
 };
-use crate::records::codec::{decode, encode};
+use crate::records::codec::{decode, encode, split_segment};
 use mmdb_kernel::Batch;
 use std::collections::BTreeSet;
 
@@ -68,12 +68,11 @@ impl<'a> Coverage<'a> {
                 if suffix.len() < 12 || !value.is_empty() {
                     return Err(ContextError::Corrupt("invalid source scope row".into()));
                 }
-                let size = u32::from_be_bytes(suffix[..4].try_into().unwrap()) as usize;
-                if size != suffix.len() - 12 {
-                    return Err(ContextError::Corrupt("invalid source scope length".into()));
-                }
-                let scope: Scope = decode(&suffix[4..4 + size])?;
-                let first = number(&suffix[4 + size..])?;
+                let (encoded, position_bytes) = split_segment(suffix)
+                    .filter(|(_, rest)| rest.len() == 8)
+                    .ok_or_else(|| ContextError::Corrupt("invalid source scope length".into()))?;
+                let scope: Scope = decode(encoded)?;
+                let first = number(position_bytes)?;
                 if previous.as_ref() != Some(&scope) && first <= span.through {
                     scopes.insert(scope.clone());
                 }
