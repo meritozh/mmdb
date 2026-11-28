@@ -621,7 +621,7 @@ impl SessionLog<'_> {
             payload: event.payload,
             endpoints: None,
             event: Some(LogEvent {
-                session: event.session,
+                session: event.session.clone(),
                 event_id: event.event_id,
                 sequence,
                 kind: event.kind,
@@ -631,6 +631,12 @@ impl SessionLog<'_> {
             checkpoint: None,
         };
         self.scoped.put_header(batch, &header)?;
+        super::coverage::Coverage::new(self.parts, owner).record_scopes(
+            batch,
+            &event.session,
+            sequence,
+            &header.source_scopes,
+        )?;
         head.sequence = sequence;
         Ok(receipt)
     }
@@ -767,11 +773,13 @@ impl SessionLog<'_> {
         &self,
         batch: &mut mmdb_kernel::Batch,
         event: &LogEvent,
+        epoch: u64,
     ) -> ContextResult<()> {
+        let coverage = super::coverage::Coverage::new(self.parts, &self.scoped.access().owner);
         let id = match &event.kind {
             EventKind::AssistantStarted { message_id }
             | EventKind::AssistantFragment { message_id, .. }
-            | EventKind::AssistantTerminal { message_id, .. } => message_id,
+            | EventKind::AssistantTerminal { message_id, .. } => Some(message_id),
             EventKind::ToolCall {
                 call_id,
                 message_id,
@@ -781,16 +789,20 @@ impl SessionLog<'_> {
                 call.purged = true;
                 let key = identity_key(&self.scoped.access().owner, &event.session, call_id);
                 batch.insert(&self.parts.calls, key, encode(&call)?);
-                let Some(id) = message_id else { return Ok(()) };
-                id
+                message_id.as_ref()
             }
-            _ => return Ok(()),
+            _ => None,
+        };
+        let Some(id) = id else {
+            coverage.record_withdrawal(batch, &event.session, epoch, event.sequence);
+            return Ok(());
         };
         let view = self.view(&event.session)?;
         let overlay = view
             .message(id)?
             .ok_or_else(|| ContextError::Corrupt("missing message lifecycle".into()))?;
         let holder = view.holder(overlay.row.started);
+        coverage.record_withdrawal(batch, holder, epoch, overlay.row.started);
         let key = identity_key(&self.scoped.access().owner, holder, id);
         let mut state: MessageState = self
             .view(holder)?

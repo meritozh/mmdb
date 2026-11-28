@@ -52,6 +52,12 @@ pub(super) struct Found<T> {
     pub row: T,
 }
 
+pub(super) struct Span<'a> {
+    pub holder: &'a str,
+    pub after: u64,
+    pub through: u64,
+}
+
 pub(super) struct View<'a> {
     parts: &'a SessionParts,
     owner: &'a str,
@@ -81,6 +87,26 @@ impl<'a> View<'a> {
             session,
             ancestors,
         })
+    }
+
+    pub fn spans(&self, position: u64) -> impl Iterator<Item = Span<'_>> + '_ {
+        self.ancestors
+            .iter()
+            .map(|s| (s.session.as_str(), s.upto))
+            .chain(std::iter::once((self.session, u64::MAX)))
+            .scan(0, move |after, (holder, end)| {
+                if *after == position {
+                    return None;
+                }
+                let through = end.min(position);
+                let span = Span {
+                    holder,
+                    after: *after,
+                    through,
+                };
+                *after = through;
+                Some(span)
+            })
     }
 
     pub fn holder(&self, position: u64) -> &str {
@@ -183,35 +209,30 @@ impl<'a> View<'a> {
         &self,
         after: u64,
     ) -> impl Iterator<Item = ContextResult<(u64, OrderEntry)>> + '_ {
-        let mut lower = after;
-        self.ancestors
-            .iter()
-            .map(|s| (s.session.as_str(), s.upto))
-            .chain(std::iter::once((self.session, u64::MAX)))
-            .flat_map(move |(session, upto)| {
-                let from = lower;
-                lower = lower.max(upto);
-                let prefix = session_key(self.owner, session);
-                let len = prefix.len();
-                let mut start = prefix.clone();
-                start.extend(from.saturating_add(1).to_be_bytes());
-                let mut end = prefix;
-                end.extend(upto.to_be_bytes());
-                (from < upto)
-                    .then(|| self.parts.order.range(start..=end))
-                    .into_iter()
-                    .flatten()
-                    .map(move |row| {
-                        let (key, bytes) = row?;
-                        let suffix = key[len..]
-                            .try_into()
-                            .map_err(|_| ContextError::Corrupt("invalid order key".into()))?;
-                        Ok((
-                            u64::from_be_bytes(suffix),
-                            OrderEntry::decode(self.owner, &bytes)?,
-                        ))
-                    })
-            })
+        self.spans(u64::MAX).flat_map(move |span| {
+            let from = after.max(span.after);
+            let upto = span.through;
+            let prefix = session_key(self.owner, span.holder);
+            let len = prefix.len();
+            let mut start = prefix.clone();
+            start.extend(from.saturating_add(1).to_be_bytes());
+            let mut end = prefix;
+            end.extend(upto.to_be_bytes());
+            (from < upto)
+                .then(|| self.parts.order.range(start..=end))
+                .into_iter()
+                .flatten()
+                .map(move |row| {
+                    let (key, bytes) = row?;
+                    let suffix = key[len..]
+                        .try_into()
+                        .map_err(|_| ContextError::Corrupt("invalid order key".into()))?;
+                    Ok((
+                        u64::from_be_bytes(suffix),
+                        OrderEntry::decode(self.owner, &bytes)?,
+                    ))
+                })
+        })
     }
 }
 

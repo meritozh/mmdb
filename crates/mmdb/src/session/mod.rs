@@ -3,6 +3,7 @@
 mod catalog;
 pub use catalog::{NewSession, SessionPage, SessionQuery, SessionState};
 mod checkpoints;
+mod coverage;
 mod fork;
 mod history;
 mod search;
@@ -20,6 +21,8 @@ pub use types::*;
 const CALLS: &str = "session_tool_calls_v1";
 const MESSAGES: &str = "session_messages_v1";
 module_partitions!(SessionParts, SESSION_PARTITIONS, {
+    source_scopes => "session_source_scopes_v1",
+    withdrawals => "session_withdrawals_v1",
     lineage => "session_lineage_v1",
     order => "session_order_v1",
     changes => "session_changes_v1",
@@ -116,9 +119,9 @@ impl SessionLog<'_> {
             expected,
             state,
             redacts,
-            |batch, _, header, _| {
+            |batch, _, header, epoch| {
                 if let Some(event) = &header.event {
-                    self.withdraw_event(batch, event)?;
+                    self.withdraw_event(batch, event, epoch)?;
                     let mut head = self.session_head(&event.session)?;
                     catalog::Changes::default().put_head(
                         self,
