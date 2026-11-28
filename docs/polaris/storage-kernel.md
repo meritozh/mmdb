@@ -45,7 +45,7 @@ Status: active
 1. [连续会话日志与原文搜索](../feature/session-log.md)：会话日志和检查点从记忆存储迁到存储内核上的会话模块，从随记忆一起重置变为重置记忆后仍完整可读。Part: 1. After: none
 2. [连续会话日志与原文搜索](../feature/session-log.md)：会话日志从只记录消息和工具事件，变为也记录轮次的开始与结束，并在重开时把未结束的轮次关闭并标为中断。Part: 1. After: 1
 3. [会话头、会话列表与 fork](../feature/sessions.md)：harness 可以创建带会话头的会话、按会话变更号列出会话，并从一段日志前缀 fork 出新会话。Part: 1. After: 1, 2
-4. harness 可以把派生出的对话存成绑定到日志位置的对话缓存，之后只读缓存之后的日志尾部就能还原对话，并在日志事件被撤回或清除后认出缓存已过期。New. Part: 1. After: 1
+4. [对话缓存](../feature/conversation-cache.md). Part: 1. After: 1
 5. WebAssembly UDF 从随 MMDB 提供变为移出 MMDB。Iterate [WebAssembly user-defined functions](../feature/wasm-udfs.md). Part: 1. After: none
 6. 运行状态从独立目录或共用多模型库 keyspace，变为同一存储中的模块，状态变更与会话日志追加同批提交。Iterate [运行状态与独立存储目录](../feature/operational-state.md). Part: 2. After: 1, 2
 

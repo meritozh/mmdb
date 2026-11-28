@@ -19,6 +19,11 @@ pub(crate) fn segment(key: &mut Vec<u8>, value: &[u8]) {
     key.extend_from_slice(value);
 }
 
+pub(crate) fn split_segment(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    let (size, suffix) = bytes.split_first_chunk::<4>()?;
+    suffix.split_at_checked(u32::from_be_bytes(*size) as usize)
+}
+
 pub(crate) fn owner_key(owner: &str) -> Vec<u8> {
     let mut key = Vec::new();
     segment(&mut key, owner.as_bytes());
@@ -51,6 +56,7 @@ pub(crate) fn revision_key(pin: &RecordPin) -> Vec<u8> {
     key
 }
 
+#[cfg(test)]
 pub(crate) fn payload_key(pin: &RecordPin, chunk: u64) -> Vec<u8> {
     let mut key = revision_key(pin);
     key.extend_from_slice(&chunk.to_be_bytes());

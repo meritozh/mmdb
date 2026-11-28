@@ -1,3 +1,4 @@
+pub(crate) mod chunks;
 pub(crate) mod codec;
 mod error;
 mod lifecycle;

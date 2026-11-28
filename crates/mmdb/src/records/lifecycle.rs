@@ -89,7 +89,7 @@ impl Scoped<'_> {
         expected: RecordPin,
         state: RecordState,
         redacts: bool,
-        update_indexes: impl FnOnce(&mut Batch, &RecordHeader, &RecordHeader) -> ContextResult<()>,
+        update_indexes: impl FnOnce(&mut Batch, &RecordHeader, &RecordHeader, u64) -> ContextResult<()>,
     ) -> ContextResult<WriteReceipt> {
         let _guard = self.lock();
         let digest = self.digest("set-context-state", &(&expected, state))?;
@@ -97,9 +97,9 @@ impl Scoped<'_> {
             return Ok(receipt);
         }
         let mut batch = self.batch();
-        let (previous, header) =
+        let (previous, header, epoch) =
             self.state_change(&mut batch, operation, &expected, state, redacts)?;
-        update_indexes(&mut batch, &previous, &header)?;
+        update_indexes(&mut batch, &previous, &header, epoch)?;
         self.commit_operation(
             batch,
             operation,
@@ -118,7 +118,7 @@ impl Scoped<'_> {
         expected: &RecordPin,
         state: RecordState,
         redacts: bool,
-    ) -> ContextResult<(RecordHeader, RecordHeader)> {
+    ) -> ContextResult<(RecordHeader, RecordHeader, u64)> {
         let (previous, pin) = self.next_revision(expected)?;
         if state == RecordState::Retracted
             && previous.information == InformationKind::Instruction
@@ -147,6 +147,6 @@ impl Scoped<'_> {
                 })?,
             );
         }
-        Ok((previous, header))
+        Ok((previous, header, epoch))
     }
 }

@@ -1,8 +1,9 @@
+use super::chunks::ChunkSpace;
 use super::codec::*;
 use super::*;
 use crate::OperationId;
 use mmdb_kernel::Batch;
-use std::io::{ErrorKind, Read};
+use std::io::Read;
 
 impl StreamedPayload {
     pub(crate) fn publish(&self, batch: &mut Batch) {
@@ -13,41 +14,24 @@ impl StreamedPayload {
 }
 
 impl Scoped<'_> {
-    pub(crate) fn content_digest(&self, bytes: &[u8]) -> [u8; 32] {
-        *self
-            .records
-            .kernel
-            .keyed_hasher("context-content")
-            .update(bytes)
-            .finalize()
-            .as_bytes()
+    fn payload_space(&self, pin: &RecordPin) -> ChunkSpace<'_> {
+        ChunkSpace {
+            partition: &self.table(pin.record.kind.module()).payloads,
+            prefix: revision_key(pin),
+        }
     }
-
     pub(crate) fn put_payload(
         &self,
         batch: &mut mmdb_kernel::Batch,
         pin: &RecordPin,
         bytes: &[u8],
     ) -> PayloadDescriptor {
-        for (chunk, bytes) in bytes.chunks(PAYLOAD_CHUNK_BYTES).enumerate() {
-            self.put_chunk(batch, pin, chunk as u64, bytes);
-        }
+        let chunks = self.put_chunks(batch, &self.payload_space(pin), bytes);
         PayloadDescriptor {
             revision: pin.revision,
-            bytes: bytes.len() as u64,
-            digest: self.content_digest(bytes),
+            bytes: chunks.bytes,
+            digest: chunks.digest,
         }
-    }
-
-    fn put_chunk(&self, batch: &mut Batch, pin: &RecordPin, chunk: u64, bytes: &[u8]) {
-        let mut value = Vec::with_capacity(32 + bytes.len());
-        value.extend_from_slice(&self.content_digest(bytes));
-        value.extend_from_slice(bytes);
-        batch.insert(
-            &self.table(pin.record.kind.module()).payloads,
-            payload_key(pin, chunk),
-            value,
-        );
     }
 
     pub(crate) fn payload_slice_locked(
@@ -56,50 +40,16 @@ impl Scoped<'_> {
         offset: u64,
         limit: usize,
     ) -> ContextResult<PayloadPage> {
-        if limit == 0 || limit > MAX_PAYLOAD_PAGE_BYTES || offset > header.payload.bytes {
-            return Err(ContextError::InvalidInput(
-                "invalid bounded payload range".into(),
-            ));
-        }
-        let end = header
-            .payload
-            .bytes
-            .min(offset.saturating_add(limit as u64));
         let payload_pin = RecordPin {
             record: header.pin.record.clone(),
             revision: header.payload.revision,
         };
-        let mut bytes = Vec::with_capacity((end - offset) as usize);
-        let mut at = offset;
-        while at < end {
-            let chunk_index = at / PAYLOAD_CHUNK_BYTES as u64;
-            let value = self
-                .table(payload_pin.record.kind.module())
-                .payloads
-                .get(payload_key(&payload_pin, chunk_index))?
-                .ok_or_else(|| ContextError::Corrupt("missing committed payload chunk".into()))?;
-            if value.len() < 32 || value.len() > PAYLOAD_CHUNK_BYTES + 32 {
-                return Err(ContextError::Corrupt("invalid payload chunk length".into()));
-            }
-            let (digest, chunk) = value.split_at(32);
-            if digest != self.content_digest(chunk) {
-                return Err(ContextError::Corrupt(
-                    "payload chunk checksum mismatch".into(),
-                ));
-            }
-            let chunk_offset = (at % PAYLOAD_CHUNK_BYTES as u64) as usize;
-            let count = ((end - at) as usize).min(chunk.len().saturating_sub(chunk_offset));
-            if count == 0 {
-                return Err(ContextError::Corrupt("short payload chunk".into()));
-            }
-            bytes.extend_from_slice(&chunk[chunk_offset..chunk_offset + count]);
-            at += count as u64;
-        }
-        Ok(PayloadPage {
-            bytes,
-            next_offset: (end < header.payload.bytes).then_some(end),
-            total_bytes: header.payload.bytes,
-        })
+        self.read_chunks(
+            &self.payload_space(&payload_pin),
+            header.payload.bytes,
+            offset,
+            limit,
+        )
     }
 
     pub(crate) fn small_payload_locked(&self, header: &RecordHeader) -> ContextResult<Vec<u8>> {
@@ -117,7 +67,7 @@ impl Scoped<'_> {
 
     pub(crate) fn stream_payload<R: Read>(
         &self,
-        mut payload: R,
+        payload: R,
         upload: Option<(&RecordPin, OperationId)>,
     ) -> ContextResult<StreamedPayload> {
         if let Some((pin, operation)) = upload {
@@ -133,40 +83,13 @@ impl Scoped<'_> {
             );
             batch.commit()?;
         }
-        let mut buffer = vec![0; PAYLOAD_CHUNK_BYTES];
-        let mut hasher = self.records.kernel.keyed_hasher("context-history-payload");
-        let mut length = 0_u64;
-        let mut chunk = 0_u64;
-        loop {
-            let mut used = 0;
-            while used < buffer.len() {
-                match payload.read(&mut buffer[used..]) {
-                    Ok(0) => break,
-                    Ok(count) => used += count,
-                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            if used == 0 {
-                break;
-            }
-            hasher.update(&buffer[..used]);
-            length = length
-                .checked_add(used as u64)
-                .ok_or(ContextError::BudgetExceeded)?;
-            if let Some((pin, _)) = upload {
-                let mut batch = self.batch();
-                self.put_chunk(&mut batch, pin, chunk, &buffer[..used]);
-                batch.commit()?;
-            }
-            chunk += 1;
-        }
-        let payload_digest = *hasher.finalize().as_bytes();
+        let space = upload.map(|(pin, _)| self.payload_space(pin));
+        let chunks = self.write_chunks(space.as_ref(), payload)?;
         Ok(StreamedPayload {
             descriptor: PayloadDescriptor {
                 revision: upload.map_or(1, |(pin, _)| pin.revision),
-                bytes: length,
-                digest: payload_digest,
+                bytes: chunks.bytes,
+                digest: chunks.digest,
             },
             upload: upload.map(|(pin, _)| {
                 (
@@ -225,22 +148,21 @@ impl Scoped<'_> {
             };
             let remaining = max_chunks - report.chunks_removed;
             let mut batch = self.records.kernel.batch();
-            let mut complete = true;
-            for (seen, chunk) in table.payloads.prefix_keys(prefix).enumerate() {
-                let chunk_key = chunk?;
-                if seen == remaining {
-                    complete = false;
-                    break;
-                }
-                batch.remove(&table.payloads, chunk_key);
-                report.chunks_removed += 1;
-            }
-            if complete {
+            let chunks = self.remove_chunks(
+                &mut batch,
+                &ChunkSpace {
+                    partition: &table.payloads,
+                    prefix,
+                },
+                remaining,
+            )?;
+            report.chunks_removed += chunks.removed;
+            if chunks.complete {
                 batch.remove(&table.pending, key);
                 report.uploads_removed += 1;
             }
             batch.commit()?;
-            if !complete {
+            if !chunks.complete {
                 report.more = true;
                 break;
             }

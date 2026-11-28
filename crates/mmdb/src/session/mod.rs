@@ -1,8 +1,11 @@
 //! Continuous, owner-scoped session events and recovery checkpoints.
 
+mod caches;
+pub use caches::{ConversationCache, ConversationCacheInput, ConversationCachePage};
 mod catalog;
 pub use catalog::{NewSession, SessionPage, SessionQuery, SessionState};
 mod checkpoints;
+mod coverage;
 mod fork;
 mod history;
 mod search;
@@ -20,6 +23,12 @@ pub use types::*;
 const CALLS: &str = "session_tool_calls_v1";
 const MESSAGES: &str = "session_messages_v1";
 module_partitions!(SessionParts, SESSION_PARTITIONS, {
+    caches => "session_caches_v1",
+    cache_chunks => "session_cache_chunks_v1"; LargeValues,
+    cache_sweep => "session_cache_sweep_v1",
+    cache_pending => "session_cache_pending_v1",
+    source_scopes => "session_source_scopes_v1",
+    withdrawals => "session_withdrawals_v1",
     lineage => "session_lineage_v1",
     order => "session_order_v1",
     changes => "session_changes_v1",
@@ -111,10 +120,14 @@ impl SessionLog<'_> {
         if redacts && !matches!(self.scoped.access().actor, Actor::User | Actor::Operator) {
             return Err(ContextError::AccessDenied);
         }
-        self.scoped
-            .commit_state_change(operation, expected, state, redacts, |batch, _, header| {
+        self.scoped.commit_state_change(
+            operation,
+            expected,
+            state,
+            redacts,
+            |batch, _, header, epoch| {
                 if let Some(event) = &header.event {
-                    self.withdraw_event(batch, event)?;
+                    self.withdraw_event(batch, event, epoch)?;
                     let mut head = self.session_head(&event.session)?;
                     catalog::Changes::default().put_head(
                         self,
@@ -125,17 +138,20 @@ impl SessionLog<'_> {
                     )?;
                 }
                 Ok(())
-            })
+            },
+        )
     }
 
-    /// Cleans abandoned uploads and purged payloads, never live committed data.
+    /// Cleans abandoned uploads, purged payloads, and obsolete cache payloads.
     /// The chunk and upload counts bound work even for very large originals.
     pub fn recover_payloads(
         &self,
         max_chunks: usize,
         max_uploads: usize,
     ) -> ContextResult<RecoveryReport> {
-        self.scoped
-            .recover_payloads(StoreModule::Session, max_chunks, max_uploads)
+        let report = self
+            .scoped
+            .recover_payloads(StoreModule::Session, max_chunks, max_uploads)?;
+        self.recover_caches(report, max_chunks, max_uploads)
     }
 }
