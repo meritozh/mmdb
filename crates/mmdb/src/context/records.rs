@@ -353,7 +353,7 @@ impl ContextStore<'_> {
             expected,
             state,
             state == RecordState::Purged,
-            |batch, previous, header| {
+            |batch, previous, header, _| {
                 self.replace_postings(batch, header, None)?;
                 self.replace_adjacency(batch, Some(previous), header)
             },

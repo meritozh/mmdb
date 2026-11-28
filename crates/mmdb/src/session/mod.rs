@@ -111,8 +111,12 @@ impl SessionLog<'_> {
         if redacts && !matches!(self.scoped.access().actor, Actor::User | Actor::Operator) {
             return Err(ContextError::AccessDenied);
         }
-        self.scoped
-            .commit_state_change(operation, expected, state, redacts, |batch, _, header| {
+        self.scoped.commit_state_change(
+            operation,
+            expected,
+            state,
+            redacts,
+            |batch, _, header, _| {
                 if let Some(event) = &header.event {
                     self.withdraw_event(batch, event)?;
                     let mut head = self.session_head(&event.session)?;
@@ -125,7 +129,8 @@ impl SessionLog<'_> {
                     )?;
                 }
                 Ok(())
-            })
+            },
+        )
     }
 
     /// Cleans abandoned uploads and purged payloads, never live committed data.
